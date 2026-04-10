@@ -16,7 +16,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
 PREDICT_API = "https://api.predict.fun"
 POLL_INTERVAL = 15
-TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://etherscan.io/tx/")
+TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 class WatchedWallet:
     address: str
     chat_id: int
+    note: str = ""
     position_snapshot: dict = field(default_factory=dict)
     order_match_snapshot: set[str] = field(default_factory=set)
     last_check: float = 0
@@ -48,6 +49,7 @@ I18N = {
             "/list - watched list\n"
             "/pos <code>0xAddr</code> - view positions\n"
             "/orders <code>0xAddr</code> - recent fills\n"
+            "/note <code>0xAddr remark</code> - set alias\n"
             "/lang <code>en|zh</code> - switch language\n"
             "/stop - stop all"
         ),
@@ -66,6 +68,9 @@ I18N = {
         "orders_header": "<code>{addr}</code>\nRecent fills ({count})",
         "no_orders": "No recent fills",
         "stopped": "Stopped {count} watches",
+        "usage_note": "Usage: /note 0xAddress your remark",
+        "note_saved": "Saved note for <code>{addr}</code>: {note}",
+        "note_not_found": "Address is not in watch list",
         "lang_usage": "Usage: /lang en|zh",
         "lang_set": "Language switched to English 🇺🇸",
         "fmt_no_positions": "No positions",
@@ -94,6 +99,7 @@ I18N = {
             "/list - 查看监控列表\n"
             "/pos <code>0xAddr</code> - 查看持仓\n"
             "/orders <code>0xAddr</code> - 查看最近成交\n"
+            "/note <code>0xAddr 备注</code> - 设置备注\n"
             "/lang <code>en|zh</code> - 切换语言\n"
             "/stop - 清空全部监控"
         ),
@@ -112,6 +118,9 @@ I18N = {
         "orders_header": "<code>{addr}</code>\n最近成交（{count}）",
         "no_orders": "暂无最近成交",
         "stopped": "已停止 {count} 个监控",
+        "usage_note": "用法：/note 0x地址 备注",
+        "note_saved": "已保存 <code>{addr}</code> 的备注：{note}",
+        "note_not_found": "该地址不在监控列表中",
         "lang_usage": "用法：/lang en|zh",
         "lang_set": "语言已切换为中文 🇨🇳",
         "fmt_no_positions": "暂无持仓",
@@ -438,7 +447,7 @@ def _side_text(side: str, chat_id: int) -> str:
 
 def fmt_match(match: dict, chat_id: int) -> str:
     market = match.get("market") if isinstance(match.get("market"), dict) else {}
-    taker = match.get("taker") if isinstance(taker := match.get("taker"), dict) else {}
+    taker = match.get("taker") if isinstance(match.get("taker"), dict) else {}
     outcome_obj = taker.get("outcome") if isinstance(taker.get("outcome"), dict) else {}
 
     title = market.get("title") or market.get("question") or str(market.get("id", "?"))
@@ -498,6 +507,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     addr = ctx.args[0].strip()
+    note = " ".join(ctx.args[1:]).strip() if len(ctx.args) > 1 else ""
     if not addr.startswith("0x") or len(addr) != 42:
         await update.message.reply_text(t(chat_id, "invalid_address"))
         return
@@ -522,6 +532,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     watched[chat_id][addr] = WatchedWallet(
         address=addr,
         chat_id=chat_id,
+        note=note,
         position_snapshot=snapshot,
         order_match_snapshot={match_key(m) for m in matches},
         last_check=time.time(),
@@ -567,7 +578,8 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = [t(update.effective_chat.id, "watch_list")]
     for addr, w in wallets.items():
-        lines.append(f"- <code>{fmt_addr(addr)}</code> ({len(w.position_snapshot)} pos)")
+        note = f" - {w.note}" if w.note else ""
+        lines.append(f"- <code>{fmt_addr(addr)}</code>{note} ({len(w.position_snapshot)} pos)")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -625,6 +637,33 @@ async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_lang[chat_id] = lang
     await update.message.reply_text(t(chat_id, "lang_set"))
 
+
+async def cmd_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if len(ctx.args) < 2:
+        await update.message.reply_text(t(chat_id, "usage_note"))
+        return
+
+    addr = ctx.args[0].strip()
+    note = " ".join(ctx.args[1:]).strip()
+    target = None
+
+    for a, w in watched.get(chat_id, {}).items():
+        if a.lower() == addr.lower():
+            target = w
+            addr = a
+            break
+
+    if not target:
+        await update.message.reply_text(t(chat_id, "note_not_found"))
+        return
+
+    target.note = note
+    await update.message.reply_text(
+        t(chat_id, "note_saved", addr=fmt_addr(addr), note=note),
+        parse_mode="HTML",
+    )
+
 # ==================== Poll Loop ====================
 
 async def poll_loop(app: Application):
@@ -656,7 +695,8 @@ async def poll_loop(app: Application):
                             for k in closed:
                                 parts.append(t(chat_id, "closed_item", key=k))
 
-                            header = t(chat_id, "poll_header", addr=fmt_addr(w.address))
+                            display_addr = fmt_addr(w.address) + (f" · {w.note}" if w.note else "")
+                            header = t(chat_id, "poll_header", addr=display_addr)
                             text = header + "\n\n".join(parts[:8])
 
                             if len(parts) > 8:
@@ -673,7 +713,7 @@ async def poll_loop(app: Application):
                             fill_lines = [fmt_match(m, chat_id) for m in new_fills[:5]]
                             await app.bot.send_message(
                                 chat_id=chat_id,
-                                text=t(chat_id, "fills_header", addr=fmt_addr(w.address)) + "\n\n".join(fill_lines),
+                                text=t(chat_id, "fills_header", addr=display_addr) + "\n\n".join(fill_lines),
                                 parse_mode="HTML",
                                 disable_web_page_preview=True,
                             )
@@ -697,6 +737,7 @@ async def on_startup(app: Application):
             BotCommand("list", "监控列表 / Watch list"),
             BotCommand("pos", "查询持仓 / View positions"),
             BotCommand("orders", "最近成交 / Recent fills"),
+            BotCommand("note", "地址备注 / Set remark"),
             BotCommand("lang", "切换语言 / Switch language"),
             BotCommand("stop", "停止全部监控 / Stop all"),
         ]
@@ -718,6 +759,7 @@ def main():
     app.add_handler(CommandHandler("pos", cmd_pos))
     app.add_handler(CommandHandler("positions", cmd_pos))
     app.add_handler(CommandHandler("orders", cmd_orders))
+    app.add_handler(CommandHandler("note", cmd_note))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("lang", cmd_lang))
 
