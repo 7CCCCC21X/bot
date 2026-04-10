@@ -216,11 +216,11 @@ def pos_key(pos: dict) -> str:
 
 
 def pos_hash(pos: dict) -> str:
-    _, _, shares, price_c = display_fields(pos, {})
+    shares_num = _norm_amount_to_shares(pos.get("shares") or pos.get("quantity") or pos.get("amount"))
+
     fields = {
-        "shares": shares,
-        "priceCents": price_c,
-        "valueUsd": str(pos.get("valueUsd") or pos.get("value_usd") or ""),
+        # Only hash position size changes, so market-price updates do not spam.
+        "shares": _fmt_num(shares_num, digits=6) if shares_num is not None else "",
     }
     return hashlib.md5(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
@@ -260,6 +260,9 @@ def _norm_price_to_cents(price):
     p = _safe_float(price)
     if p is None:
         return None
+    # Some endpoints return fixed-point numbers where cents are scaled by 1e17.
+    if abs(p) >= 1e6:
+        p = p / 1e17
     if 0 <= p <= 1:
         p = p * 100
     return p
@@ -370,7 +373,12 @@ def fmt_pos(pos: dict, label: str, chat_id: int, market: dict | None = None) -> 
     }
     emoji = emojis.get(label, "📊")
 
-    return f"{emoji}\n{title}\n{outcome}\n{shares} x {avg}c = {val}"
+    return (
+        f"{emoji} <b>{title}</b>\n"
+        f"✅ <b>{outcome}</b>\n"
+        f"💹 <code>{shares}</code> Shares @ <code>{avg}c</code>\n"
+        f"💰 <b>{val}</b>"
+    )
 
 
 def fmt_summary(positions: list[dict], chat_id: int) -> str:
@@ -585,29 +593,27 @@ async def poll_loop(app: Application):
                         w.position_snapshot = {pos_key(p): pos_hash(p) for p in positions}
                         w.last_check = time.time()
 
-                        if not (added or changed or closed):
-                            continue
+                        if added or changed or closed:
+                            parts = []
+                            for p in added:
+                                parts.append(fmt_pos(p, "added", chat_id, markets.get(p.get("marketId"))))
+                            for p in changed:
+                                parts.append(fmt_pos(p, "changed", chat_id, markets.get(p.get("marketId"))))
+                            for k in closed:
+                                parts.append(t(chat_id, "closed_item", key=k))
 
-                        parts = []
-                        for p in added:
-                            parts.append(fmt_pos(p, "added", chat_id, markets.get(p.get("marketId"))))
-                        for p in changed:
-                            parts.append(fmt_pos(p, "changed", chat_id, markets.get(p.get("marketId"))))
-                        for k in closed:
-                            parts.append(t(chat_id, "closed_item", key=k))
+                            header = t(chat_id, "poll_header", addr=fmt_addr(w.address))
+                            text = header + "\n\n".join(parts[:8])
 
-                        header = t(chat_id, "poll_header", addr=fmt_addr(w.address))
-                        text = header + "\n\n".join(parts[:8])
+                            if len(parts) > 8:
+                                text += t(chat_id, "fmt_more", count=len(parts) - 8)
 
-                        if len(parts) > 8:
-                            text += t(chat_id, "fmt_more", count=len(parts) - 8)
-
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=text,
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
-                        )
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=text,
+                                parse_mode="HTML",
+                                disable_web_page_preview=True,
+                            )
 
                         if new_fills:
                             fill_lines = [fmt_match(m) for m in new_fills[:5]]
