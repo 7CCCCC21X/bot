@@ -16,6 +16,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
 PREDICT_API = "https://api.predict.fun"
 POLL_INTERVAL = 15
+TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://etherscan.io/tx/")
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -76,6 +77,13 @@ I18N = {
         "poll_header": "<b>Predict.fun</b> <code>{addr}</code>\n\n",
         "closed_item": "Closed: {key}",
         "fills_header": "<b>Order Fill</b> <code>{addr}</code>\n\n",
+        "label_size": "Size",
+        "label_value": "Value",
+        "label_tx": "Tx",
+        "shares_unit": "Shares",
+        "side_bid": "Buy",
+        "side_ask": "Sell",
+        "view_tx": "View Tx",
     },
     "zh": {
         "start": (
@@ -114,6 +122,13 @@ I18N = {
         "poll_header": "<b>Predict.fun</b> <code>{addr}</code>\n\n",
         "closed_item": "已平仓：{key}",
         "fills_header": "<b>订单成交</b> <code>{addr}</code>\n\n",
+        "label_size": "数量",
+        "label_value": "价值",
+        "label_tx": "哈希",
+        "shares_unit": "份额",
+        "side_bid": "买入",
+        "side_ask": "卖出",
+        "view_tx": "查看交易",
     },
 }
 
@@ -376,8 +391,8 @@ def fmt_pos(pos: dict, label: str, chat_id: int, market: dict | None = None) -> 
     return (
         f"{emoji} <b>{title}</b>\n"
         f"✅ <b>{outcome}</b>\n"
-        f"💹 <code>{shares}</code> Shares @ <code>{avg}c</code>\n"
-        f"💰 <b>{val}</b>"
+        f"💹 {t(chat_id, 'label_size')}: <code>{shares}</code> {t(chat_id, 'shares_unit')} @ <code>{avg}c</code>\n"
+        f"💰 {t(chat_id, 'label_value')}: <b>{val}</b>"
     )
 
 
@@ -410,14 +425,23 @@ def match_key(match: dict) -> str:
     return f"{tx}:{executed_at}:{amount}"
 
 
-def fmt_match(match: dict) -> str:
+def _side_text(side: str, chat_id: int) -> str:
+    s = (side or "").lower()
+    if s == "bid":
+        return t(chat_id, "side_bid")
+    if s == "ask":
+        return t(chat_id, "side_ask")
+    return side or "?"
+
+
+def fmt_match(match: dict, chat_id: int) -> str:
     market = match.get("market") if isinstance(match.get("market"), dict) else {}
     taker = match.get("taker") if isinstance(match.get("taker"), dict) else {}
     outcome_obj = taker.get("outcome") if isinstance(taker.get("outcome"), dict) else {}
 
     title = market.get("title") or market.get("question") or str(market.get("id", "?"))
     outcome = outcome_obj.get("name") or "?"
-    side = taker.get("quoteType", "?")
+    side = _side_text(taker.get("quoteType", "?"), chat_id)
     shares = _norm_amount_to_shares(match.get("amountFilled"))
     shares_text = _fmt_num(shares, digits=4)
     price_c = _norm_price_to_cents(match.get("priceExecuted") or taker.get("price"))
@@ -427,7 +451,17 @@ def fmt_match(match: dict) -> str:
         value_text = f"${shares * price_c / 100:,.2f}"
 
     price_text = f"{price_c:.2f}" if price_c is not None else "?"
-    return f"✅ {side} {outcome} | {shares_text} @ {price_text}c = {value_text}\n{title[:60]}"
+    tx = match.get("transactionHash") or "N/A"
+    tx_short = f"{tx[:10]}...{tx[-6:]}" if isinstance(tx, str) and len(tx) > 20 else str(tx)
+    tx_line = f"{t(chat_id, 'label_tx')}: <code>{tx_short}</code>"
+    if isinstance(tx, str) and tx.startswith("0x"):
+        tx_url = f"{TX_EXPLORER_BASE.rstrip('/')}/{tx}"
+        tx_line += f' | <a href="{tx_url}">{t(chat_id, "view_tx")}</a>'
+    return (
+        f"✅ {side} {outcome} | {shares_text} @ {price_text}c = {value_text}\n"
+        f"{title[:60]}\n"
+        f"{tx_line}"
+    )
 
 # ==================== Telegram ====================
 
@@ -551,7 +585,7 @@ async def cmd_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = [t(chat_id, "orders_header", addr=fmt_addr(addr), count=len(matches)), ""]
-    lines.extend(fmt_match(m) for m in matches[:8])
+    lines.extend(fmt_match(m, chat_id) for m in matches[:8])
     await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
 
@@ -616,7 +650,7 @@ async def poll_loop(app: Application):
                             )
 
                         if new_fills:
-                            fill_lines = [fmt_match(m) for m in new_fills[:5]]
+                            fill_lines = [fmt_match(m, chat_id) for m in new_fills[:5]]
                             await app.bot.send_message(
                                 chat_id=chat_id,
                                 text=t(chat_id, "fills_header", addr=fmt_addr(w.address)) + "\n\n".join(fill_lines),
