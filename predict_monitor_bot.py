@@ -7,7 +7,7 @@ import hashlib
 from dataclasses import dataclass, field
 
 import aiohttp
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== Config ====================
@@ -312,7 +312,8 @@ def fmt_pos(pos: dict, label: str, chat_id: int, market: dict | None = None) -> 
     title = title[:55]
 
     try:
-        val = f"${float(shares) * float(avg):,.2f}"
+        # avg is in cents, convert to USD.
+        val = f"${float(shares) * float(avg) / 100:,.2f}"
     except (ValueError, TypeError):
         val = "N/A"
 
@@ -338,7 +339,8 @@ def fmt_summary(positions: list[dict], chat_id: int) -> str:
         title = title[:40]
 
         try:
-            v = float(shares) * float(price)
+            # price is in cents, convert to USD.
+            v = float(shares) * float(price) / 100
             total += v
             lines.append(f"- {outcome} | {shares} @ {price}c = ${v:,.2f}\n  {title}")
         except (ValueError, TypeError):
@@ -519,6 +521,17 @@ async def poll_loop(app: Application):
 # ==================== Main ====================
 
 async def on_startup(app: Application):
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "开始 / Start"),
+            BotCommand("watch", "监控地址 / Watch wallet"),
+            BotCommand("unwatch", "取消监控 / Unwatch wallet"),
+            BotCommand("list", "监控列表 / Watch list"),
+            BotCommand("pos", "查询持仓 / View positions"),
+            BotCommand("lang", "切换语言 / Switch language"),
+            BotCommand("stop", "停止全部监控 / Stop all"),
+        ]
+    )
     asyncio.create_task(poll_loop(app))
 
 
