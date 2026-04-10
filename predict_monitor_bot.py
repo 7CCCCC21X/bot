@@ -219,22 +219,51 @@ def _norm_price_to_cents(price):
     return p
 
 
+def _norm_amount_to_shares(amount):
+    a = _safe_float(amount)
+    if a is None:
+        return None
+    # API may return token amount as wei string.
+    if abs(a) > 1e9:
+        a = a / 1e18
+    return a
+
+
+def _fmt_num(v, digits=4):
+    if v is None:
+        return "?"
+    s = f"{v:.{digits}f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
 def display_fields(pos: dict, market: dict | None = None) -> tuple[str, str, str, str]:
     market = market or {}
-    market_id = pos.get("marketId", "?")
+    market_obj = pos.get("market") if isinstance(pos.get("market"), dict) else {}
+    outcome_obj = pos.get("outcome") if isinstance(pos.get("outcome"), dict) else {}
+    market_id = pos.get("marketId") or market_obj.get("id") or market.get("id") or "?"
 
     title = (
         pos.get("title")
+        or market_obj.get("title")
+        or market_obj.get("question")
         or market.get("title")
         or market.get("question")
         or market_id
     )
 
-    outcome = pos.get("outcomeName")
+    outcome = pos.get("outcomeName") or outcome_obj.get("name") or outcome_obj.get("title")
     idx = pos.get("outcomeIndex")
+    if idx is None:
+        idx = outcome_obj.get("index")
 
     if outcome in (None, "") and idx is not None:
-        outcomes = market.get("outcomes") or market.get("outcomeNames") or []
+        outcomes = (
+            market_obj.get("outcomes")
+            or market_obj.get("outcomeNames")
+            or market.get("outcomes")
+            or market.get("outcomeNames")
+            or []
+        )
         try:
             i = int(idx)
             if isinstance(outcomes, list) and 0 <= i < len(outcomes):
@@ -245,10 +274,22 @@ def display_fields(pos: dict, market: dict | None = None) -> tuple[str, str, str
     if outcome in (None, ""):
         outcome = str(idx if idx is not None else "?")
 
-    shares = str(pos.get("shares") or pos.get("quantity") or "0")
-    price_raw = pos.get("currentPrice") or pos.get("avgPrice")
+    shares_num = _norm_amount_to_shares(pos.get("shares") or pos.get("quantity") or pos.get("amount"))
+    shares = _fmt_num(shares_num, digits=4) if shares_num is not None else "0"
+
+    price_raw = (
+        pos.get("currentPrice")
+        or pos.get("avgPrice")
+        or outcome_obj.get("price")
+    )
     if price_raw is None and idx is not None:
-        prices = market.get("outcomePrices") or market.get("prices") or []
+        prices = (
+            market_obj.get("outcomePrices")
+            or market_obj.get("prices")
+            or market.get("outcomePrices")
+            or market.get("prices")
+            or []
+        )
         try:
             i = int(idx)
             if isinstance(prices, list) and 0 <= i < len(prices):
@@ -257,6 +298,11 @@ def display_fields(pos: dict, market: dict | None = None) -> tuple[str, str, str
             pass
 
     price_c = _norm_price_to_cents(price_raw)
+    if price_c is None:
+        value_usd = _safe_float(pos.get("valueUsd") or pos.get("value_usd"))
+        if value_usd is not None and shares_num and shares_num > 0:
+            price_c = value_usd / shares_num * 100
+
     price = f"{price_c:.2f}" if price_c is not None else "?"
     return title, outcome, shares, price
 
