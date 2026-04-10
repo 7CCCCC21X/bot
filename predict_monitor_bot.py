@@ -84,6 +84,7 @@ I18N = {
         "side_bid": "Buy",
         "side_ask": "Sell",
         "view_tx": "View Tx",
+        "label_order_hash": "OrderHash",
     },
     "zh": {
         "start": (
@@ -129,6 +130,7 @@ I18N = {
         "side_bid": "买入",
         "side_ask": "卖出",
         "view_tx": "查看交易",
+        "label_order_hash": "订单哈希",
     },
 }
 
@@ -436,7 +438,7 @@ def _side_text(side: str, chat_id: int) -> str:
 
 def fmt_match(match: dict, chat_id: int) -> str:
     market = match.get("market") if isinstance(match.get("market"), dict) else {}
-    taker = match.get("taker") if isinstance(match.get("taker"), dict) else {}
+    taker = match.get("taker") if isinstance(taker := match.get("taker"), dict) else {}
     outcome_obj = taker.get("outcome") if isinstance(taker.get("outcome"), dict) else {}
 
     title = market.get("title") or market.get("question") or str(market.get("id", "?"))
@@ -445,6 +447,18 @@ def fmt_match(match: dict, chat_id: int) -> str:
     shares = _norm_amount_to_shares(match.get("amountFilled"))
     shares_text = _fmt_num(shares, digits=4)
     price_c = _norm_price_to_cents(match.get("priceExecuted") or taker.get("price"))
+
+    # Prefer deriving executed price from filled amounts when available.
+    maker_amt = _norm_amount_to_shares(match.get("makerAmountFilled"))
+    taker_amt = _norm_amount_to_shares(match.get("takerAmountFilled"))
+    maker_asset_id = str(match.get("makerAssetId", ""))
+    taker_asset_id = str(match.get("takerAssetId", ""))
+    if maker_amt and taker_amt and maker_amt > 0 and taker_amt > 0:
+        # Asset id 0 is collateral token; non-zero is position token.
+        if maker_asset_id == "0" and taker_asset_id != "0":
+            price_c = maker_amt / taker_amt * 100
+        elif taker_asset_id == "0" and maker_asset_id != "0":
+            price_c = taker_amt / maker_amt * 100
 
     value_text = "N/A"
     if shares is not None and price_c is not None:
@@ -457,10 +471,16 @@ def fmt_match(match: dict, chat_id: int) -> str:
     if isinstance(tx, str) and tx.startswith("0x"):
         tx_url = f"{TX_EXPLORER_BASE.rstrip('/')}/{tx}"
         tx_line += f' | <a href="{tx_url}">{t(chat_id, "view_tx")}</a>'
+    order_hash = match.get("orderHash") or taker.get("orderHash")
+    order_line = ""
+    if order_hash:
+        oh = str(order_hash)
+        oh_short = f"{oh[:10]}...{oh[-6:]}" if len(oh) > 20 else oh
+        order_line = f"\n{t(chat_id, 'label_order_hash')}: <code>{oh_short}</code>"
     return (
         f"✅ {side} {outcome} | {shares_text} @ {price_text}c = {value_text}\n"
         f"{title[:60]}\n"
-        f"{tx_line}"
+        f"{tx_line}{order_line}"
     )
 
 # ==================== Telegram ====================
