@@ -1,9 +1,8 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/predict_monitor_bot.py b/predict_monitor_bot.py
-index 6e7bc2f98a07cd25476146bdaea1a47edeb0533d..f20e0adbb6d31330147f05c9e8c1aef1d61288f1 100644
+index 6e7bc2f98a07cd25476146bdaea1a47edeb0533d..385c3367925affbc83134efbd77bf8fa908e5538 100644
 --- a/predict_monitor_bot.py
 +++ b/predict_monitor_bot.py
-@@ -13,346 +13,430 @@ from telegram.ext import Application, CommandHandler, ContextTypes
+@@ -13,346 +13,490 @@ from telegram.ext import Application, CommandHandler, ContextTypes
  # ==================== Config ====================
  
  TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -198,11 +197,71 @@ index 6e7bc2f98a07cd25476146bdaea1a47edeb0533d..f20e0adbb6d31330147f05c9e8c1aef1
  
  
 -def fmt_pos(pos: dict, label: str) -> str:
-+def fmt_pos(pos: dict, label: str, chat_id: int) -> str:
-     title = (pos.get("title") or pos.get("marketId", "?"))[:55]
-     outcome = pos.get("outcomeName") or pos.get("outcomeIndex", "?")
-     shares = pos.get("shares", "?")
-     avg = pos.get("avgPrice", "?")
+-    title = (pos.get("title") or pos.get("marketId", "?"))[:55]
+-    outcome = pos.get("outcomeName") or pos.get("outcomeIndex", "?")
+-    shares = pos.get("shares", "?")
+-    avg = pos.get("avgPrice", "?")
++def _safe_float(v):
++    try:
++        return float(v)
++    except (TypeError, ValueError):
++        return None
++
++
++def _norm_price_to_cents(price):
++    p = _safe_float(price)
++    if p is None:
++        return None
++    if 0 <= p <= 1:
++        p = p * 100
++    return p
++
++
++def display_fields(pos: dict, market: dict | None = None) -> tuple[str, str, str, str]:
++    market = market or {}
++    market_id = pos.get("marketId", "?")
++
++    title = (
++        pos.get("title")
++        or market.get("title")
++        or market.get("question")
++        or market_id
++    )
++
++    outcome = pos.get("outcomeName")
++    idx = pos.get("outcomeIndex")
++
++    if outcome in (None, "") and idx is not None:
++        outcomes = market.get("outcomes") or market.get("outcomeNames") or []
++        try:
++            i = int(idx)
++            if isinstance(outcomes, list) and 0 <= i < len(outcomes):
++                o = outcomes[i]
++                outcome = o.get("name") if isinstance(o, dict) else str(o)
++        except (ValueError, TypeError):
++            pass
++    if outcome in (None, ""):
++        outcome = str(idx if idx is not None else "?")
++
++    shares = str(pos.get("shares") or pos.get("quantity") or "0")
++    price_raw = pos.get("currentPrice") or pos.get("avgPrice")
++    if price_raw is None and idx is not None:
++        prices = market.get("outcomePrices") or market.get("prices") or []
++        try:
++            i = int(idx)
++            if isinstance(prices, list) and 0 <= i < len(prices):
++                price_raw = prices[i]
++        except (ValueError, TypeError):
++            pass
++
++    price_c = _norm_price_to_cents(price_raw)
++    price = f"{price_c:.2f}" if price_c is not None else "?"
++    return title, outcome, shares, price
++
++
++def fmt_pos(pos: dict, label: str, chat_id: int, market: dict | None = None) -> str:
++    title, outcome, shares, avg = display_fields(pos, market)
++    title = title[:55]
  
      try:
          val = f"${float(shares) * float(avg):,.2f}"
@@ -232,10 +291,12 @@ index 6e7bc2f98a07cd25476146bdaea1a47edeb0533d..f20e0adbb6d31330147f05c9e8c1aef1
      lines = []
  
      for p in positions[:20]:
-         title = (p.get("title") or p.get("marketId", "?"))[:40]
-         outcome = p.get("outcomeName") or str(p.get("outcomeIndex", "?"))
-         shares = p.get("shares", "0")
-         price = p.get("currentPrice") or p.get("avgPrice", "?")
+-        title = (p.get("title") or p.get("marketId", "?"))[:40]
+-        outcome = p.get("outcomeName") or str(p.get("outcomeIndex", "?"))
+-        shares = p.get("shares", "0")
+-        price = p.get("currentPrice") or p.get("avgPrice", "?")
++        title, outcome, shares, price = display_fields(p, p.get("_market"))
++        title = title[:40]
  
          try:
              v = float(shares) * float(price)
@@ -365,6 +426,10 @@ index 6e7bc2f98a07cd25476146bdaea1a47edeb0533d..f20e0adbb6d31330147f05c9e8c1aef1
  
      async with aiohttp.ClientSession() as session:
          positions = await fetch_positions(session, addr)
++        market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
++        markets = {mid: await fetch_market(session, mid) for mid in market_ids}
++        for p in positions:
++            p["_market"] = markets.get(p.get("marketId"), {})
  
 -    text = f"<code>{fmt_addr(addr)}</code>\n\n{fmt_summary(positions)}"
 +    text = f"<code>{fmt_addr(addr)}</code>\n\n{fmt_summary(positions, update.effective_chat.id)}"
@@ -401,6 +466,8 @@ index 6e7bc2f98a07cd25476146bdaea1a47edeb0533d..f20e0adbb6d31330147f05c9e8c1aef1
                  for addr, w in list(wallets.items()):
                      try:
                          positions = await fetch_positions(session, w.address)
++                        market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
++                        markets = {mid: await fetch_market(session, mid) for mid in market_ids}
                          added, changed, closed = diff_positions(w.position_snapshot, positions)
  
                          w.position_snapshot = {pos_key(p): pos_hash(p) for p in positions}
@@ -412,10 +479,10 @@ index 6e7bc2f98a07cd25476146bdaea1a47edeb0533d..f20e0adbb6d31330147f05c9e8c1aef1
                          parts = []
                          for p in added:
 -                            parts.append(fmt_pos(p, "added"))
-+                            parts.append(fmt_pos(p, "added", chat_id))
++                            parts.append(fmt_pos(p, "added", chat_id, markets.get(p.get("marketId"))))
                          for p in changed:
 -                            parts.append(fmt_pos(p, "changed"))
-+                            parts.append(fmt_pos(p, "changed", chat_id))
++                            parts.append(fmt_pos(p, "changed", chat_id, markets.get(p.get("marketId"))))
                          for k in closed:
 -                            parts.append(f"Closed: {k}")
 +                            parts.append(t(chat_id, "closed_item", key=k))
@@ -471,6 +538,3 @@ index 6e7bc2f98a07cd25476146bdaea1a47edeb0533d..f20e0adbb6d31330147f05c9e8c1aef1
  
  if __name__ == "__main__":
      main()
- 
-EOF
-)
