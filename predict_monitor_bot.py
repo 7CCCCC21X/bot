@@ -30,6 +30,7 @@ class WatchedWallet:
     address: str
     chat_id: int
     position_snapshot: dict = field(default_factory=dict)
+    order_match_snapshot: set[str] = field(default_factory=set)
     last_check: float = 0
 
 
@@ -45,6 +46,7 @@ I18N = {
             "/unwatch <code>0xAddr</code> - stop\n"
             "/list - watched list\n"
             "/pos <code>0xAddr</code> - view positions\n"
+            "/orders <code>0xAddr</code> - recent fills\n"
             "/lang <code>en|zh</code> - switch language\n"
             "/stop - stop all"
         ),
@@ -59,6 +61,9 @@ I18N = {
         "no_watched_wallets": "No watched wallets",
         "watch_list": "<b>Watch List</b>\n",
         "usage_pos": "Usage: /pos 0xAddress",
+        "usage_orders": "Usage: /orders 0xAddress",
+        "orders_header": "<code>{addr}</code>\nRecent fills ({count})",
+        "no_orders": "No recent fills",
         "stopped": "Stopped {count} watches",
         "lang_usage": "Usage: /lang en|zh",
         "lang_set": "Language switched to English 🇺🇸",
@@ -70,6 +75,7 @@ I18N = {
         "fmt_more": "\n\n...and {count} more",
         "poll_header": "<b>Predict.fun</b> <code>{addr}</code>\n\n",
         "closed_item": "Closed: {key}",
+        "fills_header": "<b>Order Fill</b> <code>{addr}</code>\n\n",
     },
     "zh": {
         "start": (
@@ -78,6 +84,7 @@ I18N = {
             "/unwatch <code>0xAddr</code> - 停止监控\n"
             "/list - 查看监控列表\n"
             "/pos <code>0xAddr</code> - 查看持仓\n"
+            "/orders <code>0xAddr</code> - 查看最近成交\n"
             "/lang <code>en|zh</code> - 切换语言\n"
             "/stop - 清空全部监控"
         ),
@@ -92,6 +99,9 @@ I18N = {
         "no_watched_wallets": "当前没有监控的钱包",
         "watch_list": "<b>监控列表</b>\n",
         "usage_pos": "用法：/pos 0x地址",
+        "usage_orders": "用法：/orders 0x地址",
+        "orders_header": "<code>{addr}</code>\n最近成交（{count}）",
+        "no_orders": "暂无最近成交",
         "stopped": "已停止 {count} 个监控",
         "lang_usage": "用法：/lang en|zh",
         "lang_set": "语言已切换为中文 🇨🇳",
@@ -103,6 +113,7 @@ I18N = {
         "fmt_more": "\n\n...还有 {count} 条变动",
         "poll_header": "<b>Predict.fun</b> <code>{addr}</code>\n\n",
         "closed_item": "已平仓：{key}",
+        "fills_header": "<b>订单成交</b> <code>{addr}</code>\n\n",
     },
 }
 
@@ -156,6 +167,33 @@ async def fetch_market(session: aiohttp.ClientSession, market_id: str) -> dict:
     return {}
 
 
+async def fetch_order_matches(
+    session: aiohttp.ClientSession,
+    address: str,
+    first: int = 20,
+) -> list[dict]:
+    url = f"{PREDICT_API}/v1/orders/matches"
+    params = {
+        "signerAddress": address,
+        "first": str(first),
+    }
+    try:
+        async with session.get(
+            url,
+            params=params,
+            headers=_headers(),
+            timeout=aiohttp.ClientTimeout(total=12),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("data", []) if data.get("success") else []
+            logger.warning(f"Orders matches API {resp.status} for {address}")
+            return []
+    except Exception as e:
+        logger.error(f"fetch_order_matches error: {e}")
+        return []
+
+
 def get_lang(chat_id: int) -> str:
     return chat_lang.get(chat_id, "en")
 
@@ -168,13 +206,21 @@ def t(chat_id: int, key: str, **kwargs) -> str:
 # ==================== Diff ====================
 
 def pos_key(pos: dict) -> str:
-    return f"{pos.get('marketId', '')}_{pos.get('outcomeIndex', '')}"
+    market_obj = pos.get("market") if isinstance(pos.get("market"), dict) else {}
+    outcome_obj = pos.get("outcome") if isinstance(pos.get("outcome"), dict) else {}
+    market_id = pos.get("marketId") or market_obj.get("id") or ""
+    outcome_index = pos.get("outcomeIndex")
+    if outcome_index is None:
+        outcome_index = outcome_obj.get("index", "")
+    return f"{market_id}_{outcome_index}"
 
 
 def pos_hash(pos: dict) -> str:
+    _, _, shares, price_c = display_fields(pos, {})
     fields = {
-        "shares": str(pos.get("shares", "")),
-        "avgPrice": str(pos.get("avgPrice", "")),
+        "shares": shares,
+        "priceCents": price_c,
+        "valueUsd": str(pos.get("valueUsd") or pos.get("value_usd") or ""),
     }
     return hashlib.md5(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
@@ -348,6 +394,33 @@ def fmt_summary(positions: list[dict], chat_id: int) -> str:
 
     return t(chat_id, "fmt_positions_header", count=len(positions), total=total) + "\n\n".join(lines)
 
+
+def match_key(match: dict) -> str:
+    tx = match.get("transactionHash", "")
+    executed_at = match.get("executedAt", "")
+    amount = str(match.get("amountFilled", ""))
+    return f"{tx}:{executed_at}:{amount}"
+
+
+def fmt_match(match: dict) -> str:
+    market = match.get("market") if isinstance(match.get("market"), dict) else {}
+    taker = match.get("taker") if isinstance(match.get("taker"), dict) else {}
+    outcome_obj = taker.get("outcome") if isinstance(taker.get("outcome"), dict) else {}
+
+    title = market.get("title") or market.get("question") or str(market.get("id", "?"))
+    outcome = outcome_obj.get("name") or "?"
+    side = taker.get("quoteType", "?")
+    shares = _norm_amount_to_shares(match.get("amountFilled"))
+    shares_text = _fmt_num(shares, digits=4)
+    price_c = _norm_price_to_cents(match.get("priceExecuted") or taker.get("price"))
+
+    value_text = "N/A"
+    if shares is not None and price_c is not None:
+        value_text = f"${shares * price_c / 100:,.2f}"
+
+    price_text = f"{price_c:.2f}" if price_c is not None else "?"
+    return f"✅ {side} {outcome} | {shares_text} @ {price_text}c = {value_text}\n{title[:60]}"
+
 # ==================== Telegram ====================
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -381,12 +454,14 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     async with aiohttp.ClientSession() as session:
         positions = await fetch_positions(session, addr)
+        matches = await fetch_order_matches(session, addr, first=30)
 
     snapshot = {pos_key(p): pos_hash(p) for p in positions}
     watched[chat_id][addr] = WatchedWallet(
         address=addr,
         chat_id=chat_id,
         position_snapshot=snapshot,
+        order_match_snapshot={match_key(m) for m in matches},
         last_check=time.time(),
     )
 
@@ -453,6 +528,25 @@ async def cmd_pos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+async def cmd_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not ctx.args:
+        await update.message.reply_text(t(chat_id, "usage_orders"))
+        return
+
+    addr = ctx.args[0].strip()
+    async with aiohttp.ClientSession() as session:
+        matches = await fetch_order_matches(session, addr, first=10)
+
+    if not matches:
+        await update.message.reply_text(t(chat_id, "no_orders"))
+        return
+
+    lines = [t(chat_id, "orders_header", addr=fmt_addr(addr), count=len(matches)), ""]
+    lines.extend(fmt_match(m) for m in matches[:8])
+    await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     n = len(watched.pop(chat_id, {}))
@@ -481,9 +575,12 @@ async def poll_loop(app: Application):
                 for addr, w in list(wallets.items()):
                     try:
                         positions = await fetch_positions(session, w.address)
+                        matches = await fetch_order_matches(session, w.address, first=20)
                         market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
                         markets = {mid: await fetch_market(session, mid) for mid in market_ids}
                         added, changed, closed = diff_positions(w.position_snapshot, positions)
+                        new_match_keys = {match_key(m) for m in matches}
+                        new_fills = [m for m in matches if match_key(m) not in w.order_match_snapshot]
 
                         w.position_snapshot = {pos_key(p): pos_hash(p) for p in positions}
                         w.last_check = time.time()
@@ -511,6 +608,17 @@ async def poll_loop(app: Application):
                             parse_mode="HTML",
                             disable_web_page_preview=True,
                         )
+
+                        if new_fills:
+                            fill_lines = [fmt_match(m) for m in new_fills[:5]]
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=t(chat_id, "fills_header", addr=fmt_addr(w.address)) + "\n\n".join(fill_lines),
+                                parse_mode="HTML",
+                                disable_web_page_preview=True,
+                            )
+
+                        w.order_match_snapshot = set(list(new_match_keys)[:100])
                     except Exception as e:
                         logger.error(f"Poll error {addr}: {e}")
 
@@ -528,6 +636,7 @@ async def on_startup(app: Application):
             BotCommand("unwatch", "取消监控 / Unwatch wallet"),
             BotCommand("list", "监控列表 / Watch list"),
             BotCommand("pos", "查询持仓 / View positions"),
+            BotCommand("orders", "最近成交 / Recent fills"),
             BotCommand("lang", "切换语言 / Switch language"),
             BotCommand("stop", "停止全部监控 / Stop all"),
         ]
@@ -548,6 +657,7 @@ def main():
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("pos", cmd_pos))
     app.add_handler(CommandHandler("positions", cmd_pos))
+    app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("lang", cmd_lang))
 
