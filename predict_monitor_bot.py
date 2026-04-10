@@ -1,14 +1,14 @@
 # “””
 Predict.fun 钱包监控 Telegram Bot
 
-输入 EOA 钱包地址 → 轮询 GET /v1/positions/{address} → 持仓变化推送 Telegram
+Input EOA address -> poll GET /v1/positions/{address} -> push changes to Telegram
 
-依赖：pip install python-telegram-bot aiohttp
+Deps: pip install python-telegram-bot aiohttp
 
-配置：
+Config:
 
-1. TELEGRAM_BOT_TOKEN — @BotFather 获取
-1. PREDICT_API_KEY — Predict Discord 开 ticket 申请
+1. TELEGRAM_BOT_TOKEN - from @BotFather
+1. PREDICT_API_KEY - from Predict Discord
 1. python predict_monitor_bot.py
    “””
 
