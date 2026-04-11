@@ -5,6 +5,7 @@ import time
 import json
 import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import aiohttp
 from telegram import Update, BotCommand
@@ -17,6 +18,8 @@ PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
 PREDICT_API = "https://api.predict.fun"
 POLL_INTERVAL = 15
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
+DATA_FILE = DATA_DIR / "bot_data.json"
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -39,6 +42,65 @@ class WatchedWallet:
 watched: dict[int, dict[str, WatchedWallet]] = {}
 market_cache: dict[str, dict] = {}
 chat_lang: dict[int, str] = {}
+
+
+# ==================== Persistence ====================
+
+def save_data():
+    """Persist watched wallets and language preferences to disk."""
+    payload = {
+        "watched": {
+            str(chat_id): {
+                addr: {
+                    "address": w.address,
+                    "chat_id": w.chat_id,
+                    "note": w.note,
+                    "position_snapshot": w.position_snapshot,
+                    "order_match_snapshot": list(w.order_match_snapshot),
+                    "last_check": w.last_check,
+                }
+                for addr, w in wallets.items()
+            }
+            for chat_id, wallets in watched.items()
+        },
+        "chat_lang": {str(k): v for k, v in chat_lang.items()},
+    }
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = DATA_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+        tmp.replace(DATA_FILE)
+    except Exception as e:
+        logger.error(f"save_data error: {e}")
+
+
+def load_data():
+    """Load watched wallets and language preferences from disk."""
+    global watched, chat_lang
+    if not DATA_FILE.exists():
+        logger.info("No saved data file found, starting fresh")
+        return
+    try:
+        raw = json.loads(DATA_FILE.read_text())
+        for chat_id_str, wallets in raw.get("watched", {}).items():
+            chat_id = int(chat_id_str)
+            watched[chat_id] = {}
+            for addr, w_data in wallets.items():
+                watched[chat_id][addr] = WatchedWallet(
+                    address=w_data["address"],
+                    chat_id=w_data["chat_id"],
+                    note=w_data.get("note", ""),
+                    position_snapshot=w_data.get("position_snapshot", {}),
+                    order_match_snapshot=set(w_data.get("order_match_snapshot", [])),
+                    last_check=w_data.get("last_check", 0),
+                )
+        for chat_id_str, lang in raw.get("chat_lang", {}).items():
+            chat_lang[int(chat_id_str)] = lang
+        total = sum(len(w) for w in watched.values())
+        logger.info(f"Loaded {total} watched wallets, {len(chat_lang)} language preferences")
+    except Exception as e:
+        logger.error(f"load_data error: {e}")
+
 
 I18N = {
     "en": {
@@ -537,6 +599,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         order_match_snapshot={match_key(m) for m in matches},
         last_check=time.time(),
     )
+    save_data()
 
     await update.message.reply_text(
         t(chat_id, "watching_ok", addr=fmt_addr(addr), count=len(positions), interval=POLL_INTERVAL),
@@ -561,6 +624,7 @@ async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if to_remove:
         del watched[chat_id][to_remove]
+        save_data()
         await update.message.reply_text(
             t(chat_id, "removed", addr=fmt_addr(addr)),
             parse_mode="HTML",
@@ -624,6 +688,7 @@ async def cmd_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     n = len(watched.pop(chat_id, {}))
+    save_data()
     await update.message.reply_text(t(chat_id, "stopped", count=n))
 
 
@@ -635,6 +700,7 @@ async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lang = ctx.args[0].lower()
     chat_lang[chat_id] = lang
+    save_data()
     await update.message.reply_text(t(chat_id, "lang_set"))
 
 
@@ -659,6 +725,7 @@ async def cmd_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     target.note = note
+    save_data()
     await update.message.reply_text(
         t(chat_id, "note_saved", addr=fmt_addr(addr), note=note),
         parse_mode="HTML",
@@ -719,6 +786,7 @@ async def poll_loop(app: Application):
                             )
 
                         w.order_match_snapshot = set(list(new_match_keys)[:100])
+                        save_data()
                     except Exception as e:
                         logger.error(f"Poll error {addr}: {e}")
 
@@ -750,6 +818,8 @@ def main():
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
     if not PREDICT_API_KEY:
         raise RuntimeError("Missing PREDICT_API_KEY")
+
+    load_data()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
