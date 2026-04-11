@@ -10,8 +10,8 @@ from pathlib import Path
 from dataclasses import dataclass, field
 
 import aiohttp
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ==================== Config ====================
 
@@ -20,6 +20,7 @@ PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
 PREDICT_API = "https://api.predict.fun"
 POLL_INTERVAL = 15
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
+GUIDE_IMAGE_PATH = os.environ.get("GUIDE_IMAGE_PATH", os.path.join(os.path.dirname(__file__), "images", "guide_deposit_address.png"))
 
 
 def resolve_sqlite_path() -> str:
@@ -79,8 +80,25 @@ I18N = {
             "/orders <code>0xAddr</code> - recent fills\n"
             "/note <code>0xAddr remark</code> - set alias\n"
             "/dbinfo - database status\n"
-            "/lang <code>en|zh</code> - switch language\n"
             "/stop - stop all"
+        ),
+        "choose_lang": "🌐 Choose language:",
+        "btn_watch_guide": "📖 How to find wallet address",
+        "watch_guide_caption": (
+            "📖 <b>How to find your Predict.fun wallet address</b>\n\n"
+            "1. Go to Predict.fun and log in\n"
+            "2. Click <b>Deposit</b> in the top right\n"
+            "3. Find your <b>Predict Smart Wallet</b> address\n"
+            "4. Click the <b>Copy</b> button to copy the address\n"
+            "5. Use /watch <code>0xYourAddress</code> to start monitoring"
+        ),
+        "watch_guide_text": (
+            "📖 <b>How to find your Predict.fun wallet address</b>\n\n"
+            "1. Go to Predict.fun and log in\n"
+            "2. Click <b>Deposit</b> in the top right\n"
+            "3. Find your <b>Predict Smart Wallet</b> address\n"
+            "4. Click the <b>Copy</b> button to copy the address\n"
+            "5. Use /watch <code>0xYourAddress</code> to start monitoring"
         ),
         "usage_watch": "Usage: /watch 0xAddress",
         "invalid_address": "Invalid address",
@@ -131,8 +149,25 @@ I18N = {
             "/orders <code>0xAddr</code> - 查看最近成交\n"
             "/note <code>0xAddr 备注</code> - 设置备注\n"
             "/dbinfo - 查看数据库状态\n"
-            "/lang <code>en|zh</code> - 切换语言\n"
             "/stop - 清空全部监控"
+        ),
+        "choose_lang": "🌐 选择语言：",
+        "btn_watch_guide": "📖 如何找到钱包地址",
+        "watch_guide_caption": (
+            "📖 <b>如何找到你的 Predict.fun 钱包地址</b>\n\n"
+            "1. 打开 Predict.fun 并登录\n"
+            "2. 点击右上角的 <b>Deposit</b>（存款）\n"
+            "3. 找到你的 <b>Predict Smart Wallet</b> 地址\n"
+            "4. 点击 <b>Copy</b>（复制）按钮复制地址\n"
+            "5. 使用 /watch <code>0x你的地址</code> 开始监控"
+        ),
+        "watch_guide_text": (
+            "📖 <b>如何找到你的 Predict.fun 钱包地址</b>\n\n"
+            "1. 打开 Predict.fun 并登录\n"
+            "2. 点击右上角的 <b>Deposit</b>（存款）\n"
+            "3. 找到你的 <b>Predict Smart Wallet</b> 地址\n"
+            "4. 点击 <b>Copy</b>（复制）按钮复制地址\n"
+            "5. 使用 /watch <code>0x你的地址</code> 开始监控"
         ),
         "usage_watch": "用法：/watch 0x地址",
         "invalid_address": "地址格式无效",
@@ -637,7 +672,66 @@ def fmt_match(match: dict, chat_id: int) -> str:
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(t(chat_id, "start"), parse_mode="HTML")
+    keyboard = [
+        [
+            InlineKeyboardButton("🇺🇸 English", callback_data="lang_en"),
+            InlineKeyboardButton("🇨🇳 中文", callback_data="lang_zh"),
+        ],
+        [
+            InlineKeyboardButton(t(chat_id, "btn_watch_guide"), callback_data="watch_guide"),
+        ],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        t(chat_id, "start") + "\n\n" + t(chat_id, "choose_lang"),
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+    )
+
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    data = query.data
+
+    if data in ("lang_en", "lang_zh"):
+        lang = data.split("_")[1]
+        chat_lang[chat_id] = lang
+        save_chat_lang(chat_id, lang)
+
+        keyboard = [
+            [
+                InlineKeyboardButton("🇺🇸 English", callback_data="lang_en"),
+                InlineKeyboardButton("🇨🇳 中文", callback_data="lang_zh"),
+            ],
+            [
+                InlineKeyboardButton(t(chat_id, "btn_watch_guide"), callback_data="watch_guide"),
+            ],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            t(chat_id, "start") + "\n\n" + t(chat_id, "choose_lang"),
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+
+    elif data == "watch_guide":
+        guide_path = Path(GUIDE_IMAGE_PATH)
+        if guide_path.exists():
+            with open(guide_path, "rb") as photo:
+                await ctx.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo,
+                    caption=t(chat_id, "watch_guide_caption"),
+                    parse_mode="HTML",
+                )
+        else:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=t(chat_id, "watch_guide_text"),
+                parse_mode="HTML",
+            )
 
 
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -945,6 +1039,7 @@ def main():
     app.add_handler(CommandHandler("dbinfo", cmd_dbinfo))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("lang", cmd_lang))
+    app.add_handler(CallbackQueryHandler(on_callback))
 
     app.post_init = on_startup
 
