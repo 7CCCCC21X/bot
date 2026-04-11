@@ -4,6 +4,9 @@ import logging
 import time
 import json
 import hashlib
+import sqlite3
+import threading
+from pathlib import Path
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -18,11 +21,33 @@ PREDICT_API = "https://api.predict.fun"
 POLL_INTERVAL = 15
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
 
+
+def resolve_sqlite_path() -> str:
+    explicit = os.environ.get("SQLITE_PATH", "").strip()
+    if explicit:
+        return explicit
+
+    railway_mount = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    if railway_mount:
+        return str(Path(railway_mount) / "bot_state.db")
+
+    for candidate in ("/data", "/app/data"):
+        p = Path(candidate)
+        if p.exists() and p.is_dir():
+            return str(p / "bot_state.db")
+
+    return "bot_state.db"
+
+
+SQLITE_PATH = resolve_sqlite_path()
+
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+for noisy_logger in ("httpx", "httpcore", "telegram", "telegram.ext"):
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 # ==================== Data ====================
 
@@ -39,6 +64,7 @@ class WatchedWallet:
 watched: dict[int, dict[str, WatchedWallet]] = {}
 market_cache: dict[str, dict] = {}
 chat_lang: dict[int, str] = {}
+db_lock = threading.Lock()
 
 I18N = {
     "en": {
@@ -50,6 +76,7 @@ I18N = {
             "/pos <code>0xAddr</code> - view positions\n"
             "/orders <code>0xAddr</code> - recent fills\n"
             "/note <code>0xAddr remark</code> - set alias\n"
+            "/dbinfo - database status\n"
             "/lang <code>en|zh</code> - switch language\n"
             "/stop - stop all"
         ),
@@ -90,6 +117,7 @@ I18N = {
         "side_ask": "Sell",
         "view_tx": "View Tx",
         "label_order_hash": "OrderHash",
+        "db_info": "DB: <code>{path}</code>\nChats: {chats}\nWatches: {watches}\nLoaded now: {loaded}",
     },
     "zh": {
         "start": (
@@ -100,6 +128,7 @@ I18N = {
             "/pos <code>0xAddr</code> - 查看持仓\n"
             "/orders <code>0xAddr</code> - 查看最近成交\n"
             "/note <code>0xAddr 备注</code> - 设置备注\n"
+            "/dbinfo - 查看数据库状态\n"
             "/lang <code>en|zh</code> - 切换语言\n"
             "/stop - 清空全部监控"
         ),
@@ -140,10 +169,120 @@ I18N = {
         "side_ask": "卖出",
         "view_tx": "查看交易",
         "label_order_hash": "订单哈希",
+        "db_info": "数据库: <code>{path}</code>\n会话数: {chats}\n监控数: {watches}\n当前内存: {loaded}",
     },
 }
 
 # ==================== API ====================
+
+
+def db_conn():
+    db_path = Path(SQLITE_PATH)
+    if db_path.parent and str(db_path.parent) not in ("", "."):
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(SQLITE_PATH)
+
+
+def init_db():
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS watches (
+                chat_id INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                position_snapshot TEXT NOT NULL DEFAULT '{}',
+                order_match_snapshot TEXT NOT NULL DEFAULT '[]',
+                last_check REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (chat_id, address)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_lang (
+                chat_id INTEGER PRIMARY KEY,
+                lang TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def save_watch(w: WatchedWallet):
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO watches(chat_id, address, note, position_snapshot, order_match_snapshot, last_check)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(chat_id, address) DO UPDATE SET
+              note=excluded.note,
+              position_snapshot=excluded.position_snapshot,
+              order_match_snapshot=excluded.order_match_snapshot,
+              last_check=excluded.last_check
+            """,
+            (
+                w.chat_id,
+                w.address,
+                w.note,
+                json.dumps(w.position_snapshot, ensure_ascii=False),
+                json.dumps(sorted(w.order_match_snapshot), ensure_ascii=False),
+                w.last_check,
+            ),
+        )
+        conn.commit()
+
+
+def delete_watch(chat_id: int, address: str):
+    with db_lock, db_conn() as conn:
+        conn.execute("DELETE FROM watches WHERE chat_id=? AND lower(address)=lower(?)", (chat_id, address))
+        conn.commit()
+
+
+def delete_all_watches(chat_id: int):
+    with db_lock, db_conn() as conn:
+        conn.execute("DELETE FROM watches WHERE chat_id=?", (chat_id,))
+        conn.commit()
+
+
+def save_chat_lang(chat_id: int, lang: str):
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO chat_lang(chat_id, lang) VALUES(?,?)
+            ON CONFLICT(chat_id) DO UPDATE SET lang=excluded.lang
+            """,
+            (chat_id, lang),
+        )
+        conn.commit()
+
+
+def load_state():
+    with db_lock, db_conn() as conn:
+        for chat_id, lang in conn.execute("SELECT chat_id, lang FROM chat_lang"):
+            chat_lang[int(chat_id)] = lang
+
+        for row in conn.execute(
+            "SELECT chat_id, address, note, position_snapshot, order_match_snapshot, last_check FROM watches"
+        ):
+            chat_id, address, note, pos_json, matches_json, last_check = row
+            if int(chat_id) not in watched:
+                watched[int(chat_id)] = {}
+            watched[int(chat_id)][address] = WatchedWallet(
+                address=address,
+                chat_id=int(chat_id),
+                note=note or "",
+                position_snapshot=json.loads(pos_json or "{}"),
+                order_match_snapshot=set(json.loads(matches_json or "[]")),
+                last_check=float(last_check or 0),
+            )
+
+
+def db_counts() -> tuple[int, int]:
+    with db_lock, db_conn() as conn:
+        chats = conn.execute("SELECT COUNT(*) FROM chat_lang").fetchone()[0]
+        watches_count = conn.execute("SELECT COUNT(*) FROM watches").fetchone()[0]
+    return int(chats), int(watches_count)
 
 def _headers():
     return {
@@ -537,6 +676,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         order_match_snapshot={match_key(m) for m in matches},
         last_check=time.time(),
     )
+    save_watch(watched[chat_id][addr])
 
     await update.message.reply_text(
         t(chat_id, "watching_ok", addr=fmt_addr(addr), count=len(positions), interval=POLL_INTERVAL),
@@ -561,6 +701,7 @@ async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if to_remove:
         del watched[chat_id][to_remove]
+        delete_watch(chat_id, to_remove)
         await update.message.reply_text(
             t(chat_id, "removed", addr=fmt_addr(addr)),
             parse_mode="HTML",
@@ -624,6 +765,7 @@ async def cmd_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     n = len(watched.pop(chat_id, {}))
+    delete_all_watches(chat_id)
     await update.message.reply_text(t(chat_id, "stopped", count=n))
 
 
@@ -635,6 +777,7 @@ async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lang = ctx.args[0].lower()
     chat_lang[chat_id] = lang
+    save_chat_lang(chat_id, lang)
     await update.message.reply_text(t(chat_id, "lang_set"))
 
 
@@ -659,8 +802,19 @@ async def cmd_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     target.note = note
+    save_watch(target)
     await update.message.reply_text(
         t(chat_id, "note_saved", addr=fmt_addr(addr), note=note),
+        parse_mode="HTML",
+    )
+
+
+async def cmd_dbinfo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    chats, watches_count = db_counts()
+    loaded = sum(len(v) for v in watched.values())
+    await update.message.reply_text(
+        t(chat_id, "db_info", path=SQLITE_PATH, chats=chats, watches=watches_count, loaded=loaded),
         parse_mode="HTML",
     )
 
@@ -685,6 +839,7 @@ async def poll_loop(app: Application):
 
                         w.position_snapshot = {pos_key(p): pos_hash(p) for p in positions}
                         w.last_check = time.time()
+                        display_addr = fmt_addr(w.address) + (f" · {w.note}" if w.note else "")
 
                         if added or changed or closed:
                             parts = []
@@ -695,7 +850,6 @@ async def poll_loop(app: Application):
                             for k in closed:
                                 parts.append(t(chat_id, "closed_item", key=k))
 
-                            display_addr = fmt_addr(w.address) + (f" · {w.note}" if w.note else "")
                             header = t(chat_id, "poll_header", addr=display_addr)
                             text = header + "\n\n".join(parts[:8])
 
@@ -719,6 +873,7 @@ async def poll_loop(app: Application):
                             )
 
                         w.order_match_snapshot = set(list(new_match_keys)[:100])
+                        save_watch(w)
                     except Exception as e:
                         logger.error(f"Poll error {addr}: {e}")
 
@@ -729,6 +884,21 @@ async def poll_loop(app: Application):
 # ==================== Main ====================
 
 async def on_startup(app: Application):
+    init_db()
+    load_state()
+    chats, watches_count = db_counts()
+    db_path = Path(SQLITE_PATH).resolve()
+    volume_mount = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    on_volume = bool(volume_mount) and str(db_path).startswith(str(Path(volume_mount).resolve()))
+    logger.info(
+        "DB path check | path=%s exists=%s parent_writable=%s railway_volume=%s on_volume=%s",
+        db_path,
+        db_path.exists(),
+        os.access(db_path.parent, os.W_OK),
+        volume_mount or "-",
+        on_volume,
+    )
+    logger.info(f"SQLite ready at {SQLITE_PATH} | chats={chats} watches={watches_count}")
     await app.bot.set_my_commands(
         [
             BotCommand("start", "开始 / Start"),
@@ -738,6 +908,7 @@ async def on_startup(app: Application):
             BotCommand("pos", "查询持仓 / View positions"),
             BotCommand("orders", "最近成交 / Recent fills"),
             BotCommand("note", "地址备注 / Set remark"),
+            BotCommand("dbinfo", "数据库状态 / DB status"),
             BotCommand("lang", "切换语言 / Switch language"),
             BotCommand("stop", "停止全部监控 / Stop all"),
         ]
@@ -760,6 +931,7 @@ def main():
     app.add_handler(CommandHandler("positions", cmd_pos))
     app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CommandHandler("note", cmd_note))
+    app.add_handler(CommandHandler("dbinfo", cmd_dbinfo))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("lang", cmd_lang))
 
