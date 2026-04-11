@@ -25,13 +25,15 @@ TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
 def resolve_sqlite_path() -> str:
     explicit = os.environ.get("SQLITE_PATH", "").strip()
     if explicit:
-        return explicit
+        # Support values like "$RAILWAY_VOLUME_MOUNT_PATH/bot_state.db".
+        return os.path.expandvars(explicit)
 
-    railway_mount = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
-    if railway_mount:
-        return str(Path(railway_mount) / "bot_state.db")
+    for env_key in ("RAILWAY_VOLUME_MOUNT_PATH", "RAILWAY_VOLUME_PATH"):
+        mount = os.environ.get(env_key, "").strip()
+        if mount:
+            return str(Path(mount) / "bot_state.db")
 
-    for candidate in ("/data", "/app/data"):
+    for candidate in ("/data", "/app/data", "/bot-volume", "/volume"):
         p = Path(candidate)
         if p.exists() and p.is_dir():
             return str(p / "bot_state.db")
@@ -888,7 +890,10 @@ async def on_startup(app: Application):
     load_state()
     chats, watches_count = db_counts()
     db_path = Path(SQLITE_PATH).resolve()
-    volume_mount = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    volume_mount = (
+        os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+        or os.environ.get("RAILWAY_VOLUME_PATH", "").strip()
+    )
     on_volume = bool(volume_mount) and str(db_path).startswith(str(Path(volume_mount).resolve()))
     logger.info(
         "DB path check | path=%s exists=%s parent_writable=%s railway_volume=%s on_volume=%s",
@@ -899,6 +904,12 @@ async def on_startup(app: Application):
         on_volume,
     )
     logger.info(f"SQLite ready at {SQLITE_PATH} | chats={chats} watches={watches_count}")
+    if "$" in SQLITE_PATH:
+        logger.warning("SQLITE_PATH still contains '$'; check env var expansion in deployment settings")
+    if not volume_mount:
+        logger.warning("No railway volume env detected; set SQLITE_PATH to a mounted volume to keep data across deploys")
+    elif not on_volume:
+        logger.warning("SQLite path is not under railway volume mount; data may be lost after redeploy")
     await app.bot.set_my_commands(
         [
             BotCommand("start", "开始 / Start"),
