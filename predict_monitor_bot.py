@@ -528,9 +528,17 @@ def display_fields(pos: dict, market: dict | None = None) -> tuple[str, str, str
     shares_num = _norm_amount_to_shares(pos.get("shares") or pos.get("quantity") or pos.get("amount"))
     shares = _fmt_num(shares_num, digits=4) if shares_num is not None else "0"
 
+    # Prefer the user's entry/average cost basis over the current mark price.
+    # Position-change notifications are about what the watched wallet did, so
+    # "价值" should reflect what they actually spent on those shares rather
+    # than today's market quote (which may have already drifted).
     price_raw = (
-        pos.get("currentPrice")
-        or pos.get("avgPrice")
+        pos.get("avgPrice")
+        or pos.get("averagePrice")
+        or pos.get("entryPrice")
+        or pos.get("avgEntryPrice")
+        or pos.get("costBasis")
+        or pos.get("currentPrice")
         or outcome_obj.get("price")
     )
     if price_raw is None and idx is not None:
@@ -550,7 +558,12 @@ def display_fields(pos: dict, market: dict | None = None) -> tuple[str, str, str
 
     price_c = _norm_price_to_cents(price_raw)
     if price_c is None:
-        value_usd = _safe_float(pos.get("valueUsd") or pos.get("value_usd"))
+        value_usd = _safe_float(
+            pos.get("costUsd")
+            or pos.get("cost_usd")
+            or pos.get("valueUsd")
+            or pos.get("value_usd")
+        )
         if value_usd is not None and shares_num and shares_num > 0:
             price_c = value_usd / shares_num * 100
 
