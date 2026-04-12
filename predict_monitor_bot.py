@@ -631,23 +631,39 @@ def fmt_match(match: dict, chat_id: int) -> str:
     side = _side_text(taker.get("quoteType", "?"), chat_id)
     shares = _norm_amount_to_shares(match.get("amountFilled"))
     shares_text = _fmt_num(shares, digits=4)
-    price_c = _norm_price_to_cents(match.get("priceExecuted") or taker.get("price"))
 
-    # Prefer deriving executed price from filled amounts when available.
+    # Derive executed price and total USD value from on-chain filled amounts
+    # whenever possible — these are the ground truth from the settlement. The
+    # API's `priceExecuted` / `taker.price` fields are only used as a fallback,
+    # because they can arrive in varying scales that are easy to misinterpret.
     maker_amt = _norm_amount_to_shares(match.get("makerAmountFilled"))
     taker_amt = _norm_amount_to_shares(match.get("takerAmountFilled"))
-    maker_asset_id = str(match.get("makerAssetId", ""))
-    taker_asset_id = str(match.get("takerAssetId", ""))
-    if maker_amt and taker_amt and maker_amt > 0 and taker_amt > 0:
-        # Asset id 0 is collateral token; non-zero is position token.
-        if maker_asset_id == "0" and taker_asset_id != "0":
-            price_c = maker_amt / taker_amt * 100
-        elif taker_asset_id == "0" and maker_asset_id != "0":
-            price_c = taker_amt / maker_amt * 100
 
-    value_text = "N/A"
-    if shares is not None and price_c is not None:
+    price_c = None
+    total_usd = None
+    if (
+        shares is not None and shares > 0
+        and maker_amt is not None and maker_amt > 0
+        and taker_amt is not None and taker_amt > 0
+    ):
+        # One side is the position token (matches `amountFilled`), the other is
+        # the collateral (USD). Pick whichever is closer to `shares` as the
+        # position side; the other is the collateral total.
+        if abs(maker_amt - shares) <= abs(taker_amt - shares):
+            total_usd = taker_amt
+        else:
+            total_usd = maker_amt
+        price_c = total_usd / shares * 100
+
+    if price_c is None:
+        price_c = _norm_price_to_cents(match.get("priceExecuted") or taker.get("price"))
+
+    if total_usd is not None:
+        value_text = f"${total_usd:,.2f}"
+    elif shares is not None and price_c is not None:
         value_text = f"${shares * price_c / 100:,.2f}"
+    else:
+        value_text = "N/A"
 
     price_text = f"{price_c:.2f}" if price_c is not None else "?"
     tx = match.get("transactionHash") or "N/A"
