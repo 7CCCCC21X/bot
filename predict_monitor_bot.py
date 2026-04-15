@@ -78,6 +78,7 @@ I18N = {
             "/pos <code>0xAddr</code> - view positions\n"
             "/orders <code>0xAddr</code> - recent fills\n"
             "/note <code>0xAddr remark</code> - set alias\n"
+            "/dbinfo - database status\n"
             "/stop - stop all"
         ),
         "choose_lang": "🌐 Choose language:",
@@ -139,6 +140,7 @@ I18N = {
         "label_fill": "Fill",
         "label_total_pos": "Total position",
         "label_prev_shares": "Prev",
+        "db_info": "DB: <code>{path}</code>\nChats: {chats}\nWatches: {watches}\nLoaded now: {loaded}",
     },
     "zh": {
         "start": (
@@ -149,6 +151,7 @@ I18N = {
             "/pos <code>0xAddr</code> - 查看持仓\n"
             "/orders <code>0xAddr</code> - 查看最近成交\n"
             "/note <code>0xAddr 备注</code> - 设置备注\n"
+            "/dbinfo - 查看数据库状态\n"
             "/stop - 清空全部监控"
         ),
         "choose_lang": "🌐 选择语言：",
@@ -210,6 +213,7 @@ I18N = {
         "label_fill": "本次成交",
         "label_total_pos": "总持仓",
         "label_prev_shares": "原持仓",
+        "db_info": "数据库: <code>{path}</code>\n会话数: {chats}\n监控数: {watches}\n当前内存: {loaded}",
     },
 }
 
@@ -1050,6 +1054,15 @@ async def cmd_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_dbinfo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    chats, watches_count = db_counts()
+    loaded = sum(len(v) for v in watched.values())
+    await update.message.reply_text(
+        t(chat_id, "db_info", path=SQLITE_PATH, chats=chats, watches=watches_count, loaded=loaded),
+        parse_mode="HTML",
+    )
+
 # ==================== Poll Loop ====================
 
 async def poll_loop(app: Application):
@@ -1163,6 +1176,7 @@ async def on_startup(app: Application):
             BotCommand("pos", "查询持仓 / View positions"),
             BotCommand("orders", "最近成交 / Recent fills"),
             BotCommand("note", "地址备注 / Set remark"),
+            BotCommand("dbinfo", "数据库状态 / DB status"),
             BotCommand("lang", "切换语言 / Switch language"),
             BotCommand("stop", "停止全部监控 / Stop all"),
         ]
@@ -1185,6 +1199,7 @@ def main():
     app.add_handler(CommandHandler("positions", cmd_pos))
     app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CommandHandler("note", cmd_note))
+    app.add_handler(CommandHandler("dbinfo", cmd_dbinfo))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CallbackQueryHandler(on_callback))
