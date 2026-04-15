@@ -43,6 +43,16 @@ GUIDE_IMAGE_PATH = os.environ.get("GUIDE_IMAGE_PATH", os.path.join(os.path.dirna
 ERROR_ALERT_THRESHOLD = 5
 LIST_PAGE_SIZE = 8
 
+# Categories for the /help browser. Keys are i18n-less identifiers; labels and
+# command help strings live in I18N under `help_cat_<id>` and `help_cmd_<name>`.
+HELP_CATEGORIES: list[tuple[str, list[str]]] = [
+    ("watch", ["watch", "unwatch", "list", "note", "mute", "unmute", "stop"]),
+    ("query", ["pos", "portfolio", "orders", "history"]),
+    ("alert", ["alert", "alerts", "unalert"]),
+    ("filter", ["threshold", "interval"]),
+    ("other", ["settings", "lang", "export", "import", "start"]),
+]
+
 
 def resolve_sqlite_path() -> str:
     explicit = os.environ.get("SQLITE_PATH", "").strip()
@@ -292,6 +302,145 @@ I18N = {
             "<code>/watch 0x1234…abcd alice</code>  — with note\n"
             "<code>/watch 0xAAA 0xBBB 0xCCC</code>  — multiple"
         ),
+        # --- /help browser ---
+        "help_title": "📖 <b>Feature guide</b>\n\nPick a category to browse commands:",
+        "help_cmd_title": "<b>{cmd}</b>\n\n",
+        "btn_back": "⬅ Back",
+        "btn_help": "📖 Feature guide",
+        "help_cat_watch": "📡 Watch management",
+        "help_cat_query": "🔎 Queries",
+        "help_cat_alert": "🔔 Alerts",
+        "help_cat_filter": "🎚 Filters",
+        "help_cat_other": "⚙ Other",
+        "help_cat_header_watch": "📡 <b>Watch management</b>\n\n",
+        "help_cat_header_query": "🔎 <b>Queries</b>\n\n",
+        "help_cat_header_alert": "🔔 <b>Alerts</b>\n\n",
+        "help_cat_header_filter": "🎚 <b>Filters</b>\n\n",
+        "help_cat_header_other": "⚙ <b>Other</b>\n\n",
+        # Per-command help blurbs.
+        "help_cmd_start": "<b>/start</b> — Welcome screen\n\nShows the welcome message, language picker, and the wallet-discovery guide.",
+        "help_cmd_watch": (
+            "<b>/watch</b> — Start monitoring one or more wallets\n\n"
+            "Subscribes to position changes, new fills and market resolutions for the given wallet(s). "
+            "Calling /watch without arguments opens the wallet-discovery guide.\n\n"
+            "<b>Usage</b>\n"
+            "• <code>/watch 0x1234…abcd</code>\n"
+            "• <code>/watch 0x1234…abcd alice</code>  (with note)\n"
+            "• <code>/watch 0xAAA 0xBBB 0xCCC</code>  (bulk)"
+        ),
+        "help_cmd_unwatch": (
+            "<b>/unwatch</b> — Stop watching a wallet\n\n"
+            "Accepts either the raw address or its note (alias).\n\n"
+            "<b>Usage</b>\n"
+            "• <code>/unwatch 0x1234…abcd</code>\n"
+            "• <code>/unwatch alice</code>"
+        ),
+        "help_cmd_list": (
+            "<b>/list</b> — Watched wallets\n\n"
+            "One row per wallet with full address, note, position count and last-check time. "
+            "Each row has inline buttons for 📊 positions, 📜 fills, ✏️ edit-note, 🔕/🔔 mute toggle and 🛑 unwatch. "
+            "Paginates at 8 wallets per page."
+        ),
+        "help_cmd_pos": (
+            "<b>/pos</b> — Positions for a wallet\n\n"
+            "Shows current holdings with cost basis, mark price, unrealized P&L per position and in total. "
+            "Buttons let you refresh, switch to fills, change sort order (value / size / alpha), "
+            "or expand the portfolio summary card.\n\n"
+            "<b>Usage</b>\n"
+            "• <code>/pos 0x1234…abcd</code>\n"
+            "• <code>/pos alice</code>"
+        ),
+        "help_cmd_portfolio": (
+            "<b>/portfolio</b> — Portfolio summary card\n\n"
+            "Same as /pos but opens with the portfolio card expanded (deployed capital, largest holding, total P&L). "
+            "You can also reach it from the 📊 Portfolio card button inside /pos."
+        ),
+        "help_cmd_orders": (
+            "<b>/orders</b> — Recent fills\n\n"
+            "Up to 30 fills paginated 8 per page. Partial fills of the same order are merged into one line with a "
+            "(N fills) suffix. Each fill shows the executed price, USD value, the wallet's total holding in that market, "
+            "and a link to the on-chain transaction."
+        ),
+        "help_cmd_note": (
+            "<b>/note</b> — Set a note / alias\n\n"
+            "After setting, you can use the note instead of the full 0x address in every other command.\n\n"
+            "<b>Usage</b>\n"
+            "• <code>/note 0x1234…abcd alice</code>\n\n"
+            "💡 Tip: in /list you can tap the ✏️ button next to a wallet to edit its note inline."
+        ),
+        "help_cmd_mute": (
+            "<b>/mute</b> — Silence alerts for a wallet\n\n"
+            "The wallet is still polled, but position/fill notifications are suppressed. Price alerts still fire.\n\n"
+            "<b>Usage</b>\n• <code>/mute alice</code>\n\n"
+            "💡 Tip: the 🔕 button in /list toggles mute."
+        ),
+        "help_cmd_unmute": (
+            "<b>/unmute</b> — Resume alerts for a wallet\n\n"
+            "<b>Usage</b>\n• <code>/unmute alice</code>\n\n"
+            "💡 Tip: the 🔔 button in /list toggles unmute."
+        ),
+        "help_cmd_stop": (
+            "<b>/stop</b> — Remove every watched wallet\n\n"
+            "Nukes all monitoring for this chat. Price alerts and event history for those wallets also go away."
+        ),
+        "help_cmd_history": (
+            "<b>/history</b> — Activity log for a wallet\n\n"
+            "Shows the latest 20 events (open / change / close / fill / resolve / alert) with relative timestamps. "
+            "The bot keeps up to 500 events per wallet.\n\n"
+            "<b>Usage</b>\n• <code>/history alice</code>"
+        ),
+        "help_cmd_alert": (
+            "<b>/alert</b> — Set a one-shot price alert\n\n"
+            "Fires a single notification when the market price of the wallet's position in that outcome crosses a "
+            "threshold. The rule is automatically deleted after firing.\n\n"
+            "<b>Usage</b>\n"
+            "• <code>/alert alice YES &gt;= 80</code>  (in cents, 0–100)\n"
+            "• <code>/alert 0xAddr NO &lt;= 25</code>"
+        ),
+        "help_cmd_alerts": (
+            "<b>/alerts</b> — List active alerts\n\n"
+            "<b>Usage</b>\n"
+            "• <code>/alerts</code>  (all alerts)\n"
+            "• <code>/alerts alice</code>  (alerts for one wallet)"
+        ),
+        "help_cmd_unalert": (
+            "<b>/unalert</b> — Delete an alert by id\n\n"
+            "Get the id from /alerts.\n\n"
+            "<b>Usage</b>\n• <code>/unalert 42</code>"
+        ),
+        "help_cmd_threshold": (
+            "<b>/threshold</b> — Min-change filter per wallet\n\n"
+            "Suppresses position-change notifications whose share delta is smaller than the given percent. "
+            "0 disables the filter (default).\n\n"
+            "<b>Usage</b>\n• <code>/threshold alice 5</code>  (ignore &lt;5% rebalances)"
+        ),
+        "help_cmd_interval": (
+            "<b>/interval</b> — Per-wallet poll interval\n\n"
+            "0 (default) means use the global interval. Minimum when set is 5 seconds.\n\n"
+            "<b>Usage</b>\n• <code>/interval alice 60</code>  (poll every 60s)"
+        ),
+        "help_cmd_settings": (
+            "<b>/settings</b> — Preferences card\n\n"
+            "Shows current language, global poll interval, watch count and muted count. "
+            "Language buttons toggle EN/中文 in place."
+        ),
+        "help_cmd_lang": (
+            "<b>/lang</b> — Switch bot language\n\n"
+            "<b>Usage</b>\n"
+            "• <code>/lang en</code>\n"
+            "• <code>/lang zh</code>\n\n"
+            "💡 Tip: /start and /settings both have language buttons."
+        ),
+        "help_cmd_export": (
+            "<b>/export</b> — Download your watch list\n\n"
+            "Emits a <code>predict_watches.json</code> file with every watched address, note and muted flag. "
+            "Use /import to restore it later."
+        ),
+        "help_cmd_import": (
+            "<b>/import</b> — Bulk-import a watch list\n\n"
+            "Reply to a <code>predict_watches.json</code> file (or any JSON document with the same shape) with /import "
+            "to add the wallets in bulk. Duplicates are skipped. Max size 256 KB."
+        ),
     },
     "zh": {
         "choose_lang": "🌐 选择语言：",
@@ -465,6 +614,129 @@ I18N = {
             "<code>/watch 0x1234…abcd</code>  — 单个钱包\n"
             "<code>/watch 0x1234…abcd 张三</code>  — 带备注\n"
             "<code>/watch 0xAAA 0xBBB 0xCCC</code>  — 批量"
+        ),
+        # --- /help 浏览器 ---
+        "help_title": "📖 <b>功能介绍</b>\n\n请选择分类，查看命令详情：",
+        "help_cmd_title": "<b>{cmd}</b>\n\n",
+        "btn_back": "⬅ 返回",
+        "btn_help": "📖 功能介绍",
+        "help_cat_watch": "📡 监控管理",
+        "help_cat_query": "🔎 查询",
+        "help_cat_alert": "🔔 警报",
+        "help_cat_filter": "🎚 过滤",
+        "help_cat_other": "⚙ 其他",
+        "help_cat_header_watch": "📡 <b>监控管理</b>\n\n",
+        "help_cat_header_query": "🔎 <b>查询</b>\n\n",
+        "help_cat_header_alert": "🔔 <b>警报</b>\n\n",
+        "help_cat_header_filter": "🎚 <b>过滤</b>\n\n",
+        "help_cat_header_other": "⚙ <b>其他</b>\n\n",
+        "help_cmd_start": "<b>/start</b> — 欢迎页\n\n显示欢迎信息、语言切换，以及「如何找到钱包地址」图文指南。",
+        "help_cmd_watch": (
+            "<b>/watch</b> — 开始监控钱包\n\n"
+            "对给定地址订阅持仓变化、新成交和市场结算通知。不带参数调用会直接弹出「如何找到钱包地址」指南。\n\n"
+            "<b>用法</b>\n"
+            "• <code>/watch 0x1234…abcd</code>\n"
+            "• <code>/watch 0x1234…abcd 张三</code>（带备注）\n"
+            "• <code>/watch 0xAAA 0xBBB 0xCCC</code>（批量）"
+        ),
+        "help_cmd_unwatch": (
+            "<b>/unwatch</b> — 取消监控某个钱包\n\n"
+            "地址或备注都可以。\n\n"
+            "<b>用法</b>\n"
+            "• <code>/unwatch 0x1234…abcd</code>\n"
+            "• <code>/unwatch 张三</code>"
+        ),
+        "help_cmd_list": (
+            "<b>/list</b> — 查看所有被监控的钱包\n\n"
+            "每行显示完整地址、备注、持仓数和最后检查时间。每行配 📊 持仓 / 📜 成交 / ✏️ 编辑备注 / 🔕🔔 静音切换 / 🛑 取消监控 按钮，超过 8 个自动分页。"
+        ),
+        "help_cmd_pos": (
+            "<b>/pos</b> — 查询钱包当前持仓\n\n"
+            "显示每个仓位的成本、现价、浮动盈亏，以及总盈亏。按钮支持 🔄 刷新 / 📜 查看成交 / ↕ 切换排序（价值/数量/字母）/ 📊 汇总卡片。\n\n"
+            "<b>用法</b>\n"
+            "• <code>/pos 0x1234…abcd</code>\n"
+            "• <code>/pos 张三</code>"
+        ),
+        "help_cmd_portfolio": (
+            "<b>/portfolio</b> — 持仓汇总卡片\n\n"
+            "和 /pos 功能一样，但默认展开「汇总卡片」：已投入、最大仓、总浮动盈亏。也可以从 /pos 的「📊 汇总卡片」按钮进入。"
+        ),
+        "help_cmd_orders": (
+            "<b>/orders</b> — 最近成交\n\n"
+            "最多 30 条，每页 8 条翻页。相同订单的分段成交合并成一条（带「共 N 笔」后缀）。每条显示成交价格、USD 价值、钱包在该市场的总持仓以及链上交易哈希。"
+        ),
+        "help_cmd_note": (
+            "<b>/note</b> — 设置地址备注/别名\n\n"
+            "设置后，所有命令里都可以用备注代替地址输入。\n\n"
+            "<b>用法</b>\n• <code>/note 0x1234…abcd 张三</code>\n\n"
+            "💡 提示：在 /list 里点 ✏️ 按钮可以直接就地修改备注。"
+        ),
+        "help_cmd_mute": (
+            "<b>/mute</b> — 暂停某钱包的提醒\n\n"
+            "轮询继续，但持仓/成交的通知会被压掉。价格警报仍然生效。\n\n"
+            "<b>用法</b>\n• <code>/mute 张三</code>\n\n"
+            "💡 提示：/list 里 🔕 按钮可以一键切换。"
+        ),
+        "help_cmd_unmute": (
+            "<b>/unmute</b> — 恢复提醒\n\n"
+            "<b>用法</b>\n• <code>/unmute 张三</code>\n\n"
+            "💡 提示：/list 里 🔔 按钮可以一键切换。"
+        ),
+        "help_cmd_stop": (
+            "<b>/stop</b> — 清空当前会话的全部监控\n\n"
+            "会一并删掉这些钱包的价格警报和历史记录。请谨慎使用。"
+        ),
+        "help_cmd_history": (
+            "<b>/history</b> — 某个钱包的操作历史\n\n"
+            "最近 20 条事件（open / change / close / fill / resolve / alert），带相对时间。每个钱包最多保留 500 条。\n\n"
+            "<b>用法</b>\n• <code>/history 张三</code>"
+        ),
+        "help_cmd_alert": (
+            "<b>/alert</b> — 单次价格警报\n\n"
+            "当指定钱包在指定结果上的市场价跨越阈值时推送一次通知，然后自动删除。\n\n"
+            "<b>用法</b>\n"
+            "• <code>/alert 张三 YES &gt;= 80</code>（cents，0–100）\n"
+            "• <code>/alert 0x地址 NO &lt;= 25</code>"
+        ),
+        "help_cmd_alerts": (
+            "<b>/alerts</b> — 查看已设置的警报\n\n"
+            "<b>用法</b>\n"
+            "• <code>/alerts</code>（全部）\n"
+            "• <code>/alerts 张三</code>（单个钱包）"
+        ),
+        "help_cmd_unalert": (
+            "<b>/unalert</b> — 按 id 删除警报\n\n"
+            "id 可以从 /alerts 的输出里找到。\n\n"
+            "<b>用法</b>\n• <code>/unalert 42</code>"
+        ),
+        "help_cmd_threshold": (
+            "<b>/threshold</b> — 单钱包最小变动过滤\n\n"
+            "份额变动小于设定百分比的通知会被丢掉。0 = 关闭过滤（默认）。\n\n"
+            "<b>用法</b>\n• <code>/threshold 张三 5</code>（&lt; 5% 的调仓不提醒）"
+        ),
+        "help_cmd_interval": (
+            "<b>/interval</b> — 单钱包独立轮询间隔\n\n"
+            "0（默认）使用全局间隔。设置时最小 5 秒。\n\n"
+            "<b>用法</b>\n• <code>/interval 张三 60</code>（60 秒一次）"
+        ),
+        "help_cmd_settings": (
+            "<b>/settings</b> — 偏好面板\n\n"
+            "显示当前语言、全局轮询间隔、监控数和静音数，下面有语言切换按钮。"
+        ),
+        "help_cmd_lang": (
+            "<b>/lang</b> — 切换机器人语言\n\n"
+            "<b>用法</b>\n"
+            "• <code>/lang zh</code>\n"
+            "• <code>/lang en</code>\n\n"
+            "💡 提示：/start 和 /settings 里都有 🇺🇸/🇨🇳 按钮可以切换。"
+        ),
+        "help_cmd_export": (
+            "<b>/export</b> — 导出监控列表\n\n"
+            "生成 <code>predict_watches.json</code>，包含每个钱包的地址、备注、静音状态。可以用 /import 恢复。"
+        ),
+        "help_cmd_import": (
+            "<b>/import</b> — 批量导入监控列表\n\n"
+            "回复一个 <code>predict_watches.json</code> 文件（或相同格式的 JSON），附带 /import 即可批量添加。重复的会跳过，最大 256 KB。"
         ),
     },
 }
@@ -1601,6 +1873,7 @@ def _start_keyboard(chat_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🇨🇳 中文", callback_data="lang_zh"),
             ],
             [InlineKeyboardButton(t(chat_id, "btn_watch_guide"), callback_data="watch_guide")],
+            [InlineKeyboardButton(t(chat_id, "btn_help"), callback_data="help_root")],
         ]
     )
 
@@ -2411,6 +2684,69 @@ async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ---- /help browser ----------------------------------------------------
+
+
+def _help_root_markup(chat_id: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for cat_id, _ in HELP_CATEGORIES:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    t(chat_id, f"help_cat_{cat_id}"),
+                    callback_data=f"help_cat:{cat_id}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+def _help_category_markup(chat_id: int, cat_id: str) -> InlineKeyboardMarkup:
+    cmds = next((cs for cid, cs in HELP_CATEGORIES if cid == cat_id), [])
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for c in cmds:
+        row.append(
+            InlineKeyboardButton(f"/{c}", callback_data=f"help_cmd:{c}:{cat_id}")
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(t(chat_id, "btn_back"), callback_data="help_root")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _help_command_markup(chat_id: int, cat_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(t(chat_id, "btn_back"), callback_data=f"help_cat:{cat_id}")]]
+    )
+
+
+def _help_category_text(chat_id: int, cat_id: str) -> str:
+    cmds = next((cs for cid, cs in HELP_CATEGORIES if cid == cat_id), [])
+    # Tiny one-liner per command — first line of each help blurb.
+    lines = [t(chat_id, f"help_cat_header_{cat_id}")]
+    for c in cmds:
+        blurb = t(chat_id, f"help_cmd_{c}")
+        first = blurb.split("\n", 1)[0]
+        lines.append(f"• {first}")
+    lines.append("")
+    lines.append("👇")
+    return "\n".join(lines)
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(
+        t(chat_id, "help_title"),
+        parse_mode="HTML",
+        reply_markup=_help_root_markup(chat_id),
+        disable_web_page_preview=True,
+    )
+
+
 # ---- /import: either reply-to a JSON document OR forward a JSON document.
 
 MAX_IMPORT_BYTES = 256 * 1024
@@ -2708,6 +3044,53 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "watch_guide":
         await _send_watch_guide(ctx, chat_id)
+        return
+
+    # /help browser callbacks.
+    if data == "help_root":
+        try:
+            await query.edit_message_text(
+                t(chat_id, "help_title"),
+                parse_mode="HTML",
+                reply_markup=_help_root_markup(chat_id),
+                disable_web_page_preview=True,
+            )
+        except BadRequest:
+            pass
+        return
+
+    if data.startswith("help_cat:"):
+        cat_id = data.split(":", 1)[1]
+        if cat_id not in {cid for cid, _ in HELP_CATEGORIES}:
+            return
+        try:
+            await query.edit_message_text(
+                _help_category_text(chat_id, cat_id),
+                parse_mode="HTML",
+                reply_markup=_help_category_markup(chat_id, cat_id),
+                disable_web_page_preview=True,
+            )
+        except BadRequest:
+            pass
+        return
+
+    if data.startswith("help_cmd:"):
+        parts = data.split(":")
+        cmd = parts[1] if len(parts) > 1 else ""
+        back_cat = parts[2] if len(parts) > 2 else "other"
+        i18n_key = f"help_cmd_{cmd}"
+        # Safety net: if someone passes an unknown command, bounce back.
+        if i18n_key not in I18N.get(get_lang(chat_id), {}) and i18n_key not in I18N["en"]:
+            return
+        try:
+            await query.edit_message_text(
+                t(chat_id, i18n_key),
+                parse_mode="HTML",
+                reply_markup=_help_command_markup(chat_id, back_cat),
+                disable_web_page_preview=True,
+            )
+        except BadRequest:
+            pass
         return
 
 
@@ -3094,28 +3477,23 @@ async def on_startup(app: Application):
         logger.warning("No railway volume env detected; set SQLITE_PATH to a mounted volume to keep data across deploys")
     elif not on_volume:
         logger.warning("SQLite path is not under railway volume mount; data may be lost after redeploy")
+    # Trimmed to a daily-use core. Commands not in this list still work if
+    # typed directly (mute/note/portfolio/lang/etc. are also exposed as inline
+    # buttons in /list, /pos and /settings).
     await app.bot.set_my_commands(
         [
             BotCommand("start", "开始 / Start"),
+            BotCommand("help", "功能介绍 / Help"),
             BotCommand("watch", "监控地址 / Watch wallet(s)"),
             BotCommand("unwatch", "取消监控 / Unwatch wallet"),
             BotCommand("list", "监控列表 / Watch list"),
             BotCommand("pos", "查询持仓 / View positions"),
-            BotCommand("portfolio", "持仓汇总 / Portfolio summary"),
             BotCommand("orders", "最近成交 / Recent fills"),
-            BotCommand("note", "地址备注 / Set remark"),
-            BotCommand("mute", "暂停提醒 / Mute wallet"),
-            BotCommand("unmute", "恢复提醒 / Unmute wallet"),
-            BotCommand("threshold", "最小变动过滤 / Min-change filter"),
-            BotCommand("interval", "轮询间隔 / Per-wallet interval"),
             BotCommand("alert", "价格警报 / Price alert"),
             BotCommand("alerts", "警报列表 / List alerts"),
-            BotCommand("unalert", "删除警报 / Remove alert"),
             BotCommand("history", "操作历史 / Activity log"),
             BotCommand("settings", "偏好设置 / Settings"),
             BotCommand("export", "导出监控 / Export watches"),
-            BotCommand("import", "导入监控 / Import watches"),
-            BotCommand("lang", "切换语言 / Switch language"),
             BotCommand("stop", "停止全部监控 / Stop all"),
         ]
     )
@@ -3130,6 +3508,7 @@ def main():
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("watch", cmd_watch))
     app.add_handler(CommandHandler("unwatch", cmd_unwatch))
     app.add_handler(CommandHandler("list", cmd_list))
