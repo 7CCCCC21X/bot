@@ -104,7 +104,6 @@ I18N = {
             "/unmute <code>addr|alias</code> - resume alerts\n"
             "/settings - preferences\n"
             "/export - export watch list\n"
-            "/dbinfo - database status\n"
             "/stop - stop all"
         ),
         "choose_lang": "🌐 Choose language:",
@@ -175,7 +174,6 @@ I18N = {
         "label_last_check": "Last check",
         "label_muted_flag": "🔕 muted",
         "label_watching_flag": "👁 watching",
-        "db_info": "DB: <code>{path}</code>\nChats: {chats}\nWatches: {watches}\nLoaded now: {loaded}",
         "watching_multi": "Added {added} new, skipped {skipped} already-watching / invalid.",
         "usage_mute": "Usage: /mute addr|alias",
         "usage_unmute": "Usage: /unmute addr|alias",
@@ -211,7 +209,6 @@ I18N = {
             "/unmute <code>地址或备注</code> - 恢复提醒\n"
             "/settings - 偏好设置\n"
             "/export - 导出监控列表\n"
-            "/dbinfo - 查看数据库状态\n"
             "/stop - 清空全部监控"
         ),
         "choose_lang": "🌐 选择语言：",
@@ -282,7 +279,6 @@ I18N = {
         "label_last_check": "最后检查",
         "label_muted_flag": "🔕 已静音",
         "label_watching_flag": "👁 监控中",
-        "db_info": "数据库: <code>{path}</code>\n会话数: {chats}\n监控数: {watches}\n当前内存: {loaded}",
         "watching_multi": "新增 {added} 个监控，跳过 {skipped} 个（已存在或格式错误）。",
         "usage_mute": "用法：/mute 地址或备注",
         "usage_unmute": "用法：/unmute 地址或备注",
@@ -1443,16 +1439,6 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_dbinfo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    chats, watches_count = db_counts()
-    loaded = sum(len(v) for v in watched.values())
-    await update.message.reply_text(
-        t(chat_id, "db_info", path=SQLITE_PATH, chats=chats, watches=watches_count, loaded=loaded),
-        parse_mode="HTML",
-    )
-
-
 # ==================== Callback handling ====================
 
 
@@ -1755,7 +1741,6 @@ async def on_startup(app: Application):
             BotCommand("unmute", "恢复提醒 / Unmute wallet"),
             BotCommand("settings", "偏好设置 / Settings"),
             BotCommand("export", "导出监控 / Export watches"),
-            BotCommand("dbinfo", "数据库状态 / DB status"),
             BotCommand("lang", "切换语言 / Switch language"),
             BotCommand("stop", "停止全部监控 / Stop all"),
         ]
@@ -1782,7 +1767,6 @@ def main():
     app.add_handler(CommandHandler("unmute", cmd_unmute))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("export", cmd_export))
-    app.add_handler(CommandHandler("dbinfo", cmd_dbinfo))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CallbackQueryHandler(on_callback))
