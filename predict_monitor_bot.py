@@ -45,12 +45,13 @@ LIST_PAGE_SIZE = 8
 
 # Categories for the /help browser. Keys are i18n-less identifiers; labels and
 # command help strings live in I18N under `help_cat_<id>` and `help_cmd_<name>`.
+# Kept in lock-step with set_my_commands so the feature guide only shows what
+# the menu bar shows. Handlers for removed commands (/alert /export /mute etc.)
+# are still registered so typing them continues to work.
 HELP_CATEGORIES: list[tuple[str, list[str]]] = [
-    ("watch", ["watch", "unwatch", "list", "note", "mute", "unmute", "stop"]),
-    ("query", ["pos", "portfolio", "orders", "history"]),
-    ("alert", ["alert", "alerts", "unalert"]),
-    ("filter", ["threshold", "interval"]),
-    ("other", ["settings", "lang", "export", "import", "start"]),
+    ("watch", ["watch", "unwatch", "list", "stop"]),
+    ("query", ["pos", "orders", "history"]),
+    ("other", ["settings", "start"]),
 ]
 
 
@@ -3489,11 +3490,8 @@ async def on_startup(app: Application):
             BotCommand("list", "监控列表 / Watch list"),
             BotCommand("pos", "查询持仓 / View positions"),
             BotCommand("orders", "最近成交 / Recent fills"),
-            BotCommand("alert", "价格警报 / Price alert"),
-            BotCommand("alerts", "警报列表 / List alerts"),
             BotCommand("history", "操作历史 / Activity log"),
             BotCommand("settings", "偏好设置 / Settings"),
-            BotCommand("export", "导出监控 / Export watches"),
             BotCommand("stop", "停止全部监控 / Stop all"),
         ]
     )
