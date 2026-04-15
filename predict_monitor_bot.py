@@ -1745,12 +1745,16 @@ async def on_startup(app: Application):
     await app.bot.set_my_commands(
         [
             BotCommand("start", "开始 / Start"),
-            BotCommand("watch", "监控地址 / Watch wallet"),
+            BotCommand("watch", "监控地址 / Watch wallet(s)"),
             BotCommand("unwatch", "取消监控 / Unwatch wallet"),
             BotCommand("list", "监控列表 / Watch list"),
             BotCommand("pos", "查询持仓 / View positions"),
             BotCommand("orders", "最近成交 / Recent fills"),
             BotCommand("note", "地址备注 / Set remark"),
+            BotCommand("mute", "暂停提醒 / Mute wallet"),
+            BotCommand("unmute", "恢复提醒 / Unmute wallet"),
+            BotCommand("settings", "偏好设置 / Settings"),
+            BotCommand("export", "导出监控 / Export watches"),
             BotCommand("dbinfo", "数据库状态 / DB status"),
             BotCommand("lang", "切换语言 / Switch language"),
             BotCommand("stop", "停止全部监控 / Stop all"),
