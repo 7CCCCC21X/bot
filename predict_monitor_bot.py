@@ -149,7 +149,11 @@ I18N = {
         "removed": "Removed <code>{addr}</code>",
         "not_found": "Not found",
         "no_watched_wallets": "No watched wallets",
-        "watch_list": "<b>Watch List</b>\n",
+        "watch_list": (
+            "<b>Watch List</b>\n"
+            "<i>💡 Tap a row button: 📊 positions · 📜 fills · ✏️ edit note · "
+            "🔕/🔔 mute toggle · 🛑 unwatch.</i>\n"
+        ),
         "usage_pos": "Usage: /pos 0xAddress",
         "usage_orders": "Usage: /orders 0xAddress",
         "orders_header": "<code>{addr}</code>\nRecent fills ({count})",
@@ -179,9 +183,9 @@ I18N = {
         "label_order_hash": "OrderHash",
         "btn_view_positions": "📊 Pos",
         "btn_view_orders": "📜 Fills",
-        "btn_unwatch": "🛑",
-        "btn_mute": "🔕",
-        "btn_unmute": "🔔",
+        "btn_unwatch": "🛑 Unwatch",
+        "btn_mute": "🔕 Mute",
+        "btn_unmute": "🔔 Unmute",
         "btn_refresh": "🔄 Refresh",
         "btn_market_link": "🌐 Market",
         "label_fill": "Fill",
@@ -294,7 +298,7 @@ I18N = {
         # --- Recovery ---
         "api_recovered": "✅ Predict.fun API recovered for <code>{addr}</code>.",
         # --- Note-edit flow ---
-        "btn_edit_note": "✏️",
+        "btn_edit_note": "✏️ Note",
         "edit_note_prompt": "Reply with the new note for <code>{addr}</code> (send empty to clear):",
         "edit_note_saved": "Note for <code>{addr}</code> → {note}",
         "watch_example": (
@@ -471,7 +475,11 @@ I18N = {
         "removed": "已移除 <code>{addr}</code>",
         "not_found": "未找到该地址",
         "no_watched_wallets": "当前没有监控的钱包",
-        "watch_list": "<b>监控列表</b>\n",
+        "watch_list": (
+            "<b>监控列表</b>\n"
+            "<i>💡 每行按钮：📊 查看持仓 · 📜 查看成交 · ✏️ 编辑备注 · "
+            "🔕/🔔 静音切换 · 🛑 取消监控。</i>\n"
+        ),
         "usage_pos": "用法：/pos 0x地址",
         "usage_orders": "用法：/orders 0x地址",
         "orders_header": "<code>{addr}</code>\n最近成交（{count}）",
@@ -501,9 +509,9 @@ I18N = {
         "label_order_hash": "订单哈希",
         "btn_view_positions": "📊 持仓",
         "btn_view_orders": "📜 成交",
-        "btn_unwatch": "🛑",
-        "btn_mute": "🔕",
-        "btn_unmute": "🔔",
+        "btn_unwatch": "🛑 取消",
+        "btn_mute": "🔕 静音",
+        "btn_unmute": "🔔 提醒",
         "btn_refresh": "🔄 刷新",
         "btn_market_link": "🌐 查看市场",
         "label_fill": "本次成交",
@@ -607,7 +615,7 @@ I18N = {
         "label_stale_flag": "💤 休眠",
         "label_fresh_flag": "🌱 刚添加",
         "api_recovered": "✅ <code>{addr}</code> 的 Predict.fun API 已恢复。",
-        "btn_edit_note": "✏️",
+        "btn_edit_note": "✏️ 备注",
         "edit_note_prompt": "回复此消息以设置 <code>{addr}</code> 的新备注（发空即清除）：",
         "edit_note_saved": "<code>{addr}</code> 备注已更新为：{note}",
         "watch_example": (
