@@ -3,7 +3,6 @@ import asyncio
 import logging
 import time
 import json
-import hashlib
 import sqlite3
 import threading
 from pathlib import Path
@@ -79,7 +78,6 @@ I18N = {
             "/pos <code>0xAddr</code> - view positions\n"
             "/orders <code>0xAddr</code> - recent fills\n"
             "/note <code>0xAddr remark</code> - set alias\n"
-            "/dbinfo - database status\n"
             "/stop - stop all"
         ),
         "choose_lang": "🌐 Choose language:",
@@ -137,7 +135,10 @@ I18N = {
         "side_ask": "Sell",
         "view_tx": "View Tx",
         "label_order_hash": "OrderHash",
-        "db_info": "DB: <code>{path}</code>\nChats: {chats}\nWatches: {watches}\nLoaded now: {loaded}",
+        "btn_view_positions": "📊 Positions",
+        "label_fill": "Fill",
+        "label_total_pos": "Total position",
+        "label_prev_shares": "Prev",
     },
     "zh": {
         "start": (
@@ -148,7 +149,6 @@ I18N = {
             "/pos <code>0xAddr</code> - 查看持仓\n"
             "/orders <code>0xAddr</code> - 查看最近成交\n"
             "/note <code>0xAddr 备注</code> - 设置备注\n"
-            "/dbinfo - 查看数据库状态\n"
             "/stop - 清空全部监控"
         ),
         "choose_lang": "🌐 选择语言：",
@@ -206,7 +206,10 @@ I18N = {
         "side_ask": "卖出",
         "view_tx": "查看交易",
         "label_order_hash": "订单哈希",
-        "db_info": "数据库: <code>{path}</code>\n会话数: {chats}\n监控数: {watches}\n当前内存: {loaded}",
+        "btn_view_positions": "📊 查询持仓",
+        "label_fill": "本次成交",
+        "label_total_pos": "总持仓",
+        "label_prev_shares": "原持仓",
     },
 }
 
@@ -417,27 +420,49 @@ def pos_key(pos: dict) -> str:
     return f"{market_id}_{outcome_index}"
 
 
-def pos_hash(pos: dict) -> str:
-    shares_num = _norm_amount_to_shares(pos.get("shares") or pos.get("quantity") or pos.get("amount"))
+def pos_size(pos: dict) -> float | None:
+    """Return current share count for a position, normalized to a float."""
+    return _norm_amount_to_shares(pos.get("shares") or pos.get("quantity") or pos.get("amount"))
 
-    fields = {
-        # Only hash position size changes, so market-price updates do not spam.
-        "shares": _fmt_num(shares_num, digits=6) if shares_num is not None else "",
-    }
-    return hashlib.md5(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+
+def _coerce_snapshot_value(v):
+    """Legacy snapshots stored md5 hashes (strings); new ones store share counts (floats).
+
+    Returns a float for new-style entries, or None for legacy/unknown entries so
+    the first poll after an upgrade silently migrates without spamming the chat.
+    """
+    if isinstance(v, (int, float)):
+        return float(v)
+    return None
 
 
 def diff_positions(old: dict, new_list: list[dict]):
-    new_map = {pos_key(p): pos_hash(p) for p in new_list}
+    """Compute added/changed/closed positions.
 
-    added, changed, closed = [], [], []
+    For ``changed`` entries we return ``(position, previous_shares)`` so the
+    notification can display the delta (e.g. "5 → 12"). ``previous_shares`` is
+    ``None`` when migrating from the legacy hash-based snapshot.
+    """
+    added: list[dict] = []
+    changed: list[tuple[dict, float | None]] = []
+    closed: list[str] = []
+
+    new_map = {pos_key(p): pos_size(p) for p in new_list}
 
     for p in new_list:
         k = pos_key(p)
         if k not in old:
             added.append(p)
-        elif old[k] != new_map[k]:
-            changed.append(p)
+            continue
+        old_val = _coerce_snapshot_value(old[k])
+        new_val = new_map[k]
+        if old_val is None:
+            # Legacy snapshot — refresh silently without a notification.
+            continue
+        if new_val is None:
+            continue
+        if abs(new_val - old_val) > 1e-9:
+            changed.append((p, old_val))
 
     for k in old:
         if k not in new_map:
@@ -571,7 +596,13 @@ def display_fields(pos: dict, market: dict | None = None) -> tuple[str, str, str
     return title, outcome, shares, price
 
 
-def fmt_pos(pos: dict, label: str, chat_id: int, market: dict | None = None) -> str:
+def fmt_pos(
+    pos: dict,
+    label: str,
+    chat_id: int,
+    market: dict | None = None,
+    prev_shares: float | None = None,
+) -> str:
     title, outcome, shares, avg = display_fields(pos, market)
     title = title[:55]
 
@@ -588,10 +619,29 @@ def fmt_pos(pos: dict, label: str, chat_id: int, market: dict | None = None) -> 
     }
     emoji = emojis.get(label, "📊")
 
+    # When the size changed, surface the delta so the user can see whether the
+    # wallet added to or trimmed an existing position.
+    size_line = f"💹 {t(chat_id, 'label_size')}: <code>{shares}</code> {t(chat_id, 'shares_unit')} @ <code>{avg}c</code>"
+    if label == "changed" and prev_shares is not None:
+        try:
+            new_num = float(shares)
+        except (ValueError, TypeError):
+            new_num = None
+        if new_num is not None:
+            delta = new_num - prev_shares
+            arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "=")
+            prev_text = _fmt_num(prev_shares, digits=4)
+            delta_text = _fmt_num(abs(delta), digits=4)
+            size_line = (
+                f"💹 {t(chat_id, 'label_size')}: <code>{prev_text}</code> → "
+                f"<code>{shares}</code> {t(chat_id, 'shares_unit')} "
+                f"({arrow}{delta_text}) @ <code>{avg}c</code>"
+            )
+
     return (
         f"{emoji} <b>{title}</b>\n"
         f"✅ <b>{outcome}</b>\n"
-        f"💹 {t(chat_id, 'label_size')}: <code>{shares}</code> {t(chat_id, 'shares_unit')} @ <code>{avg}c</code>\n"
+        f"{size_line}\n"
         f"💰 {t(chat_id, 'label_value')}: <b>{val}</b>"
     )
 
@@ -634,7 +684,15 @@ def _side_text(side: str, chat_id: int) -> str:
     return side or "?"
 
 
-def fmt_match(match: dict, chat_id: int) -> str:
+def _position_lookup_key(market_id, outcome_index) -> str:
+    return f"{market_id or ''}_{outcome_index if outcome_index is not None else ''}"
+
+
+def fmt_match(
+    match: dict,
+    chat_id: int,
+    positions_by_key: dict | None = None,
+) -> str:
     market = match.get("market") if isinstance(match.get("market"), dict) else {}
     taker = match.get("taker") if isinstance(match.get("taker"), dict) else {}
     outcome_obj = taker.get("outcome") if isinstance(taker.get("outcome"), dict) else {}
@@ -691,9 +749,36 @@ def fmt_match(match: dict, chat_id: int) -> str:
         oh = str(order_hash)
         oh_short = f"{oh[:10]}...{oh[-6:]}" if len(oh) > 20 else oh
         order_line = f"\n{t(chat_id, 'label_order_hash')}: <code>{oh_short}</code>"
+
+    # If we have the wallet's current positions, surface the total holding for
+    # this market+outcome so the user can distinguish "this fill" from "what
+    # they now hold in total" — especially when adding to an existing stake.
+    total_line = ""
+    if positions_by_key:
+        market_id = market.get("id") or ""
+        outcome_idx = outcome_obj.get("index")
+        lookup_key = _position_lookup_key(market_id, outcome_idx)
+        current_pos = positions_by_key.get(lookup_key)
+        if current_pos:
+            total_shares = pos_size(current_pos)
+            _, _, total_shares_text, total_price = display_fields(
+                current_pos, current_pos.get("_market")
+            )
+            try:
+                total_val = f"${float(total_shares_text) * float(total_price) / 100:,.2f}"
+            except (ValueError, TypeError):
+                total_val = "N/A"
+            if total_shares is not None:
+                total_line = (
+                    f"\n📦 {t(chat_id, 'label_total_pos')}: "
+                    f"<b>{total_shares_text}</b> {t(chat_id, 'shares_unit')} "
+                    f"@ <code>{total_price}c</code> = <b>{total_val}</b>"
+                )
+
     return (
-        f"✅ {side} {outcome} | {shares_text} @ {price_text}c = {value_text}\n"
-        f"{title[:60]}\n"
+        f"✅ {side} {outcome} | "
+        f"{t(chat_id, 'label_fill')} {shares_text} @ {price_text}c = {value_text}\n"
+        f"{title[:60]}{total_line}\n"
         f"{tx_line}{order_line}"
     )
 
@@ -745,6 +830,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=reply_markup,
         )
 
+    elif data.startswith("pos:"):
+        addr = data[4:].strip()
+        if not addr.startswith("0x") or len(addr) != 42:
+            await ctx.bot.send_message(chat_id=chat_id, text=t(chat_id, "invalid_address"))
+            return
+        await ctx.bot.send_message(chat_id=chat_id, text=t(chat_id, "loading_positions"))
+        async with aiohttp.ClientSession() as session:
+            positions = await fetch_positions(session, addr)
+            market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
+            markets = {mid: await fetch_market(session, mid) for mid in market_ids}
+            for p in positions:
+                p["_market"] = markets.get(p.get("marketId"), {})
+        text = f"<code>{addr}</code>\n\n{fmt_summary(positions, chat_id)}"
+        await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+
     elif data == "watch_guide":
         guide_path = Path(GUIDE_IMAGE_PATH)
         if guide_path.exists():
@@ -792,7 +892,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         positions = await fetch_positions(session, addr)
         matches = await fetch_order_matches(session, addr, first=30)
 
-    snapshot = {pos_key(p): pos_hash(p) for p in positions}
+    snapshot = {pos_key(p): pos_size(p) for p in positions}
     watched[chat_id][addr] = WatchedWallet(
         address=addr,
         chat_id=chat_id,
@@ -836,18 +936,27 @@ async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    wallets = watched.get(update.effective_chat.id, {})
+    chat_id = update.effective_chat.id
+    wallets = watched.get(chat_id, {})
 
     if not wallets:
-        await update.message.reply_text(t(update.effective_chat.id, "no_watched_wallets"))
+        await update.message.reply_text(t(chat_id, "no_watched_wallets"))
         return
 
-    lines = [t(update.effective_chat.id, "watch_list")]
+    lines = [t(chat_id, "watch_list")]
+    keyboard = []
     for addr, w in wallets.items():
         note = f" - {w.note}" if w.note else ""
-        lines.append(f"- <code>{fmt_addr(addr)}</code>{note} ({len(w.position_snapshot)} pos)")
+        lines.append(f"• <code>{addr}</code>{note} ({len(w.position_snapshot)} pos)")
+        label = f"{t(chat_id, 'btn_view_positions')} {w.note or fmt_addr(addr)}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"pos:{addr}")])
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+    )
 
 
 async def cmd_pos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -877,13 +986,20 @@ async def cmd_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addr = ctx.args[0].strip()
     async with aiohttp.ClientSession() as session:
         matches = await fetch_order_matches(session, addr, first=10)
+        # Also fetch positions so the rendered fills can show total holdings.
+        positions = await fetch_positions(session, addr)
+        market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
+        markets = {mid: await fetch_market(session, mid) for mid in market_ids}
+        for p in positions:
+            p["_market"] = markets.get(p.get("marketId"), {})
 
     if not matches:
         await update.message.reply_text(t(chat_id, "no_orders"))
         return
 
+    positions_by_key = {pos_key(p): p for p in positions}
     lines = [t(chat_id, "orders_header", addr=fmt_addr(addr), count=len(matches)), ""]
-    lines.extend(fmt_match(m, chat_id) for m in matches[:8])
+    lines.extend(fmt_match(m, chat_id, positions_by_key) for m in matches[:8])
     await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
 
@@ -934,15 +1050,6 @@ async def cmd_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_dbinfo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    chats, watches_count = db_counts()
-    loaded = sum(len(v) for v in watched.values())
-    await update.message.reply_text(
-        t(chat_id, "db_info", path=SQLITE_PATH, chats=chats, watches=watches_count, loaded=loaded),
-        parse_mode="HTML",
-    )
-
 # ==================== Poll Loop ====================
 
 async def poll_loop(app: Application):
@@ -958,11 +1065,15 @@ async def poll_loop(app: Application):
                         matches = await fetch_order_matches(session, w.address, first=20)
                         market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
                         markets = {mid: await fetch_market(session, mid) for mid in market_ids}
+                        for p in positions:
+                            p["_market"] = markets.get(p.get("marketId"), {})
+                        positions_by_key = {pos_key(p): p for p in positions}
+
                         added, changed, closed = diff_positions(w.position_snapshot, positions)
                         new_match_keys = {match_key(m) for m in matches}
                         new_fills = [m for m in matches if match_key(m) not in w.order_match_snapshot]
 
-                        w.position_snapshot = {pos_key(p): pos_hash(p) for p in positions}
+                        w.position_snapshot = {pos_key(p): pos_size(p) for p in positions}
                         w.last_check = time.time()
                         display_addr = fmt_addr(w.address) + (f" · {w.note}" if w.note else "")
 
@@ -970,8 +1081,16 @@ async def poll_loop(app: Application):
                             parts = []
                             for p in added:
                                 parts.append(fmt_pos(p, "added", chat_id, markets.get(p.get("marketId"))))
-                            for p in changed:
-                                parts.append(fmt_pos(p, "changed", chat_id, markets.get(p.get("marketId"))))
+                            for p, prev_size in changed:
+                                parts.append(
+                                    fmt_pos(
+                                        p,
+                                        "changed",
+                                        chat_id,
+                                        markets.get(p.get("marketId")),
+                                        prev_shares=prev_size,
+                                    )
+                                )
                             for k in closed:
                                 parts.append(t(chat_id, "closed_item", key=k))
 
@@ -989,7 +1108,9 @@ async def poll_loop(app: Application):
                             )
 
                         if new_fills:
-                            fill_lines = [fmt_match(m, chat_id) for m in new_fills[:5]]
+                            fill_lines = [
+                                fmt_match(m, chat_id, positions_by_key) for m in new_fills[:5]
+                            ]
                             await app.bot.send_message(
                                 chat_id=chat_id,
                                 text=t(chat_id, "fills_header", addr=display_addr) + "\n\n".join(fill_lines),
@@ -1042,7 +1163,6 @@ async def on_startup(app: Application):
             BotCommand("pos", "查询持仓 / View positions"),
             BotCommand("orders", "最近成交 / Recent fills"),
             BotCommand("note", "地址备注 / Set remark"),
-            BotCommand("dbinfo", "数据库状态 / DB status"),
             BotCommand("lang", "切换语言 / Switch language"),
             BotCommand("stop", "停止全部监控 / Stop all"),
         ]
@@ -1065,7 +1185,6 @@ def main():
     app.add_handler(CommandHandler("positions", cmd_pos))
     app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CommandHandler("note", cmd_note))
-    app.add_handler(CommandHandler("dbinfo", cmd_dbinfo))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CallbackQueryHandler(on_callback))
