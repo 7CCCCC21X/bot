@@ -118,6 +118,11 @@ class WatchedWallet:
 watched: dict[int, dict[str, WatchedWallet]] = {}
 market_cache: dict[str, dict] = {}
 chat_lang: dict[int, str] = {}
+# Per-chat notification mode: "split" (default — one message per block) or
+# "merged" (legacy T13 — position changes + fills + resolution joined by
+# ───── into a single Telegram message).
+chat_notify: dict[int, str] = {}
+NOTIFY_MODES = ("split", "merged")
 db_lock = threading.Lock()
 
 I18N = {
@@ -201,8 +206,14 @@ I18N = {
         "unmuted_ok": "🔔 Unmuted <code>{addr}</code>",
         "settings_title": "<b>Settings</b>",
         "settings_lang": "🌐 Language: {lang}",
-        "settings_interval": "⏱ Poll interval: {interval}s",
+        "settings_interval": "⏱ Poll interval: {interval}s (global)",
         "settings_watches": "👁 Watches: {count} ({muted} muted)",
+        "settings_notify": "🔔 Notify mode: {mode}",
+        "notify_split": "split (one block per message)",
+        "notify_merged": "merged (all blocks in one message with ─────)",
+        "btn_notify_split": "🔔 Split messages",
+        "btn_notify_merged": "🧩 Merge into one",
+        "notify_switched": "Notification mode set to: {mode}",
         "export_caption": "Your watch list ({count} wallets)",
         "fetch_error_alert": "⚠️ Failed to reach Predict.fun API {count}× for <code>{addr}</code>. Will keep retrying silently.",
         "fetch_error_msg": "⚠️ Predict.fun API is unavailable right now. Try again in a moment.",
@@ -506,8 +517,14 @@ I18N = {
         "unmuted_ok": "🔔 已恢复提醒 <code>{addr}</code>",
         "settings_title": "<b>偏好设置</b>",
         "settings_lang": "🌐 语言：{lang}",
-        "settings_interval": "⏱ 轮询间隔：{interval} 秒",
+        "settings_interval": "⏱ 轮询间隔：{interval} 秒（全局）",
         "settings_watches": "👁 监控数：{count}（已静音 {muted}）",
+        "settings_notify": "🔔 通知模式：{mode}",
+        "notify_split": "分开发（每类事件一条消息）",
+        "notify_merged": "合并发（一条消息里用 ───── 拼接）",
+        "btn_notify_split": "🔔 分开发",
+        "btn_notify_merged": "🧩 合并发",
+        "notify_switched": "通知模式已设为：{mode}",
         "export_caption": "监控列表（{count} 个钱包）",
         "fetch_error_alert": "⚠️ 连续 {count} 次无法访问 Predict.fun API：<code>{addr}</code>。会继续静默重试。",
         "fetch_error_msg": "⚠️ Predict.fun API 暂时无响应，请稍后再试。",
@@ -764,6 +781,14 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS chat_notify (
+                chat_id INTEGER PRIMARY KEY,
+                mode TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
@@ -846,6 +871,18 @@ def save_chat_lang(chat_id: int, lang: str):
         conn.commit()
 
 
+def save_chat_notify(chat_id: int, mode: str):
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO chat_notify(chat_id, mode) VALUES(?,?)
+            ON CONFLICT(chat_id) DO UPDATE SET mode=excluded.mode
+            """,
+            (chat_id, mode),
+        )
+        conn.commit()
+
+
 # --- alerts + events persistence -----------------------------------------
 
 
@@ -911,11 +948,19 @@ def delete_alert(chat_id: int, alert_id: int) -> bool:
         return cur.rowcount > 0
 
 
-# Cap the event log per wallet so the DB doesn't grow unbounded.
 def load_state():
     with db_lock, db_conn() as conn:
         for chat_id, lang in conn.execute("SELECT chat_id, lang FROM chat_lang"):
             chat_lang[int(chat_id)] = lang
+
+        try:
+            for chat_id, mode in conn.execute("SELECT chat_id, mode FROM chat_notify"):
+                if mode in NOTIFY_MODES:
+                    chat_notify[int(chat_id)] = mode
+        except sqlite3.OperationalError:
+            # Upgrading from a pre-chat_notify DB; init_db will have created
+            # the table by the time we're here, so this should be rare.
+            pass
 
         for row in conn.execute(
             """
@@ -2278,24 +2323,50 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _set_mute(update, ctx, False)
 
 
-async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+def _settings_body(chat_id: int) -> str:
     wallets = watched.get(chat_id, {})
     muted_count = sum(1 for w in wallets.values() if w.muted)
     lang_label = "🇨🇳 中文" if get_lang(chat_id) == "zh" else "🇺🇸 English"
-    body = "\n".join(
+    mode = chat_notify.get(chat_id, "split")
+    mode_label = t(chat_id, f"notify_{mode}")
+    return "\n".join(
         [
             t(chat_id, "settings_title"),
             "",
             t(chat_id, "settings_lang", lang=lang_label),
             t(chat_id, "settings_interval", interval=POLL_INTERVAL),
             t(chat_id, "settings_watches", count=len(wallets), muted=muted_count),
+            t(chat_id, "settings_notify", mode=mode_label),
         ]
     )
+
+
+def _settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    mode = chat_notify.get(chat_id, "split")
+    # Show the opposite of the current mode as the toggle target.
+    target = "merged" if mode == "split" else "split"
+    target_label_key = "btn_notify_merged" if target == "merged" else "btn_notify_split"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🇺🇸 English", callback_data="lang_en"),
+                InlineKeyboardButton("🇨🇳 中文", callback_data="lang_zh"),
+            ],
+            [
+                InlineKeyboardButton(
+                    t(chat_id, target_label_key), callback_data=f"notify:{target}"
+                )
+            ],
+        ]
+    )
+
+
+async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     await update.message.reply_text(
-        body,
+        _settings_body(chat_id),
         parse_mode="HTML",
-        reply_markup=_start_keyboard(chat_id),
+        reply_markup=_settings_keyboard(chat_id),
     )
 
 
@@ -2774,6 +2845,23 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
+    # notify:<split|merged> — toggle the per-chat notification layout.
+    if data.startswith("notify:"):
+        mode = data.split(":", 1)[1].strip()
+        if mode not in NOTIFY_MODES:
+            return
+        chat_notify[chat_id] = mode
+        save_chat_notify(chat_id, mode)
+        try:
+            await query.edit_message_text(
+                _settings_body(chat_id),
+                parse_mode="HTML",
+                reply_markup=_settings_keyboard(chat_id),
+            )
+        except BadRequest:
+            pass
+        return
+
     # pos:<addr> | refresh_pos:<addr>[:sort[:portfolio]] | sortpos:<addr>:<sort>:<portfolio>
     if data.startswith("pos:") or data.startswith("refresh_pos:") or data.startswith("sortpos:"):
         parts = data.split(":")
@@ -3236,19 +3324,26 @@ async def poll_loop(app: Application):
                                 + "\n\n".join(lines)
                             )
 
-                        # Send each block (position changes / fills /
-                        # resolution) as its own Telegram message so fills
-                        # and position changes don't get glued together via
-                        # a ───── separator. In-block batching still applies:
-                        # up to 5 fills are consolidated into one fills
-                        # message, up to 8 position changes into one poll
-                        # message.
+                        # Honor the chat's notification mode:
+                        #   "split"  (default) — one Telegram message per
+                        #            block (position changes / fills /
+                        #            resolution).
+                        #   "merged" — all blocks glued together with ───── so
+                        #            one poll produces at most one message.
+                        # In-block batching always applies: up to 5 fills per
+                        # 订单成交 message, up to 8 position changes per 持仓变化
+                        # message. This is about cross-block layout only.
                         if blocks and not w.muted:
-                            for block in blocks:
+                            mode = chat_notify.get(chat_id, "split")
+                            if mode == "merged":
+                                outgoing = ["\n\n─────\n\n".join(blocks)]
+                            else:
+                                outgoing = blocks
+                            for msg in outgoing:
                                 try:
                                     await app.bot.send_message(
                                         chat_id=chat_id,
-                                        text=block,
+                                        text=msg,
                                         parse_mode="HTML",
                                         disable_web_page_preview=True,
                                     )
