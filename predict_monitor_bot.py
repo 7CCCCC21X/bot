@@ -13,12 +13,20 @@ import aiohttp
 from telegram import (
     Update,
     BotCommand,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
 )
 from telegram.error import BadRequest
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # ==================== Config ====================
 
@@ -80,6 +88,17 @@ class WatchedWallet:
     # Cache of market titles keyed by pos_key so "closed" notifications can
     # show the human-readable title instead of a market_id key.
     position_titles: dict = field(default_factory=dict)
+    # Suppress position-change notifications where the share delta is smaller
+    # than this percent (0 disables the filter).
+    change_threshold_pct: float = 0.0
+    # Per-wallet poll interval in seconds (0 = use global POLL_INTERVAL).
+    poll_interval_s: int = 0
+    # Wall-clock of the last real activity (emitted notification). Powers the
+    # "stale" badge in /list.
+    last_activity: float = 0
+    # Cache of market resolution state keyed by market_id so we only alert
+    # once on resolution transitions.
+    resolved_markets: dict = field(default_factory=dict)
     # Transient runtime counters (not persisted).
     fetch_errors: int = 0
     error_notified: bool = False
@@ -92,20 +111,6 @@ db_lock = threading.Lock()
 
 I18N = {
     "en": {
-        "start": (
-            "<b>Predict.fun Monitor Bot</b>\n\n"
-            "/watch <code>0xAddr ...</code> - monitor one or more wallets\n"
-            "/unwatch <code>addr|alias</code> - stop\n"
-            "/list - watched list\n"
-            "/pos <code>addr|alias</code> - view positions\n"
-            "/orders <code>addr|alias</code> - recent fills\n"
-            "/note <code>addr|alias remark</code> - set alias\n"
-            "/mute <code>addr|alias</code> - silence alerts\n"
-            "/unmute <code>addr|alias</code> - resume alerts\n"
-            "/settings - preferences\n"
-            "/export - export watch list\n"
-            "/stop - stop all"
-        ),
         "choose_lang": "🌐 Choose language:",
         "btn_watch_guide": "📖 How to find wallet address",
         "watch_guide_caption": (
@@ -195,22 +200,100 @@ I18N = {
         "list_page_indicator": "{page}/{total}",
         "fills_merged_suffix": " ({count} fills)",
         "close_fallback": "(market {key})",
+        "start": (
+            "<b>Predict.fun Monitor Bot</b>\n\n"
+            "/watch <code>0xAddr ...</code> - monitor one or more wallets\n"
+            "/unwatch <code>addr|alias</code> - stop\n"
+            "/list - watched list\n"
+            "/pos <code>addr|alias</code> - view positions\n"
+            "/orders <code>addr|alias</code> - recent fills\n"
+            "/portfolio <code>addr|alias</code> - portfolio summary\n"
+            "/note <code>addr|alias remark</code> - set alias\n"
+            "/mute <code>addr|alias</code> - silence alerts\n"
+            "/unmute <code>addr|alias</code> - resume alerts\n"
+            "/threshold <code>addr|alias pct</code> - min-change filter\n"
+            "/interval <code>addr|alias sec</code> - per-wallet poll\n"
+            "/alert <code>addr|alias outcome op pct</code> - price alert\n"
+            "/alerts <code>addr|alias</code> - list alerts\n"
+            "/unalert <code>id</code> - remove alert\n"
+            "/history <code>addr|alias</code> - activity log\n"
+            "/settings - preferences\n"
+            "/export - export watch list\n"
+            "/import - reply to a JSON file to import\n"
+            "/stop - stop all"
+        ),
+        # --- PnL, sorting, portfolio ---
+        "label_pnl": "P&L",
+        "label_total_pnl": "Total P&L",
+        "label_sorted_by": "sorted by",
+        "label_largest_pos": "Largest",
+        "sort_value": "value",
+        "sort_size": "size",
+        "sort_alpha": "alpha",
+        "btn_sort": "↕ Sort: {label}",
+        "btn_portfolio": "📊 Portfolio card",
+        "btn_hide_portfolio": "⬅ Hide card",
+        "portfolio_title": "<b>Portfolio · {addr}</b>",
+        "portfolio_capital": "💰 Deployed: <b>${amount:,.2f}</b>",
+        "portfolio_positions": "📦 Positions: <b>{count}</b>",
+        "portfolio_pnl": "📈 Unrealized P&L: {arrow} <b>{sign}${amount:,.2f}</b>",
+        "portfolio_largest": "🏆 Largest: <b>{title}</b> (${amount:,.2f})",
+        # --- Resolution ---
+        "resolve_win": "🏆 你的仓位命中了（held outcome won）",
+        "resolve_lose": "💀 你的仓位未命中（held outcome lost）",
+        "label_resolve_outcome": "Winning outcome",
+        "poll_resolve_header": "🏁 <b>Market resolved</b> <code>{addr}</code>\n\n",
+        # --- Threshold / interval ---
+        "usage_threshold": "Usage: /threshold addr|alias pct",
+        "threshold_set": "🎚 Min-change filter for <code>{addr}</code>: {pct}%",
+        "usage_interval": "Usage: /interval addr|alias seconds (0 = global)",
+        "interval_set": "⏱ Poll interval for <code>{addr}</code>: {sec}s",
+        "interval_too_small": "Interval must be 0 (global) or ≥ 5 seconds.",
+        # --- Alerts ---
+        "usage_alert": "Usage: /alert addr|alias outcome >=|<= price(0-100)",
+        "alert_bad_outcome": "Outcome not found for this wallet's position.",
+        "alert_bad_op": "Operator must be >= or <=.",
+        "alert_bad_price": "Price must be between 0 and 100 (cents).",
+        "alert_created": "🔔 Alert #{id} set: {outcome} {op} {threshold:.2f}c",
+        "alerts_empty": "No alerts.",
+        "alerts_header": "<b>Alerts ({count})</b>\n\n",
+        "alerts_line": "#{id} · {outcome} {op} {threshold:.2f}c · {title}",
+        "usage_unalert": "Usage: /unalert id",
+        "unalert_not_found": "Alert not found.",
+        "unalert_ok": "🗑 Removed alert #{id}.",
+        "alert_fired": "🔔 <b>Price alert</b> <code>{addr}</code>\n\n{title}\n{outcome} {op} {threshold:.2f}c · now <b>{price:.2f}c</b>",
+        # --- Import / export / history ---
+        "usage_history": "Usage: /history addr|alias",
+        "history_header": "<b>Activity · {addr}</b>\n\n",
+        "history_empty": "No events recorded yet.",
+        "history_line": "{relt} · {kind} · {summary}",
+        "import_no_file": "Reply to a JSON document with /import to bulk-add wallets.",
+        "import_done": "Imported {added} new · {skipped} skipped (dup/invalid).",
+        "import_parse_error": "Could not parse the JSON file.",
+        "import_too_big": "File too large (max 256 KB).",
+        # --- Duplicate-watch handling ---
+        "btn_overwrite_note": "✏️ Overwrite note",
+        "btn_cancel": "Cancel",
+        "dup_watch_prompt": "<code>{addr}</code> is already watched with note <b>{old}</b>. Overwrite with <b>{new}</b>?",
+        "dup_watch_overwritten": "Note overwritten.",
+        "dup_watch_cancelled": "Cancelled.",
+        # --- /list stale badge & fresh badge ---
+        "label_stale_flag": "💤 dormant",
+        "label_fresh_flag": "🌱 just added",
+        # --- Recovery ---
+        "api_recovered": "✅ Predict.fun API recovered for <code>{addr}</code>.",
+        # --- Note-edit flow ---
+        "btn_edit_note": "✏️",
+        "edit_note_prompt": "Reply with the new note for <code>{addr}</code> (send empty to clear):",
+        "edit_note_saved": "Note for <code>{addr}</code> → {note}",
+        "watch_example": (
+            "💡 <b>Format examples</b>\n"
+            "<code>/watch 0x1234…abcd</code>  — single wallet\n"
+            "<code>/watch 0x1234…abcd alice</code>  — with note\n"
+            "<code>/watch 0xAAA 0xBBB 0xCCC</code>  — multiple"
+        ),
     },
     "zh": {
-        "start": (
-            "<b>Predict.fun 监控机器人</b>\n\n"
-            "/watch <code>0xAddr ...</code> - 监控钱包，可一次多个\n"
-            "/unwatch <code>地址或备注</code> - 停止监控\n"
-            "/list - 查看监控列表\n"
-            "/pos <code>地址或备注</code> - 查看持仓\n"
-            "/orders <code>地址或备注</code> - 查看最近成交\n"
-            "/note <code>地址或备注 新备注</code> - 设置备注\n"
-            "/mute <code>地址或备注</code> - 暂停提醒\n"
-            "/unmute <code>地址或备注</code> - 恢复提醒\n"
-            "/settings - 偏好设置\n"
-            "/export - 导出监控列表\n"
-            "/stop - 清空全部监控"
-        ),
         "choose_lang": "🌐 选择语言：",
         "btn_watch_guide": "📖 如何找到钱包地址",
         "watch_guide_caption": (
@@ -300,6 +383,89 @@ I18N = {
         "list_page_indicator": "{page}/{total}",
         "fills_merged_suffix": "（共 {count} 笔）",
         "close_fallback": "（市场 {key}）",
+        "start": (
+            "<b>Predict.fun 监控机器人</b>\n\n"
+            "/watch <code>0xAddr ...</code> - 监控钱包，可一次多个\n"
+            "/unwatch <code>地址或备注</code> - 停止监控\n"
+            "/list - 查看监控列表\n"
+            "/pos <code>地址或备注</code> - 查看持仓\n"
+            "/orders <code>地址或备注</code> - 查看最近成交\n"
+            "/portfolio <code>地址或备注</code> - 持仓汇总\n"
+            "/note <code>地址或备注 新备注</code> - 设置备注\n"
+            "/mute <code>地址或备注</code> - 暂停提醒\n"
+            "/unmute <code>地址或备注</code> - 恢复提醒\n"
+            "/threshold <code>地址或备注 百分比</code> - 最小变动过滤\n"
+            "/interval <code>地址或备注 秒</code> - 单独轮询间隔\n"
+            "/alert <code>地址或备注 结果 运算符 价格</code> - 价格警报\n"
+            "/alerts <code>地址或备注</code> - 查看警报\n"
+            "/unalert <code>id</code> - 删除警报\n"
+            "/history <code>地址或备注</code> - 操作历史\n"
+            "/settings - 偏好设置\n"
+            "/export - 导出监控列表\n"
+            "/import - 回复 JSON 文件批量导入\n"
+            "/stop - 清空全部监控"
+        ),
+        "label_pnl": "浮动盈亏",
+        "label_total_pnl": "总浮动盈亏",
+        "label_sorted_by": "排序",
+        "label_largest_pos": "最大仓",
+        "sort_value": "价值",
+        "sort_size": "数量",
+        "sort_alpha": "字母",
+        "btn_sort": "↕ 排序：{label}",
+        "btn_portfolio": "📊 汇总卡片",
+        "btn_hide_portfolio": "⬅ 收起",
+        "portfolio_title": "<b>组合 · {addr}</b>",
+        "portfolio_capital": "💰 已投入：<b>${amount:,.2f}</b>",
+        "portfolio_positions": "📦 持仓数：<b>{count}</b>",
+        "portfolio_pnl": "📈 浮动盈亏：{arrow} <b>{sign}${amount:,.2f}</b>",
+        "portfolio_largest": "🏆 最大仓：<b>{title}</b>（${amount:,.2f}）",
+        "resolve_win": "🏆 持仓方向命中",
+        "resolve_lose": "💀 持仓方向未命中",
+        "label_resolve_outcome": "获胜结果",
+        "poll_resolve_header": "🏁 <b>市场已结算</b> <code>{addr}</code>\n\n",
+        "usage_threshold": "用法：/threshold 地址或备注 百分比",
+        "threshold_set": "🎚 <code>{addr}</code> 最小变动过滤：{pct}%",
+        "usage_interval": "用法：/interval 地址或备注 秒（0 = 使用全局）",
+        "interval_set": "⏱ <code>{addr}</code> 轮询间隔：{sec} 秒",
+        "interval_too_small": "间隔必须为 0（使用全局）或 ≥ 5 秒。",
+        "usage_alert": "用法：/alert 地址或备注 结果名 >=|<= 价格(0-100)",
+        "alert_bad_outcome": "该钱包当前持仓中未找到该结果。",
+        "alert_bad_op": "运算符只能是 >= 或 <=。",
+        "alert_bad_price": "价格必须是 0~100（cents）。",
+        "alert_created": "🔔 已创建警报 #{id}：{outcome} {op} {threshold:.2f}c",
+        "alerts_empty": "暂无警报。",
+        "alerts_header": "<b>警报（{count}）</b>\n\n",
+        "alerts_line": "#{id} · {outcome} {op} {threshold:.2f}c · {title}",
+        "usage_unalert": "用法：/unalert id",
+        "unalert_not_found": "未找到该警报。",
+        "unalert_ok": "🗑 已删除警报 #{id}。",
+        "alert_fired": "🔔 <b>价格警报</b> <code>{addr}</code>\n\n{title}\n{outcome} {op} {threshold:.2f}c · 当前 <b>{price:.2f}c</b>",
+        "usage_history": "用法：/history 地址或备注",
+        "history_header": "<b>操作历史 · {addr}</b>\n\n",
+        "history_empty": "暂无历史事件。",
+        "history_line": "{relt} · {kind} · {summary}",
+        "import_no_file": "请回复一个 JSON 文件并附带 /import 来批量导入钱包。",
+        "import_done": "导入完成：新增 {added} · 跳过 {skipped}（重复或无效）。",
+        "import_parse_error": "JSON 文件解析失败。",
+        "import_too_big": "文件过大（最大 256 KB）。",
+        "btn_overwrite_note": "✏️ 覆盖备注",
+        "btn_cancel": "取消",
+        "dup_watch_prompt": "<code>{addr}</code> 已在监控，当前备注 <b>{old}</b>。要覆盖为 <b>{new}</b> 吗？",
+        "dup_watch_overwritten": "备注已覆盖。",
+        "dup_watch_cancelled": "已取消。",
+        "label_stale_flag": "💤 休眠",
+        "label_fresh_flag": "🌱 刚添加",
+        "api_recovered": "✅ <code>{addr}</code> 的 Predict.fun API 已恢复。",
+        "btn_edit_note": "✏️",
+        "edit_note_prompt": "回复此消息以设置 <code>{addr}</code> 的新备注（发空即清除）：",
+        "edit_note_saved": "<code>{addr}</code> 备注已更新为：{note}",
+        "watch_example": (
+            "💡 <b>格式示例</b>\n"
+            "<code>/watch 0x1234…abcd</code>  — 单个钱包\n"
+            "<code>/watch 0x1234…abcd 张三</code>  — 带备注\n"
+            "<code>/watch 0xAAA 0xBBB 0xCCC</code>  — 批量"
+        ),
     },
 }
 
@@ -326,14 +492,22 @@ def init_db():
                 last_check REAL NOT NULL DEFAULT 0,
                 muted INTEGER NOT NULL DEFAULT 0,
                 position_titles TEXT NOT NULL DEFAULT '{}',
+                change_threshold_pct REAL NOT NULL DEFAULT 0,
+                poll_interval_s INTEGER NOT NULL DEFAULT 0,
+                last_activity REAL NOT NULL DEFAULT 0,
+                resolved_markets TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY (chat_id, address)
             )
             """
         )
         # Tolerate upgrades from older schemas that pre-date these columns.
-        for column, ddl in (
-            ("muted", "ALTER TABLE watches ADD COLUMN muted INTEGER NOT NULL DEFAULT 0"),
-            ("position_titles", "ALTER TABLE watches ADD COLUMN position_titles TEXT NOT NULL DEFAULT '{}'"),
+        for ddl in (
+            "ALTER TABLE watches ADD COLUMN muted INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE watches ADD COLUMN position_titles TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE watches ADD COLUMN change_threshold_pct REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE watches ADD COLUMN poll_interval_s INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE watches ADD COLUMN last_activity REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE watches ADD COLUMN resolved_markets TEXT NOT NULL DEFAULT '{}'",
         ):
             try:
                 conn.execute(ddl)
@@ -348,6 +522,38 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                market_id TEXT NOT NULL,
+                outcome_index INTEGER NOT NULL,
+                op TEXT NOT NULL,
+                threshold REAL NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS alerts_by_chat ON alerts(chat_id, address)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                ts REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS events_by_wallet ON events(chat_id, address, ts DESC)"
+        )
         conn.commit()
 
 
@@ -355,15 +561,23 @@ def save_watch(w: WatchedWallet):
     with db_lock, db_conn() as conn:
         conn.execute(
             """
-            INSERT INTO watches(chat_id, address, note, position_snapshot, order_match_snapshot, last_check, muted, position_titles)
-            VALUES(?,?,?,?,?,?,?,?)
+            INSERT INTO watches(
+              chat_id, address, note, position_snapshot, order_match_snapshot,
+              last_check, muted, position_titles, change_threshold_pct,
+              poll_interval_s, last_activity, resolved_markets
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(chat_id, address) DO UPDATE SET
               note=excluded.note,
               position_snapshot=excluded.position_snapshot,
               order_match_snapshot=excluded.order_match_snapshot,
               last_check=excluded.last_check,
               muted=excluded.muted,
-              position_titles=excluded.position_titles
+              position_titles=excluded.position_titles,
+              change_threshold_pct=excluded.change_threshold_pct,
+              poll_interval_s=excluded.poll_interval_s,
+              last_activity=excluded.last_activity,
+              resolved_markets=excluded.resolved_markets
             """,
             (
                 w.chat_id,
@@ -374,6 +588,10 @@ def save_watch(w: WatchedWallet):
                 w.last_check,
                 1 if w.muted else 0,
                 json.dumps(w.position_titles, ensure_ascii=False),
+                float(w.change_threshold_pct or 0),
+                int(w.poll_interval_s or 0),
+                float(w.last_activity or 0),
+                json.dumps(w.resolved_markets, ensure_ascii=False),
             ),
         )
         conn.commit()
@@ -403,6 +621,117 @@ def save_chat_lang(chat_id: int, lang: str):
         conn.commit()
 
 
+# --- alerts + events persistence -----------------------------------------
+
+
+def insert_alert(
+    chat_id: int,
+    address: str,
+    market_id: str,
+    outcome_index: int,
+    op: str,
+    threshold_cents: float,
+) -> int:
+    """Persist a new price alert and return its id."""
+    with db_lock, db_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO alerts(chat_id, address, market_id, outcome_index, op, threshold, created_at)
+            VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                chat_id,
+                address,
+                market_id,
+                int(outcome_index),
+                op,
+                float(threshold_cents),
+                time.time(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+
+
+def list_alerts(chat_id: int, address: str | None = None) -> list[dict]:
+    query = "SELECT id, chat_id, address, market_id, outcome_index, op, threshold, created_at FROM alerts WHERE chat_id=?"
+    args: list = [chat_id]
+    if address:
+        query += " AND lower(address)=lower(?)"
+        args.append(address)
+    query += " ORDER BY created_at ASC"
+    with db_lock, db_conn() as conn:
+        rows = conn.execute(query, args).fetchall()
+    return [
+        {
+            "id": r[0],
+            "chat_id": r[1],
+            "address": r[2],
+            "market_id": r[3],
+            "outcome_index": r[4],
+            "op": r[5],
+            "threshold": r[6],
+            "created_at": r[7],
+        }
+        for r in rows
+    ]
+
+
+def delete_alert(chat_id: int, alert_id: int) -> bool:
+    with db_lock, db_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM alerts WHERE chat_id=? AND id=?", (chat_id, alert_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+# Cap the event log per wallet so the DB doesn't grow unbounded.
+EVENT_LOG_CAP = 500
+
+
+def insert_event(chat_id: int, address: str, kind: str, payload: dict):
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO events(chat_id, address, kind, payload, ts)
+            VALUES(?,?,?,?,?)
+            """,
+            (chat_id, address, kind, json.dumps(payload, ensure_ascii=False), time.time()),
+        )
+        # Trim old events for this (chat, address) — keep only the newest
+        # EVENT_LOG_CAP rows.
+        conn.execute(
+            """
+            DELETE FROM events
+            WHERE chat_id=? AND address=? AND id NOT IN (
+                SELECT id FROM events
+                WHERE chat_id=? AND address=?
+                ORDER BY ts DESC LIMIT ?
+            )
+            """,
+            (chat_id, address, chat_id, address, EVENT_LOG_CAP),
+        )
+        conn.commit()
+
+
+def list_events(chat_id: int, address: str, limit: int = 20) -> list[dict]:
+    with db_lock, db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, kind, payload, ts FROM events
+            WHERE chat_id=? AND lower(address)=lower(?)
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (chat_id, address, limit),
+        ).fetchall()
+    return [
+        {"id": r[0], "kind": r[1], "payload": json.loads(r[2] or "{}"), "ts": r[3]}
+        for r in rows
+    ]
+
+
 def load_state():
     with db_lock, db_conn() as conn:
         for chat_id, lang in conn.execute("SELECT chat_id, lang FROM chat_lang"):
@@ -411,7 +740,8 @@ def load_state():
         for row in conn.execute(
             """
             SELECT chat_id, address, note, position_snapshot, order_match_snapshot,
-                   last_check, muted, position_titles
+                   last_check, muted, position_titles, change_threshold_pct,
+                   poll_interval_s, last_activity, resolved_markets
             FROM watches
             """
         ):
@@ -424,6 +754,10 @@ def load_state():
                 last_check,
                 muted,
                 titles_json,
+                change_threshold_pct,
+                poll_interval_s,
+                last_activity,
+                resolved_json,
             ) = row
             if int(chat_id) not in watched:
                 watched[int(chat_id)] = {}
@@ -436,6 +770,10 @@ def load_state():
                 last_check=float(last_check or 0),
                 muted=bool(muted),
                 position_titles=json.loads(titles_json or "{}"),
+                change_threshold_pct=float(change_threshold_pct or 0),
+                poll_interval_s=int(poll_interval_s or 0),
+                last_activity=float(last_activity or 0),
+                resolved_markets=json.loads(resolved_json or "{}"),
             )
 
 
@@ -583,6 +921,93 @@ def _relative_time(chat_id: int, ts: float) -> str:
     return t(chat_id, "relt_days", n=int(delta / 86400))
 
 
+def mark_price_cents(pos: dict, market: dict | None = None) -> float | None:
+    """Return the current market (mark) price in cents for a position.
+
+    Distinct from entry/avg price in `display_fields`, which is what the user
+    paid. The mark price drives unrealized P&L and price-alert triggers.
+    """
+    market = market or {}
+    outcome_obj = pos.get("outcome") if isinstance(pos.get("outcome"), dict) else {}
+    market_obj = pos.get("market") if isinstance(pos.get("market"), dict) else {}
+
+    raw = (
+        pos.get("currentPrice")
+        or outcome_obj.get("price")
+        or outcome_obj.get("currentPrice")
+    )
+    if raw is None:
+        idx = pos.get("outcomeIndex")
+        if idx is None:
+            idx = outcome_obj.get("index")
+        if idx is not None:
+            prices = (
+                market_obj.get("outcomePrices")
+                or market_obj.get("prices")
+                or market.get("outcomePrices")
+                or market.get("prices")
+                or []
+            )
+            try:
+                i = int(idx)
+                if isinstance(prices, list) and 0 <= i < len(prices):
+                    raw = prices[i]
+            except (ValueError, TypeError):
+                pass
+
+    return _norm_price_to_cents(raw)
+
+
+def pnl_of(pos: dict, market: dict | None = None) -> tuple[float | None, float | None, float | None]:
+    """Compute unrealized PnL for a position.
+
+    Returns ``(pnl_usd, pnl_pct, mark_price_cents)``. Any component can be
+    ``None`` when the underlying data is missing (no mark price, zero entry).
+    """
+    shares_num = _norm_amount_to_shares(
+        pos.get("shares") or pos.get("quantity") or pos.get("amount")
+    )
+    if not shares_num or shares_num <= 0:
+        return None, None, None
+
+    # Re-use the same entry-price resolution as display_fields so PnL is
+    # computed against the user's cost basis, not the live mark.
+    _, _, _, entry_text = display_fields(pos, market)
+    try:
+        entry_c = float(entry_text)
+    except (ValueError, TypeError):
+        entry_c = None
+
+    mark_c = mark_price_cents(pos, market)
+    if entry_c is None or mark_c is None:
+        return None, None, mark_c
+
+    pnl_usd = shares_num * (mark_c - entry_c) / 100
+    pnl_pct = ((mark_c - entry_c) / entry_c * 100) if entry_c > 0 else None
+    return pnl_usd, pnl_pct, mark_c
+
+
+def market_resolution(market: dict | None) -> tuple[bool, int | None]:
+    """Detect whether a market is resolved and, if so, which outcome won.
+
+    Returns ``(is_resolved, winning_index_or_None)``.
+    """
+    if not isinstance(market, dict):
+        return False, None
+    status = str(market.get("status") or market.get("state") or "").lower()
+    resolved = bool(market.get("resolved")) or status in ("resolved", "closed", "settled")
+    winning = market.get("resolvedOutcome")
+    if winning is None:
+        winning = market.get("winningOutcome")
+    if winning is None:
+        winning = market.get("winningOutcomeIndex")
+    try:
+        winning_idx = int(winning) if winning is not None else None
+    except (ValueError, TypeError):
+        winning_idx = None
+    return resolved, winning_idx
+
+
 def consolidate_fills(matches: list[dict]) -> list[dict]:
     """Merge partial fills of the same order into a single synthetic entry.
 
@@ -664,12 +1089,20 @@ def _coerce_snapshot_value(v):
     return None
 
 
-def diff_positions(old: dict, new_list: list[dict]):
+def diff_positions(
+    old: dict,
+    new_list: list[dict],
+    threshold_pct: float = 0.0,
+):
     """Compute added/changed/closed positions.
 
     For ``changed`` entries we return ``(position, previous_shares)`` so the
     notification can display the delta (e.g. "5 → 12"). ``previous_shares`` is
     ``None`` when migrating from the legacy hash-based snapshot.
+
+    ``threshold_pct`` (0–100) suppresses small share-count changes: a change
+    that represents less than this percent of the previous size won't be
+    reported. ``0`` disables the filter (default).
     """
     added: list[dict] = []
     changed: list[tuple[dict, float | None]] = []
@@ -689,8 +1122,13 @@ def diff_positions(old: dict, new_list: list[dict]):
             continue
         if new_val is None:
             continue
-        if abs(new_val - old_val) > 1e-9:
-            changed.append((p, old_val))
+        if abs(new_val - old_val) <= 1e-9:
+            continue
+        if threshold_pct and old_val:
+            rel = abs(new_val - old_val) / abs(old_val) * 100.0
+            if rel < threshold_pct:
+                continue
+        changed.append((p, old_val))
 
     for k in old:
         if k not in new_map:
@@ -843,6 +1281,17 @@ def _title_html(title: str, market: dict | None) -> str:
     return safe_title
 
 
+def _pnl_line(chat_id: int, pnl_usd: float | None, pnl_pct: float | None) -> str:
+    if pnl_usd is None or pnl_pct is None:
+        return ""
+    arrow = "🟢" if pnl_usd > 0 else ("🔴" if pnl_usd < 0 else "⚪")
+    sign = "+" if pnl_usd >= 0 else "−"
+    return (
+        f"\n📈 {t(chat_id, 'label_pnl')}: {arrow} "
+        f"<b>{sign}${abs(pnl_usd):,.2f}</b> ({sign}{abs(pnl_pct):.2f}%)"
+    )
+
+
 def fmt_pos(
     pos: dict,
     label: str,
@@ -886,35 +1335,139 @@ def fmt_pos(
             )
 
     combined_market = market or pos.get("_market")
+    pnl_usd, pnl_pct, _ = pnl_of(pos, combined_market)
+    pnl_line = _pnl_line(chat_id, pnl_usd, pnl_pct) if label != "closed" else ""
+
     return (
         f"{emoji} <b>{_title_html(title, combined_market)}</b>\n"
         f"✅ <b>{outcome}</b>\n"
         f"{size_line}\n"
         f"💰 {t(chat_id, 'label_value')}: <b>{val}</b>"
+        f"{pnl_line}"
     )
 
 
-def fmt_summary(positions: list[dict], chat_id: int) -> str:
+def fmt_resolution(
+    chat_id: int,
+    market: dict | None,
+    winning_outcome: int | None,
+    held_outcome: int | None,
+) -> str:
+    title = "?"
+    if isinstance(market, dict):
+        title = market.get("title") or market.get("question") or market.get("id") or "?"
+    outcomes = []
+    if isinstance(market, dict):
+        outcomes = market.get("outcomes") or market.get("outcomeNames") or []
+
+    def _outcome_name(idx):
+        if idx is None:
+            return "?"
+        try:
+            i = int(idx)
+            if isinstance(outcomes, list) and 0 <= i < len(outcomes):
+                o = outcomes[i]
+                return o.get("name") if isinstance(o, dict) else str(o)
+        except (ValueError, TypeError):
+            pass
+        return str(idx)
+
+    winner = _outcome_name(winning_outcome)
+    verdict = ""
+    if held_outcome is not None and winning_outcome is not None:
+        if int(held_outcome) == int(winning_outcome):
+            verdict = f"\n{t(chat_id, 'resolve_win')}"
+        else:
+            verdict = f"\n{t(chat_id, 'resolve_lose')}"
+    return (
+        f"🏁 <b>{_title_html(title[:55], market)}</b>\n"
+        f"{t(chat_id, 'label_resolve_outcome')}: <b>{_html_escape(winner)}</b>"
+        f"{verdict}"
+    )
+
+
+def _sort_positions(positions: list[dict], sort_key: str) -> list[dict]:
+    def _value(p):
+        _, _, shares, price = display_fields(p, p.get("_market"))
+        try:
+            return float(shares) * float(price) / 100
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _size(p):
+        s = pos_size(p)
+        return s if s is not None else 0.0
+
+    def _title(p):
+        title, _, _, _ = display_fields(p, p.get("_market"))
+        return (title or "").lower()
+
+    if sort_key == "size":
+        return sorted(positions, key=_size, reverse=True)
+    if sort_key == "alpha":
+        return sorted(positions, key=_title)
+    # Default: sort by notional value descending.
+    return sorted(positions, key=_value, reverse=True)
+
+
+def fmt_summary(
+    positions: list[dict],
+    chat_id: int,
+    sort_key: str = "value",
+    include_portfolio: bool = False,
+) -> str:
     if not positions:
         return t(chat_id, "fmt_no_positions")
 
-    total = 0
+    ordered = _sort_positions(positions, sort_key)
+
+    total = 0.0
+    total_pnl = 0.0
+    total_pnl_known = False
+    largest_val = 0.0
+    largest_title = ""
     lines = []
 
-    for p in positions[:20]:
+    for p in ordered[:20]:
         title, outcome, shares, price = display_fields(p, p.get("_market"))
         title = title[:40]
         title_html = _title_html(title, p.get("_market"))
+        pnl_usd, pnl_pct, _ = pnl_of(p, p.get("_market"))
 
         try:
             # price is in cents, convert to USD.
             v = float(shares) * float(price) / 100
             total += v
-            lines.append(f"• {outcome} | {shares} @ {price}c = ${v:,.2f}\n  {title_html}")
+            if v > largest_val:
+                largest_val = v
+                largest_title = title
+            pnl_tail = ""
+            if pnl_usd is not None and pnl_pct is not None:
+                sign = "+" if pnl_usd >= 0 else "−"
+                arrow = "🟢" if pnl_usd > 0 else ("🔴" if pnl_usd < 0 else "⚪")
+                pnl_tail = f"  {arrow} {sign}${abs(pnl_usd):,.2f} ({sign}{abs(pnl_pct):.2f}%)"
+                total_pnl += pnl_usd
+                total_pnl_known = True
+            lines.append(f"• {outcome} | {shares} @ {price}c = ${v:,.2f}{pnl_tail}\n  {title_html}")
         except (ValueError, TypeError):
             lines.append(f"• {outcome} | {shares} @ {price}c\n  {title_html}")
 
-    return t(chat_id, "fmt_positions_header", count=len(positions), total=total) + "\n\n".join(lines)
+    header = t(chat_id, "fmt_positions_header", count=len(positions), total=total)
+    if total_pnl_known:
+        sign = "+" if total_pnl >= 0 else "−"
+        arrow = "🟢" if total_pnl > 0 else ("🔴" if total_pnl < 0 else "⚪")
+        header += f"{t(chat_id, 'label_total_pnl')}: {arrow} <b>{sign}${abs(total_pnl):,.2f}</b>\n\n"
+
+    if include_portfolio and largest_title:
+        header += (
+            f"{t(chat_id, 'label_largest_pos')}: <b>{_html_escape(largest_title)}</b> "
+            f"(${largest_val:,.2f})\n\n"
+        )
+
+    sort_label = t(chat_id, f"sort_{sort_key}")
+    header += f"<i>{t(chat_id, 'label_sorted_by')}: {sort_label}</i>\n\n"
+
+    return header + "\n\n".join(lines)
 
 
 def match_key(match: dict) -> str:
@@ -1077,45 +1630,108 @@ async def _fetch_positions_with_markets(session, addr):
     return positions, {pos_key(p): p for p in positions}
 
 
-async def _render_positions(chat_id: int, addr: str) -> tuple[str, InlineKeyboardMarkup]:
+SORT_CYCLE = ("value", "size", "alpha")
+
+
+def _next_sort(current: str) -> str:
+    try:
+        return SORT_CYCLE[(SORT_CYCLE.index(current) + 1) % len(SORT_CYCLE)]
+    except ValueError:
+        return SORT_CYCLE[0]
+
+
+ORDERS_PAGE_SIZE = 8
+ORDERS_FETCH_LIMIT = 30
+
+
+async def _render_positions(
+    chat_id: int,
+    addr: str,
+    sort_key: str = "value",
+    portfolio: bool = False,
+) -> tuple[str, InlineKeyboardMarkup]:
     async with aiohttp.ClientSession() as session:
         positions, _ = await _fetch_positions_with_markets(session, addr)
     if positions is None:
         text = t(chat_id, "fetch_error_msg")
     else:
-        text = f"<code>{addr}</code>\n\n{fmt_summary(positions, chat_id)}"
+        text = (
+            f"<code>{addr}</code>\n\n"
+            f"{fmt_summary(positions, chat_id, sort_key=sort_key, include_portfolio=portfolio)}"
+        )
+    sort_label = t(chat_id, f"sort_{_next_sort(sort_key)}")
+    portfolio_btn_key = "btn_hide_portfolio" if portfolio else "btn_portfolio"
     markup = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(t(chat_id, "btn_refresh"), callback_data=f"refresh_pos:{addr}"),
-                InlineKeyboardButton(t(chat_id, "btn_view_orders"), callback_data=f"orders:{addr}"),
-            ]
+                InlineKeyboardButton(
+                    t(chat_id, "btn_refresh"),
+                    callback_data=f"refresh_pos:{addr}:{sort_key}:{1 if portfolio else 0}",
+                ),
+                InlineKeyboardButton(
+                    t(chat_id, "btn_view_orders"), callback_data=f"orders:{addr}:0"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    t(chat_id, "btn_sort", label=sort_label),
+                    callback_data=f"sortpos:{addr}:{_next_sort(sort_key)}:{1 if portfolio else 0}",
+                ),
+                InlineKeyboardButton(
+                    t(chat_id, portfolio_btn_key),
+                    callback_data=f"sortpos:{addr}:{sort_key}:{0 if portfolio else 1}",
+                ),
+            ],
         ]
     )
     return text, markup
 
 
-async def _render_orders(chat_id: int, addr: str) -> str:
+async def _render_orders(
+    chat_id: int, addr: str, page: int = 0
+) -> tuple[str, InlineKeyboardMarkup | None]:
     async with aiohttp.ClientSession() as session:
-        matches = await fetch_order_matches(session, addr, first=10)
+        matches = await fetch_order_matches(session, addr, first=ORDERS_FETCH_LIMIT)
         positions, positions_by_key = await _fetch_positions_with_markets(session, addr)
 
     if matches is None and positions is None:
-        return t(chat_id, "fetch_error_msg")
+        return t(chat_id, "fetch_error_msg"), None
     matches = matches or []
     if not matches:
-        return f"<code>{addr}</code>\n\n{t(chat_id, 'no_orders')}"
+        return f"<code>{addr}</code>\n\n{t(chat_id, 'no_orders')}", None
+
     matches = consolidate_fills(matches)
+    total_pages = max(1, (len(matches) + ORDERS_PAGE_SIZE - 1) // ORDERS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * ORDERS_PAGE_SIZE
+    chunk = matches[start : start + ORDERS_PAGE_SIZE]
+
     lines = [t(chat_id, "orders_header", addr=fmt_addr(addr), count=len(matches)), ""]
-    lines.extend(fmt_match(m, chat_id, positions_by_key) for m in matches[:8])
-    return "\n\n".join(lines)
+    lines.extend(fmt_match(m, chat_id, positions_by_key) for m in chunk)
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅", callback_data=f"orders:{addr}:{page - 1}"))
+    nav.append(
+        InlineKeyboardButton(
+            t(chat_id, "list_page_indicator", page=page + 1, total=total_pages),
+            callback_data="noop",
+        )
+    )
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡", callback_data=f"orders:{addr}:{page + 1}"))
+    markup = InlineKeyboardMarkup([nav]) if total_pages > 1 else None
+    return "\n\n".join(lines), markup
 
 
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if not ctx.args:
-        await update.message.reply_text(t(chat_id, "usage_watch"))
+        # No args — user likely tapped /watch from the command menu. Show
+        # the wallet-discovery guide plus a concrete 3-line format example
+        # instead of a terse "Usage" line.
+        await _send_watch_guide(ctx, chat_id)
         return
 
     # Multi-address mode: if every argument is a well-formed 0x address, watch
@@ -1132,6 +1748,44 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         addresses = [raw_args[0]]
         base_note = " ".join(raw_args[1:]).strip()
+
+    # Duplicate-note handling (T12): if the first address is already watched
+    # and the user supplied a new note, ask before overwriting instead of
+    # silently skipping.
+    if (
+        not multi_mode
+        and base_note
+        and _is_addr(addresses[0])
+        and addresses[0] in watched.get(chat_id, {})
+        and watched[chat_id][addresses[0]].note != base_note
+    ):
+        existing = watched[chat_id][addresses[0]]
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        t(chat_id, "btn_overwrite_note"),
+                        callback_data=f"watchover:{addresses[0]}:{base_note[:50]}",
+                    ),
+                    InlineKeyboardButton(
+                        t(chat_id, "btn_cancel"),
+                        callback_data=f"watchover:{addresses[0]}:__CANCEL__",
+                    ),
+                ]
+            ]
+        )
+        await update.message.reply_text(
+            t(
+                chat_id,
+                "dup_watch_prompt",
+                addr=fmt_addr(addresses[0]),
+                old=_html_escape(existing.note or "(none)"),
+                new=_html_escape(base_note),
+            ),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        return
 
     watched.setdefault(chat_id, {})
     status = await update.message.reply_text(t(chat_id, "loading_positions"))
@@ -1219,6 +1873,39 @@ async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+STALE_THRESHOLD_S = 14 * 24 * 3600  # 14 days with no activity → 💤
+FRESH_THRESHOLD_S = 60  # watch added less than 60s ago → 🌱
+
+
+def _wallet_badge(chat_id: int, w: WatchedWallet) -> str:
+    now = time.time()
+    if w.muted:
+        return t(chat_id, "label_muted_flag")
+    # Fresh badge: brand-new wallet with no positions yet and checked just now.
+    if (
+        not w.position_snapshot
+        and w.last_check
+        and (now - w.last_check) < FRESH_THRESHOLD_S
+        and not w.last_activity
+    ):
+        return t(chat_id, "label_fresh_flag")
+    # Dormant badge: no activity for a long time and no positions.
+    if (
+        not w.position_snapshot
+        and w.last_activity
+        and (now - w.last_activity) > STALE_THRESHOLD_S
+    ):
+        return t(chat_id, "label_stale_flag")
+    if (
+        not w.position_snapshot
+        and not w.last_activity
+        and w.last_check
+        and (now - w.last_check) > STALE_THRESHOLD_S
+    ):
+        return t(chat_id, "label_stale_flag")
+    return t(chat_id, "label_watching_flag")
+
+
 def _render_list_page(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
     wallets = list(watched.get(chat_id, {}).items())
     total_pages = max(1, (len(wallets) + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
@@ -1229,8 +1916,8 @@ def _render_list_page(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarku
     lines = [t(chat_id, "watch_list")]
     keyboard: list[list[InlineKeyboardButton]] = []
     for addr, w in chunk:
-        flag = t(chat_id, "label_muted_flag") if w.muted else t(chat_id, "label_watching_flag")
-        note = f" · <b>{w.note}</b>" if w.note else ""
+        flag = _wallet_badge(chat_id, w)
+        note = f" · <b>{_html_escape(w.note)}</b>" if w.note else ""
         relt = _relative_time(chat_id, w.last_check)
         lines.append(
             f"{flag} <code>{addr}</code>{note}\n"
@@ -1238,6 +1925,7 @@ def _render_list_page(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarku
         )
         label_title = (w.note or fmt_addr(addr))[:18]
         mute_label = t(chat_id, "btn_unmute") if w.muted else t(chat_id, "btn_mute")
+        # Row 1: Positions · Fills · ✏️ (edit note)
         keyboard.append(
             [
                 InlineKeyboardButton(
@@ -1247,6 +1935,14 @@ def _render_list_page(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarku
                 InlineKeyboardButton(
                     t(chat_id, "btn_view_orders"), callback_data=f"orders:{addr}"
                 ),
+                InlineKeyboardButton(
+                    t(chat_id, "btn_edit_note"), callback_data=f"editnote:{addr}"
+                ),
+            ]
+        )
+        # Row 2: mute toggle · unwatch
+        keyboard.append(
+            [
                 InlineKeyboardButton(mute_label, callback_data=f"togglemute:{addr}"),
                 InlineKeyboardButton(
                     t(chat_id, "btn_unwatch"), callback_data=f"unwatch:{addr}"
@@ -1318,11 +2014,21 @@ async def cmd_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     status = await update.message.reply_text(t(chat_id, "loading_positions"))
-    text = await _render_orders(chat_id, addr)
+    text, markup = await _render_orders(chat_id, addr, page=0)
     try:
-        await status.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+        await status.edit_text(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=markup,
+        )
     except BadRequest:
-        await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=markup,
+        )
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1439,11 +2145,398 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if len(ctx.args) < 2:
+        await update.message.reply_text(t(chat_id, "usage_threshold"))
+        return
+    addr = resolve_addr(chat_id, ctx.args[0])
+    target = watched.get(chat_id, {}).get(addr) if addr else None
+    if not target:
+        await update.message.reply_text(t(chat_id, "not_found"))
+        return
+    try:
+        pct = float(ctx.args[1])
+    except ValueError:
+        await update.message.reply_text(t(chat_id, "usage_threshold"))
+        return
+    pct = max(0.0, min(100.0, pct))
+    target.change_threshold_pct = pct
+    save_watch(target)
+    await update.message.reply_text(
+        t(chat_id, "threshold_set", addr=fmt_addr(addr), pct=f"{pct:g}"),
+        parse_mode="HTML",
+    )
+
+
+async def cmd_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if len(ctx.args) < 2:
+        await update.message.reply_text(t(chat_id, "usage_interval"))
+        return
+    addr = resolve_addr(chat_id, ctx.args[0])
+    target = watched.get(chat_id, {}).get(addr) if addr else None
+    if not target:
+        await update.message.reply_text(t(chat_id, "not_found"))
+        return
+    try:
+        sec = int(ctx.args[1])
+    except ValueError:
+        await update.message.reply_text(t(chat_id, "usage_interval"))
+        return
+    if sec != 0 and sec < 5:
+        await update.message.reply_text(t(chat_id, "interval_too_small"))
+        return
+    target.poll_interval_s = sec
+    save_watch(target)
+    await update.message.reply_text(
+        t(chat_id, "interval_set", addr=fmt_addr(addr), sec=sec),
+        parse_mode="HTML",
+    )
+
+
+def _find_outcome_index(
+    chat_id: int, addr: str, outcome_name: str
+) -> tuple[str | None, int | None]:
+    """Search the wallet's cached titles / positions for an outcome match.
+
+    Returns (market_id, outcome_index). We scan the live poll snapshot so the
+    user can reference outcomes by name (e.g. "YES"/"NO"/"Trump") rather than
+    having to know the internal market ID. Returns (None, None) when nothing
+    matches.
+    """
+    w = watched.get(chat_id, {}).get(addr)
+    if not w:
+        return None, None
+    want = outcome_name.lower()
+    # position_titles keys are pos_key == "<market_id>_<idx>". We don't have
+    # the outcome name in there, so fall back to looking at the live market
+    # cache for any outcome whose name matches.
+    for k in w.position_snapshot.keys():
+        market_id, _, idx_str = k.rpartition("_")
+        if not market_id:
+            continue
+        market = market_cache.get(market_id) or {}
+        outcomes = market.get("outcomes") or market.get("outcomeNames") or []
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            continue
+        if isinstance(outcomes, list) and 0 <= idx < len(outcomes):
+            o = outcomes[idx]
+            name = (o.get("name") if isinstance(o, dict) else str(o)) or ""
+            if name.lower() == want:
+                return market_id, idx
+    # Second pass: any outcome in market_cache for any of the user's markets.
+    for k in w.position_snapshot.keys():
+        market_id, _, _ = k.rpartition("_")
+        market = market_cache.get(market_id) or {}
+        outcomes = market.get("outcomes") or market.get("outcomeNames") or []
+        if isinstance(outcomes, list):
+            for i, o in enumerate(outcomes):
+                name = (o.get("name") if isinstance(o, dict) else str(o)) or ""
+                if name.lower() == want:
+                    return market_id, i
+    return None, None
+
+
+async def cmd_alert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if len(ctx.args) < 4:
+        await update.message.reply_text(t(chat_id, "usage_alert"))
+        return
+    addr = resolve_addr(chat_id, ctx.args[0])
+    target = watched.get(chat_id, {}).get(addr) if addr else None
+    if not target:
+        await update.message.reply_text(t(chat_id, "not_found"))
+        return
+    outcome_name = ctx.args[1]
+    op = ctx.args[2]
+    if op not in (">=", "<="):
+        await update.message.reply_text(t(chat_id, "alert_bad_op"))
+        return
+    try:
+        threshold = float(ctx.args[3])
+    except ValueError:
+        await update.message.reply_text(t(chat_id, "alert_bad_price"))
+        return
+    if not (0 <= threshold <= 100):
+        await update.message.reply_text(t(chat_id, "alert_bad_price"))
+        return
+
+    market_id, outcome_index = _find_outcome_index(chat_id, addr, outcome_name)
+    if not market_id or outcome_index is None:
+        await update.message.reply_text(t(chat_id, "alert_bad_outcome"))
+        return
+
+    alert_id = insert_alert(chat_id, addr, market_id, outcome_index, op, threshold)
+    await update.message.reply_text(
+        t(
+            chat_id,
+            "alert_created",
+            id=alert_id,
+            outcome=_html_escape(outcome_name),
+            op=op,
+            threshold=threshold,
+        ),
+        parse_mode="HTML",
+    )
+
+
+async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    addr = None
+    if ctx.args:
+        addr = resolve_addr(chat_id, ctx.args[0])
+    alerts = list_alerts(chat_id, addr)
+    if not alerts:
+        await update.message.reply_text(t(chat_id, "alerts_empty"))
+        return
+    lines = [t(chat_id, "alerts_header", count=len(alerts))]
+    for a in alerts:
+        market = market_cache.get(a["market_id"]) or {}
+        outcomes = market.get("outcomes") or market.get("outcomeNames") or []
+        outcome_name = "?"
+        try:
+            idx = int(a["outcome_index"])
+            if isinstance(outcomes, list) and 0 <= idx < len(outcomes):
+                o = outcomes[idx]
+                outcome_name = o.get("name") if isinstance(o, dict) else str(o)
+        except (ValueError, TypeError):
+            pass
+        title = (market.get("title") or market.get("question") or a["market_id"])[:45]
+        lines.append(
+            t(
+                chat_id,
+                "alerts_line",
+                id=a["id"],
+                outcome=_html_escape(str(outcome_name)),
+                op=a["op"],
+                threshold=a["threshold"],
+                title=_html_escape(title),
+            )
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_unalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not ctx.args:
+        await update.message.reply_text(t(chat_id, "usage_unalert"))
+        return
+    try:
+        alert_id = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text(t(chat_id, "usage_unalert"))
+        return
+    ok = delete_alert(chat_id, alert_id)
+    key = "unalert_ok" if ok else "unalert_not_found"
+    await update.message.reply_text(
+        t(chat_id, key, id=alert_id),
+        parse_mode="HTML",
+    )
+
+
+def _event_summary(chat_id: int, ev: dict) -> str:
+    """Collapse a stored event payload into a one-line summary."""
+    kind = ev.get("kind", "?")
+    payload = ev.get("payload") or {}
+    if kind == "open":
+        return f"opened {payload.get('pos_key', '')}"
+    if kind == "close":
+        return f"closed {payload.get('title', payload.get('pos_key', ''))}"
+    if kind == "change":
+        prev = payload.get("prev")
+        new = payload.get("new")
+        return f"{payload.get('pos_key', '')}: {prev} → {new}"
+    if kind == "fill":
+        tx = (payload.get("tx") or "")[:12]
+        amt = payload.get("amount")
+        return f"fill {amt} (tx {tx}…)"
+    if kind == "resolve":
+        return f"resolved: {payload.get('title', '')} → outcome {payload.get('winning')}"
+    if kind == "alert":
+        return f"alert #{payload.get('alert_id')} @ {payload.get('price', 0):.2f}c"
+    return kind
+
+
+async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not ctx.args:
+        await update.message.reply_text(t(chat_id, "usage_history"))
+        return
+    addr = resolve_addr(chat_id, ctx.args[0])
+    if not addr:
+        await update.message.reply_text(t(chat_id, "invalid_address"))
+        return
+    events = list_events(chat_id, addr, limit=20)
+    if not events:
+        await update.message.reply_text(t(chat_id, "history_empty"))
+        return
+    lines = [t(chat_id, "history_header", addr=fmt_addr(addr))]
+    for ev in events:
+        lines.append(
+            t(
+                chat_id,
+                "history_line",
+                relt=_relative_time(chat_id, ev["ts"]),
+                kind=ev["kind"],
+                summary=_html_escape(_event_summary(chat_id, ev)),
+            )
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Reuse /pos rendering but open with the portfolio card expanded."""
+    chat_id = update.effective_chat.id
+    if not ctx.args:
+        await update.message.reply_text(t(chat_id, "usage_pos"))
+        return
+    addr = resolve_addr(chat_id, ctx.args[0])
+    if not addr:
+        await update.message.reply_text(t(chat_id, "invalid_address"))
+        return
+    status = await update.message.reply_text(t(chat_id, "loading_positions"))
+    text, markup = await _render_positions(
+        chat_id, addr, sort_key="value", portfolio=True
+    )
+    try:
+        await status.edit_text(
+            text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True
+        )
+    except BadRequest:
+        await update.message.reply_text(
+            text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True
+        )
+
+
+# ---- /import: either reply-to a JSON document OR forward a JSON document.
+
+MAX_IMPORT_BYTES = 256 * 1024
+
+
+async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    msg = update.message
+    target_msg = msg.reply_to_message if msg and msg.reply_to_message else msg
+    doc = getattr(target_msg, "document", None) if target_msg else None
+    if not doc:
+        await msg.reply_text(t(chat_id, "import_no_file"))
+        return
+    if doc.file_size and doc.file_size > MAX_IMPORT_BYTES:
+        await msg.reply_text(t(chat_id, "import_too_big"))
+        return
+    try:
+        tg_file = await doc.get_file()
+        buf = BytesIO()
+        await tg_file.download_to_memory(out=buf)
+        buf.seek(0)
+        payload = json.loads(buf.read().decode("utf-8"))
+    except Exception as e:
+        logger.warning(f"/import parse failed: {e}")
+        await msg.reply_text(t(chat_id, "import_parse_error"))
+        return
+
+    records = payload.get("watches") if isinstance(payload, dict) else payload
+    if not isinstance(records, list):
+        await msg.reply_text(t(chat_id, "import_parse_error"))
+        return
+
+    added = 0
+    skipped = 0
+    watched.setdefault(chat_id, {})
+    async with aiohttp.ClientSession() as session:
+        for rec in records:
+            if not isinstance(rec, dict):
+                skipped += 1
+                continue
+            addr = str(rec.get("address") or "").strip()
+            if not (addr.startswith("0x") and len(addr) == 42):
+                skipped += 1
+                continue
+            if addr.lower() in {a.lower() for a in watched[chat_id]}:
+                skipped += 1
+                continue
+
+            positions = await fetch_positions(session, addr)
+            matches = await fetch_order_matches(session, addr, first=30)
+            if positions is None and matches is None:
+                skipped += 1
+                continue
+            positions = positions or []
+            matches = matches or []
+            snapshot = {pos_key(p): pos_size(p) for p in positions}
+            title_cache = {}
+            for p in positions:
+                title, _, _, _ = display_fields(p, p.get("_market"))
+                title_cache[pos_key(p)] = title[:80]
+            watched[chat_id][addr] = WatchedWallet(
+                address=addr,
+                chat_id=chat_id,
+                note=str(rec.get("note") or ""),
+                muted=bool(rec.get("muted", False)),
+                position_snapshot=snapshot,
+                position_titles=title_cache,
+                order_match_snapshot={match_key(m) for m in matches},
+                last_check=time.time(),
+            )
+            save_watch(watched[chat_id][addr])
+            added += 1
+
+    await msg.reply_text(
+        t(chat_id, "import_done", added=added, skipped=skipped), parse_mode="HTML"
+    )
+
+
+# ---- Inline note editing (reply-based) ----
+
+# Maps chat_id to address awaiting a note reply. Tracked in user_data, but we
+# also keep a module-level fallback for group chats where user_data is keyed
+# differently.
+def _set_pending_note_edit(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, addr: str):
+    ctx.user_data["pending_note_edit"] = {"chat_id": chat_id, "address": addr}
+
+
+def _pop_pending_note_edit(ctx: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    return ctx.user_data.pop("pending_note_edit", None)
+
+
+async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle free-text messages. Currently only the note-edit reply flow."""
+    if not update.message or update.message.text is None:
+        return
+    chat_id = update.effective_chat.id
+    pending = _pop_pending_note_edit(ctx)
+    if not pending or pending.get("chat_id") != chat_id:
+        return
+    addr = pending.get("address") or ""
+    target = watched.get(chat_id, {}).get(addr)
+    if not target:
+        return
+    target.note = update.message.text.strip()
+    save_watch(target)
+    await update.message.reply_text(
+        t(chat_id, "edit_note_saved", addr=fmt_addr(addr), note=_html_escape(target.note)),
+        parse_mode="HTML",
+    )
+
+
 # ==================== Callback handling ====================
 
 
-async def _show_positions_via_callback(query, ctx, chat_id: int, addr: str, edit: bool):
-    text, markup = await _render_positions(chat_id, addr)
+async def _show_positions_via_callback(
+    query,
+    ctx,
+    chat_id: int,
+    addr: str,
+    edit: bool,
+    sort_key: str = "value",
+    portfolio: bool = False,
+):
+    text, markup = await _render_positions(
+        chat_id, addr, sort_key=sort_key, portfolio=portfolio
+    )
     if edit:
         try:
             await query.edit_message_text(
@@ -1487,25 +2580,52 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    if data.startswith("pos:") or data.startswith("refresh_pos:"):
-        addr = data.split(":", 1)[1].strip()
+    # pos:<addr> | refresh_pos:<addr>[:sort[:portfolio]] | sortpos:<addr>:<sort>:<portfolio>
+    if data.startswith("pos:") or data.startswith("refresh_pos:") or data.startswith("sortpos:"):
+        parts = data.split(":")
+        addr = parts[1].strip() if len(parts) > 1 else ""
+        sort_key = parts[2] if len(parts) > 2 else "value"
+        portfolio = bool(int(parts[3])) if len(parts) > 3 and parts[3].isdigit() else False
+        if sort_key not in SORT_CYCLE:
+            sort_key = "value"
         if not addr.startswith("0x") or len(addr) != 42:
             await ctx.bot.send_message(chat_id=chat_id, text=t(chat_id, "invalid_address"))
             return
+        edit = data.startswith("refresh_pos:") or data.startswith("sortpos:")
         await _show_positions_via_callback(
-            query, ctx, chat_id, addr, edit=data.startswith("refresh_pos:")
+            query, ctx, chat_id, addr, edit=edit, sort_key=sort_key, portfolio=portfolio
         )
         return
 
+    # orders:<addr>[:page]
     if data.startswith("orders:"):
-        addr = data.split(":", 1)[1].strip()
+        parts = data.split(":")
+        addr = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            page = int(parts[2]) if len(parts) > 2 else 0
+        except ValueError:
+            page = 0
         if not addr.startswith("0x") or len(addr) != 42:
             await ctx.bot.send_message(chat_id=chat_id, text=t(chat_id, "invalid_address"))
             return
-        text = await _render_orders(chat_id, addr)
-        await ctx.bot.send_message(
-            chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True
-        )
+        text, markup = await _render_orders(chat_id, addr, page=page)
+        # B2: edit the existing message if the button came from an existing
+        # orders view (page > 0 or tapping again). Fall back to sending new.
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except BadRequest:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
         return
 
     if data.startswith("unwatch:"):
@@ -1552,25 +2672,173 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    if data == "watch_guide":
-        guide_path = Path(GUIDE_IMAGE_PATH)
-        if guide_path.exists():
-            with open(guide_path, "rb") as photo:
-                await ctx.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=photo,
-                    caption=t(chat_id, "watch_guide_caption"),
-                    parse_mode="HTML",
-                )
-        else:
-            await ctx.bot.send_message(
-                chat_id=chat_id,
-                text=t(chat_id, "watch_guide_text"),
-                parse_mode="HTML",
-            )
+    # editnote:<addr> — prompt the user to reply with the new note.
+    if data.startswith("editnote:"):
+        addr = data.split(":", 1)[1].strip()
+        if addr not in watched.get(chat_id, {}):
+            return
+        _set_pending_note_edit(ctx, chat_id, addr)
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=t(chat_id, "edit_note_prompt", addr=fmt_addr(addr)),
+            parse_mode="HTML",
+            reply_markup=ForceReply(selective=True),
+        )
         return
 
+    # watchover:<addr>:<base64-note> — confirm overwriting an existing note.
+    if data.startswith("watchover:"):
+        parts = data.split(":", 2)
+        addr = parts[1].strip() if len(parts) > 1 else ""
+        new_note = parts[2] if len(parts) > 2 else ""
+        target = watched.get(chat_id, {}).get(addr)
+        if target and new_note != "__CANCEL__":
+            target.note = new_note
+            save_watch(target)
+            try:
+                await query.edit_message_text(t(chat_id, "dup_watch_overwritten"))
+            except BadRequest:
+                pass
+        else:
+            try:
+                await query.edit_message_text(t(chat_id, "dup_watch_cancelled"))
+            except BadRequest:
+                pass
+        return
+
+    if data == "watch_guide":
+        await _send_watch_guide(ctx, chat_id)
+        return
+
+
+async def _send_watch_guide(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Send the wallet-discovery guide (image + caption, or text fallback)."""
+    guide_path = Path(GUIDE_IMAGE_PATH)
+    example = t(chat_id, "watch_example")
+    if guide_path.exists():
+        with open(guide_path, "rb") as photo:
+            await ctx.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                caption=t(chat_id, "watch_guide_caption") + "\n\n" + example,
+                parse_mode="HTML",
+            )
+    else:
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=t(chat_id, "watch_guide_text") + "\n\n" + example,
+            parse_mode="HTML",
+        )
+
 # ==================== Poll Loop ====================
+
+async def _evaluate_alerts(
+    app: Application,
+    chat_id: int,
+    w: WatchedWallet,
+    positions_by_key: dict,
+    markets: dict,
+):
+    """Check each stored price alert for this wallet; fire and delete matches."""
+    try:
+        alerts = list_alerts(chat_id, w.address)
+    except Exception as e:
+        logger.warning(f"list_alerts failed for {w.address}: {e}")
+        return
+    if not alerts:
+        return
+
+    for a in alerts:
+        mid = a["market_id"]
+        oi = a["outcome_index"]
+        lookup = _position_lookup_key(mid, oi)
+        pos = positions_by_key.get(lookup)
+        if pos is None:
+            # Position no longer held — can't evaluate against mark price.
+            continue
+        mark = mark_price_cents(pos, markets.get(mid) or pos.get("_market"))
+        if mark is None:
+            continue
+        op = a["op"]
+        thr = float(a["threshold"])
+        hit = (op == ">=" and mark >= thr) or (op == "<=" and mark <= thr)
+        if not hit:
+            continue
+        title, outcome, _, _ = display_fields(pos, pos.get("_market"))
+        try:
+            if not w.muted:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=t(
+                        chat_id,
+                        "alert_fired",
+                        addr=fmt_addr(w.address),
+                        title=_title_html(title[:55], pos.get("_market")),
+                        outcome=_html_escape(outcome),
+                        op=op,
+                        threshold=thr,
+                        price=mark,
+                    ),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            delete_alert(chat_id, a["id"])
+            insert_event(
+                chat_id,
+                w.address,
+                "alert",
+                {"alert_id": a["id"], "outcome": outcome, "op": op, "threshold": thr, "price": mark},
+            )
+        except Exception as e:
+            logger.warning(f"alert send failed for {w.address}: {e}")
+
+
+def _detect_resolutions(
+    w: WatchedWallet,
+    markets: dict,
+    old_titles: dict,
+    positions_by_key: dict,
+) -> list[tuple[dict, int | None, int | None, str]]:
+    """Scan watched markets for a resolved transition we haven't alerted on yet.
+
+    Returns a list of ``(market, winning_idx, held_idx, title)`` for markets
+    that have newly resolved. Mutates ``w.resolved_markets`` to record the
+    new state so we fire only once per resolution.
+    """
+    newly: list[tuple[dict, int | None, int | None, str]] = []
+    for mid, market in markets.items():
+        resolved, winning = market_resolution(market)
+        if not resolved:
+            continue
+        prior = w.resolved_markets.get(str(mid))
+        if prior:
+            continue
+        # Try to find which outcome (if any) this wallet held.
+        held_idx: int | None = None
+        for k, p in positions_by_key.items():
+            if str(p.get("marketId") or (p.get("market") or {}).get("id")) == str(mid):
+                oi = p.get("outcomeIndex")
+                if oi is None:
+                    oi = (p.get("outcome") or {}).get("index")
+                try:
+                    held_idx = int(oi)
+                except (ValueError, TypeError):
+                    held_idx = None
+                break
+        title = market.get("title") or market.get("question") or str(mid)
+        # Also check old_titles (in case the position just closed this cycle).
+        if held_idx is None:
+            for k, title_cache in old_titles.items():
+                if k.startswith(f"{mid}_"):
+                    try:
+                        held_idx = int(k.rsplit("_", 1)[-1])
+                    except ValueError:
+                        pass
+                    break
+        w.resolved_markets[str(mid)] = {"winning": winning, "ts": time.time()}
+        newly.append((market, winning, held_idx, title))
+    return newly
+
 
 async def poll_loop(app: Application):
     await asyncio.sleep(3)
@@ -1581,13 +2849,23 @@ async def poll_loop(app: Application):
             for chat_id, wallets in list(watched.items()):
                 for addr, w in list(wallets.items()):
                     try:
+                        # Per-wallet interval gating: skip wallets whose
+                        # personal interval hasn't elapsed. 0 = use global.
+                        if (
+                            w.poll_interval_s
+                            and (time.time() - w.last_check) < w.poll_interval_s
+                        ):
+                            continue
+
                         positions_raw = await fetch_positions(session, w.address)
                         matches_raw = await fetch_order_matches(session, w.address, first=20)
 
-                        # Both calls failing in the same poll means transient
-                        # upstream trouble — count, and notify once on threshold
-                        # crossing rather than updating stale snapshot data.
-                        if positions_raw is None and matches_raw is None:
+                        # B1 fix: count as failure if EITHER call failed.
+                        # Reset only when BOTH succeed.
+                        any_failed = positions_raw is None or matches_raw is None
+                        all_failed = positions_raw is None and matches_raw is None
+
+                        if any_failed:
                             w.fetch_errors += 1
                             if (
                                 w.fetch_errors >= ERROR_ALERT_THRESHOLD
@@ -1610,13 +2888,31 @@ async def poll_loop(app: Application):
                                     logger.warning(
                                         f"Failed to send fetch-error alert for {addr}: {send_err}"
                                     )
-                            await asyncio.sleep(1)
-                            continue
+                            if all_failed:
+                                # No data at all — can't meaningfully diff.
+                                await asyncio.sleep(1)
+                                continue
 
-                        # At least one call succeeded — reset error state.
-                        if w.fetch_errors or w.error_notified:
+                        # Both succeeded → recover state and notify if needed.
+                        if not any_failed:
+                            was_notified = w.error_notified
                             w.fetch_errors = 0
                             w.error_notified = False
+                            if was_notified and not w.muted:
+                                try:
+                                    await app.bot.send_message(
+                                        chat_id=chat_id,
+                                        text=t(
+                                            chat_id,
+                                            "api_recovered",
+                                            addr=fmt_addr(w.address),
+                                        ),
+                                        parse_mode="HTML",
+                                    )
+                                except Exception as send_err:
+                                    logger.warning(
+                                        f"Failed to send api_recovered for {addr}: {send_err}"
+                                    )
 
                         positions = positions_raw or []
                         matches = matches_raw or []
@@ -1626,7 +2922,11 @@ async def poll_loop(app: Application):
                             p["_market"] = markets.get(p.get("marketId"), {})
                         positions_by_key = {pos_key(p): p for p in positions}
 
-                        added, changed, closed = diff_positions(w.position_snapshot, positions)
+                        added, changed, closed = diff_positions(
+                            w.position_snapshot,
+                            positions,
+                            threshold_pct=w.change_threshold_pct,
+                        )
                         new_match_keys = {match_key(m) for m in matches}
                         new_fills = [m for m in matches if match_key(m) not in w.order_match_snapshot]
 
@@ -1638,15 +2938,27 @@ async def poll_loop(app: Application):
                             title, _, _, _ = display_fields(p, p.get("_market"))
                             new_titles[pos_key(p)] = title[:80]
                         old_titles = dict(w.position_titles)
+                        # Preserve titles for keys that have disappeared this
+                        # poll so we can still render their resolution notice.
+                        merged_titles = {**old_titles, **new_titles}
                         w.position_titles = new_titles
                         w.position_snapshot = {pos_key(p): pos_size(p) for p in positions}
                         w.last_check = time.time()
                         display_addr = fmt_addr(w.address) + (f" · {w.note}" if w.note else "")
 
-                        if (added or changed or closed) and not w.muted:
+                        # --- Detect market resolutions (fires once per market) ---
+                        resolutions = _detect_resolutions(
+                            w, markets, merged_titles, positions_by_key
+                        )
+
+                        blocks: list[str] = []  # For merged combined message.
+                        event_batch: list[tuple[str, dict]] = []
+
+                        if added or changed or closed:
                             parts = []
                             for p in added:
                                 parts.append(fmt_pos(p, "added", chat_id, markets.get(p.get("marketId"))))
+                                event_batch.append(("open", {"pos_key": pos_key(p)}))
                             for p, prev_size in changed:
                                 parts.append(
                                     fmt_pos(
@@ -1657,40 +2969,94 @@ async def poll_loop(app: Application):
                                         prev_shares=prev_size,
                                     )
                                 )
+                                event_batch.append(
+                                    ("change", {"pos_key": pos_key(p), "prev": prev_size, "new": pos_size(p)})
+                                )
                             for k in closed:
-                                title = old_titles.get(k) or t(
+                                title = merged_titles.get(k) or t(
                                     chat_id, "close_fallback", key=k
                                 )
                                 parts.append(
                                     f"{t(chat_id, 'fmt_closed')} <b>{_html_escape(title)}</b>"
                                 )
-
-                            header = t(chat_id, "poll_header", addr=display_addr)
-                            text = header + "\n\n".join(parts[:8])
-
+                                event_batch.append(("close", {"pos_key": k, "title": title}))
+                            block = t(chat_id, "poll_header", addr=display_addr) + "\n\n".join(parts[:8])
                             if len(parts) > 8:
-                                text += t(chat_id, "fmt_more", count=len(parts) - 8)
+                                block += t(chat_id, "fmt_more", count=len(parts) - 8)
+                            blocks.append(block)
 
-                            await app.bot.send_message(
-                                chat_id=chat_id,
-                                text=text,
-                                parse_mode="HTML",
-                                disable_web_page_preview=True,
-                            )
-
-                        if new_fills and not w.muted:
+                        if new_fills:
                             merged_fills = consolidate_fills(new_fills)
                             fill_lines = [
                                 fmt_match(m, chat_id, positions_by_key)
                                 for m in merged_fills[:5]
                             ]
-                            await app.bot.send_message(
-                                chat_id=chat_id,
-                                text=t(chat_id, "fills_header", addr=display_addr)
-                                + "\n\n".join(fill_lines),
-                                parse_mode="HTML",
-                                disable_web_page_preview=True,
+                            blocks.append(
+                                t(chat_id, "fills_header", addr=display_addr)
+                                + "\n\n".join(fill_lines)
                             )
+                            for m in merged_fills[:5]:
+                                event_batch.append(
+                                    (
+                                        "fill",
+                                        {
+                                            "tx": m.get("transactionHash"),
+                                            "order_hash": m.get("orderHash")
+                                            or (m.get("taker") or {}).get("orderHash"),
+                                            "amount": _norm_amount_to_shares(m.get("amountFilled")),
+                                        },
+                                    )
+                                )
+
+                        if resolutions:
+                            lines = []
+                            for market, winning_idx, held_idx, title in resolutions:
+                                lines.append(
+                                    fmt_resolution(chat_id, market, winning_idx, held_idx)
+                                )
+                                event_batch.append(
+                                    (
+                                        "resolve",
+                                        {
+                                            "market_id": market.get("id"),
+                                            "title": title,
+                                            "winning": winning_idx,
+                                            "held": held_idx,
+                                        },
+                                    )
+                                )
+                            blocks.append(
+                                t(chat_id, "poll_resolve_header", addr=display_addr)
+                                + "\n\n".join(lines)
+                            )
+
+                        # Merge blocks into a single message when the wallet
+                        # isn't muted — T13.
+                        if blocks and not w.muted:
+                            text = "\n\n─────\n\n".join(blocks)
+                            try:
+                                await app.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=text,
+                                    parse_mode="HTML",
+                                    disable_web_page_preview=True,
+                                )
+                                w.last_activity = time.time()
+                            except Exception as send_err:
+                                logger.warning(
+                                    f"Failed to send merged poll message for {addr}: {send_err}"
+                                )
+
+                        for kind, payload in event_batch:
+                            try:
+                                insert_event(chat_id, w.address, kind, payload)
+                            except Exception as ev_err:
+                                logger.warning(f"event log failed: {ev_err}")
+
+                        # Price-alert evaluation runs regardless of mute state
+                        # (alerts are explicit user-configured; mute only
+                        # silences auto-detected change/fill spam).
+                        await _evaluate_alerts(app, chat_id, w, positions_by_key, markets)
 
                         w.order_match_snapshot = set(list(new_match_keys)[:100])
                         save_watch(w)
@@ -1735,12 +3101,20 @@ async def on_startup(app: Application):
             BotCommand("unwatch", "取消监控 / Unwatch wallet"),
             BotCommand("list", "监控列表 / Watch list"),
             BotCommand("pos", "查询持仓 / View positions"),
+            BotCommand("portfolio", "持仓汇总 / Portfolio summary"),
             BotCommand("orders", "最近成交 / Recent fills"),
             BotCommand("note", "地址备注 / Set remark"),
             BotCommand("mute", "暂停提醒 / Mute wallet"),
             BotCommand("unmute", "恢复提醒 / Unmute wallet"),
+            BotCommand("threshold", "最小变动过滤 / Min-change filter"),
+            BotCommand("interval", "轮询间隔 / Per-wallet interval"),
+            BotCommand("alert", "价格警报 / Price alert"),
+            BotCommand("alerts", "警报列表 / List alerts"),
+            BotCommand("unalert", "删除警报 / Remove alert"),
+            BotCommand("history", "操作历史 / Activity log"),
             BotCommand("settings", "偏好设置 / Settings"),
             BotCommand("export", "导出监控 / Export watches"),
+            BotCommand("import", "导入监控 / Import watches"),
             BotCommand("lang", "切换语言 / Switch language"),
             BotCommand("stop", "停止全部监控 / Stop all"),
         ]
@@ -1767,9 +3141,21 @@ def main():
     app.add_handler(CommandHandler("unmute", cmd_unmute))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("import", cmd_import))
+    app.add_handler(CommandHandler("threshold", cmd_threshold))
+    app.add_handler(CommandHandler("interval", cmd_interval))
+    app.add_handler(CommandHandler("alert", cmd_alert))
+    app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("unalert", cmd_unalert))
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CallbackQueryHandler(on_callback))
+    # Reply-based note edit capture (must not match /-commands).
+    app.add_handler(
+        MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, on_message)
+    )
 
     app.post_init = on_startup
 
