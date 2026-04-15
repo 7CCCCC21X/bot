@@ -3236,22 +3236,27 @@ async def poll_loop(app: Application):
                                 + "\n\n".join(lines)
                             )
 
-                        # Merge blocks into a single message when the wallet
-                        # isn't muted — T13.
+                        # Send each block (position changes / fills /
+                        # resolution) as its own Telegram message so fills
+                        # and position changes don't get glued together via
+                        # a ───── separator. In-block batching still applies:
+                        # up to 5 fills are consolidated into one fills
+                        # message, up to 8 position changes into one poll
+                        # message.
                         if blocks and not w.muted:
-                            text = "\n\n─────\n\n".join(blocks)
-                            try:
-                                await app.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=text,
-                                    parse_mode="HTML",
-                                    disable_web_page_preview=True,
-                                )
-                                w.last_activity = time.time()
-                            except Exception as send_err:
-                                logger.warning(
-                                    f"Failed to send merged poll message for {addr}: {send_err}"
-                                )
+                            for block in blocks:
+                                try:
+                                    await app.bot.send_message(
+                                        chat_id=chat_id,
+                                        text=block,
+                                        parse_mode="HTML",
+                                        disable_web_page_preview=True,
+                                    )
+                                    w.last_activity = time.time()
+                                except Exception as send_err:
+                                    logger.warning(
+                                        f"Failed to send poll block for {addr}: {send_err}"
+                                    )
 
                         # Price-alert evaluation runs regardless of mute state
                         # (alerts are explicit user-configured; mute only
