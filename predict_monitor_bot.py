@@ -50,7 +50,7 @@ LIST_PAGE_SIZE = 8
 # are still registered so typing them continues to work.
 HELP_CATEGORIES: list[tuple[str, list[str]]] = [
     ("watch", ["watch", "unwatch", "list", "stop"]),
-    ("query", ["pos", "orders", "history"]),
+    ("query", ["pos", "orders"]),
     ("other", ["settings", "start"]),
 ]
 
@@ -217,24 +217,13 @@ I18N = {
         "close_fallback": "(market {key})",
         "start": (
             "<b>Predict.fun Monitor Bot</b>\n\n"
+            "/help - feature guide\n"
             "/watch <code>0xAddr ...</code> - monitor one or more wallets\n"
-            "/unwatch <code>addr|alias</code> - stop\n"
+            "/unwatch <code>addr|alias</code> - stop watching\n"
             "/list - watched list\n"
             "/pos <code>addr|alias</code> - view positions\n"
             "/orders <code>addr|alias</code> - recent fills\n"
-            "/portfolio <code>addr|alias</code> - portfolio summary\n"
-            "/note <code>addr|alias remark</code> - set alias\n"
-            "/mute <code>addr|alias</code> - silence alerts\n"
-            "/unmute <code>addr|alias</code> - resume alerts\n"
-            "/threshold <code>addr|alias pct</code> - min-change filter\n"
-            "/interval <code>addr|alias sec</code> - per-wallet poll\n"
-            "/alert <code>addr|alias outcome op pct</code> - price alert\n"
-            "/alerts <code>addr|alias</code> - list alerts\n"
-            "/unalert <code>id</code> - remove alert\n"
-            "/history <code>addr|alias</code> - activity log\n"
             "/settings - preferences\n"
-            "/export - export watch list\n"
-            "/import - reply to a JSON file to import\n"
             "/stop - stop all"
         ),
         # --- PnL, sorting, portfolio ---
@@ -277,11 +266,7 @@ I18N = {
         "unalert_not_found": "Alert not found.",
         "unalert_ok": "🗑 Removed alert #{id}.",
         "alert_fired": "🔔 <b>Price alert</b> <code>{addr}</code>\n\n{title}\n{outcome} {op} {threshold:.2f}c · now <b>{price:.2f}c</b>",
-        # --- Import / export / history ---
-        "usage_history": "Usage: /history addr|alias",
-        "history_header": "<b>Activity · {addr}</b>\n\n",
-        "history_empty": "No events recorded yet.",
-        "history_line": "{relt} · {kind} · {summary}",
+        # --- Import / export ---
         "import_no_file": "Reply to a JSON document with /import to bulk-add wallets.",
         "import_done": "Imported {added} new · {skipped} skipped (dup/invalid).",
         "import_parse_error": "Could not parse the JSON file.",
@@ -386,13 +371,7 @@ I18N = {
         ),
         "help_cmd_stop": (
             "<b>/stop</b> — Remove every watched wallet\n\n"
-            "Nukes all monitoring for this chat. Price alerts and event history for those wallets also go away."
-        ),
-        "help_cmd_history": (
-            "<b>/history</b> — Activity log for a wallet\n\n"
-            "Shows the latest 20 events (open / change / close / fill / resolve / alert) with relative timestamps. "
-            "The bot keeps up to 500 events per wallet.\n\n"
-            "<b>Usage</b>\n• <code>/history alice</code>"
+            "Nukes all monitoring for this chat. Price alerts for those wallets also go away."
         ),
         "help_cmd_alert": (
             "<b>/alert</b> — Set a one-shot price alert\n\n"
@@ -543,24 +522,13 @@ I18N = {
         "close_fallback": "（市场 {key}）",
         "start": (
             "<b>Predict.fun 监控机器人</b>\n\n"
+            "/help - 功能介绍\n"
             "/watch <code>0xAddr ...</code> - 监控钱包，可一次多个\n"
             "/unwatch <code>地址或备注</code> - 停止监控\n"
             "/list - 查看监控列表\n"
             "/pos <code>地址或备注</code> - 查看持仓\n"
             "/orders <code>地址或备注</code> - 查看最近成交\n"
-            "/portfolio <code>地址或备注</code> - 持仓汇总\n"
-            "/note <code>地址或备注 新备注</code> - 设置备注\n"
-            "/mute <code>地址或备注</code> - 暂停提醒\n"
-            "/unmute <code>地址或备注</code> - 恢复提醒\n"
-            "/threshold <code>地址或备注 百分比</code> - 最小变动过滤\n"
-            "/interval <code>地址或备注 秒</code> - 单独轮询间隔\n"
-            "/alert <code>地址或备注 结果 运算符 价格</code> - 价格警报\n"
-            "/alerts <code>地址或备注</code> - 查看警报\n"
-            "/unalert <code>id</code> - 删除警报\n"
-            "/history <code>地址或备注</code> - 操作历史\n"
             "/settings - 偏好设置\n"
-            "/export - 导出监控列表\n"
-            "/import - 回复 JSON 文件批量导入\n"
             "/stop - 清空全部监控"
         ),
         "label_pnl": "浮动盈亏",
@@ -599,10 +567,6 @@ I18N = {
         "unalert_not_found": "未找到该警报。",
         "unalert_ok": "🗑 已删除警报 #{id}。",
         "alert_fired": "🔔 <b>价格警报</b> <code>{addr}</code>\n\n{title}\n{outcome} {op} {threshold:.2f}c · 当前 <b>{price:.2f}c</b>",
-        "usage_history": "用法：/history 地址或备注",
-        "history_header": "<b>操作历史 · {addr}</b>\n\n",
-        "history_empty": "暂无历史事件。",
-        "history_line": "{relt} · {kind} · {summary}",
         "import_no_file": "请回复一个 JSON 文件并附带 /import 来批量导入钱包。",
         "import_done": "导入完成：新增 {added} · 跳过 {skipped}（重复或无效）。",
         "import_parse_error": "JSON 文件解析失败。",
@@ -693,12 +657,7 @@ I18N = {
         ),
         "help_cmd_stop": (
             "<b>/stop</b> — 清空当前会话的全部监控\n\n"
-            "会一并删掉这些钱包的价格警报和历史记录。请谨慎使用。"
-        ),
-        "help_cmd_history": (
-            "<b>/history</b> — 某个钱包的操作历史\n\n"
-            "最近 20 条事件（open / change / close / fill / resolve / alert），带相对时间。每个钱包最多保留 500 条。\n\n"
-            "<b>用法</b>\n• <code>/history 张三</code>"
+            "会一并删掉这些钱包的价格警报。请谨慎使用。"
         ),
         "help_cmd_alert": (
             "<b>/alert</b> — 单次价格警报\n\n"
@@ -819,21 +778,6 @@ def init_db():
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS alerts_by_chat ON alerts(chat_id, address)"
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                address TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                ts REAL NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS events_by_wallet ON events(chat_id, address, ts DESC)"
         )
         conn.commit()
 
@@ -968,51 +912,6 @@ def delete_alert(chat_id: int, alert_id: int) -> bool:
 
 
 # Cap the event log per wallet so the DB doesn't grow unbounded.
-EVENT_LOG_CAP = 500
-
-
-def insert_event(chat_id: int, address: str, kind: str, payload: dict):
-    with db_lock, db_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO events(chat_id, address, kind, payload, ts)
-            VALUES(?,?,?,?,?)
-            """,
-            (chat_id, address, kind, json.dumps(payload, ensure_ascii=False), time.time()),
-        )
-        # Trim old events for this (chat, address) — keep only the newest
-        # EVENT_LOG_CAP rows.
-        conn.execute(
-            """
-            DELETE FROM events
-            WHERE chat_id=? AND address=? AND id NOT IN (
-                SELECT id FROM events
-                WHERE chat_id=? AND address=?
-                ORDER BY ts DESC LIMIT ?
-            )
-            """,
-            (chat_id, address, chat_id, address, EVENT_LOG_CAP),
-        )
-        conn.commit()
-
-
-def list_events(chat_id: int, address: str, limit: int = 20) -> list[dict]:
-    with db_lock, db_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, kind, payload, ts FROM events
-            WHERE chat_id=? AND lower(address)=lower(?)
-            ORDER BY ts DESC
-            LIMIT ?
-            """,
-            (chat_id, address, limit),
-        ).fetchall()
-    return [
-        {"id": r[0], "kind": r[1], "payload": json.loads(r[2] or "{}"), "ts": r[3]}
-        for r in rows
-    ]
-
-
 def load_state():
     with db_lock, db_conn() as conn:
         for chat_id, lang in conn.execute("SELECT chat_id, lang FROM chat_lang"):
@@ -2619,56 +2518,6 @@ async def cmd_unalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def _event_summary(chat_id: int, ev: dict) -> str:
-    """Collapse a stored event payload into a one-line summary."""
-    kind = ev.get("kind", "?")
-    payload = ev.get("payload") or {}
-    if kind == "open":
-        return f"opened {payload.get('pos_key', '')}"
-    if kind == "close":
-        return f"closed {payload.get('title', payload.get('pos_key', ''))}"
-    if kind == "change":
-        prev = payload.get("prev")
-        new = payload.get("new")
-        return f"{payload.get('pos_key', '')}: {prev} → {new}"
-    if kind == "fill":
-        tx = (payload.get("tx") or "")[:12]
-        amt = payload.get("amount")
-        return f"fill {amt} (tx {tx}…)"
-    if kind == "resolve":
-        return f"resolved: {payload.get('title', '')} → outcome {payload.get('winning')}"
-    if kind == "alert":
-        return f"alert #{payload.get('alert_id')} @ {payload.get('price', 0):.2f}c"
-    return kind
-
-
-async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not ctx.args:
-        await update.message.reply_text(t(chat_id, "usage_history"))
-        return
-    addr = resolve_addr(chat_id, ctx.args[0])
-    if not addr:
-        await update.message.reply_text(t(chat_id, "invalid_address"))
-        return
-    events = list_events(chat_id, addr, limit=20)
-    if not events:
-        await update.message.reply_text(t(chat_id, "history_empty"))
-        return
-    lines = [t(chat_id, "history_header", addr=fmt_addr(addr))]
-    for ev in events:
-        lines.append(
-            t(
-                chat_id,
-                "history_line",
-                relt=_relative_time(chat_id, ev["ts"]),
-                kind=ev["kind"],
-                summary=_html_escape(_event_summary(chat_id, ev)),
-            )
-        )
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
 async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Reuse /pos rendering but open with the portfolio card expanded."""
     chat_id = update.effective_chat.id
@@ -3175,12 +3024,6 @@ async def _evaluate_alerts(
                     disable_web_page_preview=True,
                 )
             delete_alert(chat_id, a["id"])
-            insert_event(
-                chat_id,
-                w.address,
-                "alert",
-                {"alert_id": a["id"], "outcome": outcome, "op": op, "threshold": thr, "price": mark},
-            )
         except Exception as e:
             logger.warning(f"alert send failed for {w.address}: {e}")
 
@@ -3344,13 +3187,11 @@ async def poll_loop(app: Application):
                         )
 
                         blocks: list[str] = []  # For merged combined message.
-                        event_batch: list[tuple[str, dict]] = []
 
                         if added or changed or closed:
                             parts = []
                             for p in added:
                                 parts.append(fmt_pos(p, "added", chat_id, markets.get(p.get("marketId"))))
-                                event_batch.append(("open", {"pos_key": pos_key(p)}))
                             for p, prev_size in changed:
                                 parts.append(
                                     fmt_pos(
@@ -3361,9 +3202,6 @@ async def poll_loop(app: Application):
                                         prev_shares=prev_size,
                                     )
                                 )
-                                event_batch.append(
-                                    ("change", {"pos_key": pos_key(p), "prev": prev_size, "new": pos_size(p)})
-                                )
                             for k in closed:
                                 title = merged_titles.get(k) or t(
                                     chat_id, "close_fallback", key=k
@@ -3371,7 +3209,6 @@ async def poll_loop(app: Application):
                                 parts.append(
                                     f"{t(chat_id, 'fmt_closed')} <b>{_html_escape(title)}</b>"
                                 )
-                                event_batch.append(("close", {"pos_key": k, "title": title}))
                             block = t(chat_id, "poll_header", addr=display_addr) + "\n\n".join(parts[:8])
                             if len(parts) > 8:
                                 block += t(chat_id, "fmt_more", count=len(parts) - 8)
@@ -3387,35 +3224,12 @@ async def poll_loop(app: Application):
                                 t(chat_id, "fills_header", addr=display_addr)
                                 + "\n\n".join(fill_lines)
                             )
-                            for m in merged_fills[:5]:
-                                event_batch.append(
-                                    (
-                                        "fill",
-                                        {
-                                            "tx": m.get("transactionHash"),
-                                            "order_hash": m.get("orderHash")
-                                            or (m.get("taker") or {}).get("orderHash"),
-                                            "amount": _norm_amount_to_shares(m.get("amountFilled")),
-                                        },
-                                    )
-                                )
 
                         if resolutions:
                             lines = []
                             for market, winning_idx, held_idx, title in resolutions:
                                 lines.append(
                                     fmt_resolution(chat_id, market, winning_idx, held_idx)
-                                )
-                                event_batch.append(
-                                    (
-                                        "resolve",
-                                        {
-                                            "market_id": market.get("id"),
-                                            "title": title,
-                                            "winning": winning_idx,
-                                            "held": held_idx,
-                                        },
-                                    )
                                 )
                             blocks.append(
                                 t(chat_id, "poll_resolve_header", addr=display_addr)
@@ -3438,12 +3252,6 @@ async def poll_loop(app: Application):
                                 logger.warning(
                                     f"Failed to send merged poll message for {addr}: {send_err}"
                                 )
-
-                        for kind, payload in event_batch:
-                            try:
-                                insert_event(chat_id, w.address, kind, payload)
-                            except Exception as ev_err:
-                                logger.warning(f"event log failed: {ev_err}")
 
                         # Price-alert evaluation runs regardless of mute state
                         # (alerts are explicit user-configured; mute only
@@ -3498,7 +3306,6 @@ async def on_startup(app: Application):
             BotCommand("list", "监控列表 / Watch list"),
             BotCommand("pos", "查询持仓 / View positions"),
             BotCommand("orders", "最近成交 / Recent fills"),
-            BotCommand("history", "操作历史 / Activity log"),
             BotCommand("settings", "偏好设置 / Settings"),
             BotCommand("stop", "停止全部监控 / Stop all"),
         ]
@@ -3532,7 +3339,6 @@ def main():
     app.add_handler(CommandHandler("alert", cmd_alert))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("unalert", cmd_unalert))
-    app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("lang", cmd_lang))
