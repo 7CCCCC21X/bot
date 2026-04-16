@@ -3237,6 +3237,13 @@ async def poll_loop(app: Application):
                                         f"Failed to send api_recovered for {addr}: {send_err}"
                                     )
 
+                        # Only diff / refresh snapshots for endpoints that
+                        # actually returned data. A transient 5xx on one call
+                        # used to be coerced to [], which flagged every
+                        # holding as "closed" and then re-announced them all
+                        # as "new" on the next successful poll.
+                        positions_ok = positions_raw is not None
+                        matches_ok = matches_raw is not None
                         positions = positions_raw or []
                         matches = matches_raw or []
                         market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
@@ -3245,13 +3252,24 @@ async def poll_loop(app: Application):
                             p["_market"] = markets.get(p.get("marketId"), {})
                         positions_by_key = {pos_key(p): p for p in positions}
 
-                        added, changed, closed = diff_positions(
-                            w.position_snapshot,
-                            positions,
-                            threshold_pct=w.change_threshold_pct,
-                        )
-                        new_match_keys = {match_key(m) for m in matches}
-                        new_fills = [m for m in matches if match_key(m) not in w.order_match_snapshot]
+                        if positions_ok:
+                            added, changed, closed = diff_positions(
+                                w.position_snapshot,
+                                positions,
+                                threshold_pct=w.change_threshold_pct,
+                            )
+                        else:
+                            added, changed, closed = [], [], []
+
+                        if matches_ok:
+                            new_match_keys = {match_key(m) for m in matches}
+                            new_fills = [
+                                m for m in matches
+                                if match_key(m) not in w.order_match_snapshot
+                            ]
+                        else:
+                            new_match_keys = None
+                            new_fills = []
 
                         # Refresh the shares snapshot + the title cache. Hold onto
                         # old titles so "closed" notifications can show a real
@@ -3264,8 +3282,9 @@ async def poll_loop(app: Application):
                         # Preserve titles for keys that have disappeared this
                         # poll so we can still render their resolution notice.
                         merged_titles = {**old_titles, **new_titles}
-                        w.position_titles = new_titles
-                        w.position_snapshot = {pos_key(p): pos_size(p) for p in positions}
+                        if positions_ok:
+                            w.position_titles = new_titles
+                            w.position_snapshot = {pos_key(p): pos_size(p) for p in positions}
                         w.last_check = time.time()
                         display_addr = fmt_addr(w.address) + (f" · {w.note}" if w.note else "")
 
@@ -3358,7 +3377,8 @@ async def poll_loop(app: Application):
                         # silences auto-detected change/fill spam).
                         await _evaluate_alerts(app, chat_id, w, positions_by_key, markets)
 
-                        w.order_match_snapshot = set(list(new_match_keys)[:100])
+                        if new_match_keys is not None:
+                            w.order_match_snapshot = set(list(new_match_keys)[:100])
                         save_watch(w)
                     except Exception as e:
                         logger.error(f"Poll error {addr}: {e}")
