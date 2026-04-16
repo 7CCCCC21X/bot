@@ -5,8 +5,6 @@ import time
 import json
 import sqlite3
 import threading
-from collections import defaultdict, deque
-from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -52,12 +50,9 @@ LIST_PAGE_SIZE = 8
 # are still registered so typing them continues to work.
 HELP_CATEGORIES: list[tuple[str, list[str]]] = [
     ("watch", ["watch", "unwatch", "list", "stop"]),
-    ("query", ["pos", "orders", "hot"]),
+    ("query", ["pos", "orders"]),
     ("other", ["settings", "start"]),
 ]
-
-# Sliding window (seconds) for the /hot volume ranking.
-MARKET_FLOW_WINDOW_S = 3600
 
 
 def resolve_sqlite_path() -> str:
@@ -122,13 +117,6 @@ class WatchedWallet:
 
 watched: dict[int, dict[str, WatchedWallet]] = {}
 market_cache: dict[str, dict] = {}
-# market_id -> deque of (ts_epoch, usd_value, chat_id). Populated from fills
-# observed in poll_loop; drives the /hot ranking. Not persisted — a 1h window
-# refills quickly after restart.
-market_flow: dict[str, deque] = defaultdict(lambda: deque(maxlen=2000))
-# Titles we've seen for a market while indexing flow, so /hot can render a
-# name even if fetch_market hasn't been called for it yet.
-market_flow_titles: dict[str, str] = {}
 chat_lang: dict[int, str] = {}
 # Per-chat notification mode: "split" (default — one message per block) or
 # "merged" (legacy T13 — position changes + fills + resolution joined by
@@ -374,19 +362,6 @@ I18N = {
             "(N fills) suffix. Each fill shows the executed price, USD value, the wallet's total holding in that market, "
             "and a link to the on-chain transaction."
         ),
-        "help_cmd_hot": (
-            "<b>/hot</b> — Top markets by 1h volume\n\n"
-            "Ranks markets by USD volume observed in the last hour from fills across the monitored wallets. "
-            "Results are estimated from the bot's own order-flow stream (not the whole site).\n\n"
-            "<b>Usage</b>\n"
-            "• <code>/hot</code> — all observed markets\n"
-            "• <code>/hot mine</code> — only markets your watched wallets traded"
-        ),
-        "hot_header": "🔥 <b>Top markets · last 1h</b> ({scope})",
-        "hot_line": "{rank}. {title}\n   💵 <b>${usd:,.2f}</b> · {count} fills",
-        "hot_empty": "No fills observed in the last hour yet. Watch more wallets or wait a bit.",
-        "hot_scope_all": "all watched wallets",
-        "hot_scope_mine": "your watched wallets",
         "help_cmd_note": (
             "<b>/note</b> — Set a note / alias\n\n"
             "After setting, you can use the note instead of the full 0x address in every other command.\n\n"
@@ -680,18 +655,6 @@ I18N = {
             "<b>/orders</b> — 最近成交\n\n"
             "最多 30 条，每页 8 条翻页。相同订单的分段成交合并成一条（带「共 N 笔」后缀）。每条显示成交价格、USD 价值、钱包在该市场的总持仓以及链上交易哈希。"
         ),
-        "help_cmd_hot": (
-            "<b>/hot</b> — 近 1 小时市场成交量排行\n\n"
-            "按近 1 小时内观察到的 USD 成交额给市场排名。数据来源是机器人自己拉到的成交流（监控钱包的 fills），不是 Predict.fun 全站真实量。\n\n"
-            "<b>用法</b>\n"
-            "• <code>/hot</code> — 所有观察到的市场\n"
-            "• <code>/hot mine</code> — 只看本聊天监控的钱包成交的市场"
-        ),
-        "hot_header": "🔥 <b>近 1 小时成交量排行</b>（{scope}）",
-        "hot_line": "{rank}. {title}\n   💵 <b>${usd:,.2f}</b> · {count} 笔成交",
-        "hot_empty": "近 1 小时还没有观察到成交。多监控几个钱包或稍等一会再试。",
-        "hot_scope_all": "全部监控钱包",
-        "hot_scope_mine": "本聊天监控的钱包",
         "help_cmd_note": (
             "<b>/note</b> — 设置地址备注/别名\n\n"
             "设置后，所有命令里都可以用备注代替地址输入。\n\n"
@@ -1739,76 +1702,6 @@ def match_key(match: dict) -> str:
     return f"{tx}:{executed_at}:{amount}"
 
 
-def _match_price_and_usd(match: dict) -> tuple[float | None, float | None]:
-    """Return (price_cents, total_usd) for a match fill.
-
-    Prefers on-chain filled amounts (maker/taker) over the API's
-    `priceExecuted`, which can arrive in varying scales. Falls back to the
-    API-reported price only when on-chain amounts are missing.
-    """
-    shares = _norm_amount_to_shares(match.get("amountFilled"))
-    maker_amt = _norm_amount_to_shares(match.get("makerAmountFilled"))
-    taker_amt = _norm_amount_to_shares(match.get("takerAmountFilled"))
-
-    price_c = None
-    total_usd = None
-    if (
-        shares is not None and shares > 0
-        and maker_amt is not None and maker_amt > 0
-        and taker_amt is not None and taker_amt > 0
-    ):
-        # One side is the position token (≈ `amountFilled`), the other is the
-        # collateral. Pick whichever is closer to `shares` as the position
-        # side; the other is the collateral total.
-        if abs(maker_amt - shares) <= abs(taker_amt - shares):
-            total_usd = taker_amt
-        else:
-            total_usd = maker_amt
-        price_c = total_usd / shares * 100
-
-    if price_c is None:
-        taker = match.get("taker") if isinstance(match.get("taker"), dict) else {}
-        price_c = _norm_price_to_cents(match.get("priceExecuted") or taker.get("price"))
-
-    if total_usd is None and shares is not None and price_c is not None:
-        total_usd = shares * price_c / 100
-
-    return price_c, total_usd
-
-
-def _parse_executed_at(raw) -> float | None:
-    """Parse a match's executedAt field to epoch seconds.
-
-    Predict.fun has historically emitted ISO-8601 strings and epoch numbers
-    (seconds or milliseconds); accept all three.
-    """
-    if raw is None:
-        return None
-    if isinstance(raw, (int, float)):
-        v = float(raw)
-        # Heuristic: values > 10^12 are ms.
-        return v / 1000.0 if v > 1e12 else v
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return None
-        # Numeric string.
-        try:
-            v = float(s)
-            return v / 1000.0 if v > 1e12 else v
-        except ValueError:
-            pass
-        try:
-            # Accept trailing Z for UTC.
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.timestamp()
-        except ValueError:
-            return None
-    return None
-
-
 def _side_text(side: str, chat_id: int) -> str:
     s = (side or "").lower()
     if s == "bid":
@@ -1837,10 +1730,36 @@ def fmt_match(
     shares = _norm_amount_to_shares(match.get("amountFilled"))
     shares_text = _fmt_num(shares, digits=4)
 
-    price_c, total_usd = _match_price_and_usd(match)
+    # Derive executed price and total USD value from on-chain filled amounts
+    # whenever possible — these are the ground truth from the settlement. The
+    # API's `priceExecuted` / `taker.price` fields are only used as a fallback,
+    # because they can arrive in varying scales that are easy to misinterpret.
+    maker_amt = _norm_amount_to_shares(match.get("makerAmountFilled"))
+    taker_amt = _norm_amount_to_shares(match.get("takerAmountFilled"))
+
+    price_c = None
+    total_usd = None
+    if (
+        shares is not None and shares > 0
+        and maker_amt is not None and maker_amt > 0
+        and taker_amt is not None and taker_amt > 0
+    ):
+        # One side is the position token (matches `amountFilled`), the other is
+        # the collateral (USD). Pick whichever is closer to `shares` as the
+        # position side; the other is the collateral total.
+        if abs(maker_amt - shares) <= abs(taker_amt - shares):
+            total_usd = taker_amt
+        else:
+            total_usd = maker_amt
+        price_c = total_usd / shares * 100
+
+    if price_c is None:
+        price_c = _norm_price_to_cents(match.get("priceExecuted") or taker.get("price"))
 
     if total_usd is not None:
         value_text = f"${total_usd:,.2f}"
+    elif shares is not None and price_c is not None:
+        value_text = f"${shares * price_c / 100:,.2f}"
     else:
         value_text = "N/A"
 
@@ -2336,82 +2255,6 @@ async def cmd_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True,
             reply_markup=markup,
         )
-
-
-def _aggregate_market_flow(
-    chat_id_filter: int | None,
-    window_s: int = MARKET_FLOW_WINDOW_S,
-    limit: int = 10,
-) -> list[tuple[str, float, int]]:
-    """Return (market_id, total_usd, trade_count) sorted by volume desc.
-
-    Prunes entries older than ``window_s``. When ``chat_id_filter`` is set,
-    only counts fills contributed by that chat.
-    """
-    cutoff = time.time() - window_s
-    results: list[tuple[str, float, int]] = []
-    for mid, buf in list(market_flow.items()):
-        # Drop stale entries from the left in-place.
-        while buf and buf[0][0] < cutoff:
-            buf.popleft()
-        if not buf:
-            continue
-        if chat_id_filter is None:
-            total = sum(usd for _, usd, _ in buf)
-            count = len(buf)
-        else:
-            total = 0.0
-            count = 0
-            for ts, usd, cid in buf:
-                if cid == chat_id_filter:
-                    total += usd
-                    count += 1
-            if count == 0:
-                continue
-        results.append((mid, total, count))
-    results.sort(key=lambda x: x[1], reverse=True)
-    return results[:limit]
-
-
-async def cmd_hot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    scope_mine = bool(ctx.args) and ctx.args[0].lower() in ("mine", "me", "my")
-    ranking = _aggregate_market_flow(
-        chat_id_filter=chat_id if scope_mine else None,
-    )
-    if not ranking:
-        await update.message.reply_text(t(chat_id, "hot_empty"))
-        return
-
-    scope_label = t(chat_id, "hot_scope_mine" if scope_mine else "hot_scope_all")
-    lines: list[str] = [t(chat_id, "hot_header", scope=scope_label)]
-
-    async with aiohttp.ClientSession() as session:
-        for rank, (mid, total_usd, count) in enumerate(ranking, start=1):
-            market = market_cache.get(mid) or await fetch_market(session, mid)
-            title = (
-                (market or {}).get("title")
-                or (market or {}).get("question")
-                or market_flow_titles.get(mid)
-                or mid
-            )
-            title = title[:55]
-            lines.append(
-                t(
-                    chat_id,
-                    "hot_line",
-                    rank=rank,
-                    title=_title_html(title, market if market else None),
-                    usd=total_usd,
-                    count=count,
-                )
-            )
-
-    await update.message.reply_text(
-        "\n\n".join(lines),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3428,25 +3271,6 @@ async def poll_loop(app: Application):
                             new_match_keys = None
                             new_fills = []
 
-                        # Feed the /hot rolling volume buffer with anything we
-                        # haven't seen before. `new_fills` is already
-                        # deduplicated against the per-wallet snapshot.
-                        for fill in new_fills:
-                            fmkt = fill.get("market") if isinstance(fill.get("market"), dict) else {}
-                            mid = fmkt.get("id")
-                            if not mid:
-                                continue
-                            ts = _parse_executed_at(fill.get("executedAt"))
-                            if ts is None:
-                                ts = time.time()
-                            _, usd = _match_price_and_usd(fill)
-                            if usd is None or usd <= 0:
-                                continue
-                            market_flow[str(mid)].append((ts, float(usd), chat_id))
-                            ftitle = fmkt.get("title") or fmkt.get("question")
-                            if ftitle:
-                                market_flow_titles[str(mid)] = ftitle[:80]
-
                         # Refresh the shares snapshot + the title cache. Hold onto
                         # old titles so "closed" notifications can show a real
                         # market name even though the position is gone now.
@@ -3602,7 +3426,6 @@ async def on_startup(app: Application):
             BotCommand("list", "监控列表 / Watch list"),
             BotCommand("pos", "查询持仓 / View positions"),
             BotCommand("orders", "最近成交 / Recent fills"),
-            BotCommand("hot", "1h 成交排行 / Top markets (1h)"),
             BotCommand("settings", "偏好设置 / Settings"),
             BotCommand("stop", "停止全部监控 / Stop all"),
         ]
@@ -3625,7 +3448,6 @@ def main():
     app.add_handler(CommandHandler("pos", cmd_pos))
     app.add_handler(CommandHandler("positions", cmd_pos))
     app.add_handler(CommandHandler("orders", cmd_orders))
-    app.add_handler(CommandHandler("hot", cmd_hot))
     app.add_handler(CommandHandler("note", cmd_note))
     app.add_handler(CommandHandler("mute", cmd_mute))
     app.add_handler(CommandHandler("unmute", cmd_unmute))
