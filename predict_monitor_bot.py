@@ -2424,6 +2424,17 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_chatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Echo the caller's chat id. Handy for filling ADMIN_CHAT_ID on deploys."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    uid = user.id if user else "?"
+    await update.message.reply_text(
+        f"chat_id: <code>{chat_id}</code>\nuser_id: <code>{uid}</code>",
+        parse_mode="HTML",
+    )
+
+
 async def cmd_raw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Admin-only: dump the raw matches + one position JSON for debugging.
 
@@ -3596,6 +3607,7 @@ def main():
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("import", cmd_import))
     app.add_handler(CommandHandler("raw", cmd_raw))
+    app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("threshold", cmd_threshold))
     app.add_handler(CommandHandler("interval", cmd_interval))
     app.add_handler(CommandHandler("alert", cmd_alert))
