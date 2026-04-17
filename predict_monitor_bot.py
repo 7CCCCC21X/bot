@@ -1477,32 +1477,50 @@ def display_fields(pos: dict, market: dict | None = None) -> tuple[str, str, str
         or pos.get("entryPrice")
         or pos.get("avgEntryPrice")
         or pos.get("costBasis")
-        or pos.get("currentPrice")
-        or outcome_obj.get("price")
     )
-    if price_raw is None and idx is not None:
-        prices = (
-            market_obj.get("outcomePrices")
-            or market_obj.get("prices")
-            or market.get("outcomePrices")
-            or market.get("prices")
-            or []
-        )
-        try:
-            i = int(idx)
-            if isinstance(prices, list) and 0 <= i < len(prices):
-                price_raw = prices[i]
-        except (ValueError, TypeError):
-            pass
-
     price_c = _norm_price_to_cents(price_raw)
+
+    # If no explicit entry/avg field is available, derive the cost basis from
+    # the USD cost recorded for the position. Done before falling back to the
+    # current mark price so 总持仓 reflects what the wallet actually paid,
+    # not the (possibly drifted) market quote.
     if price_c is None:
-        value_usd = _safe_float(
+        cost_usd = _safe_float(
             pos.get("costUsd")
             or pos.get("cost_usd")
-            or pos.get("valueUsd")
-            or pos.get("value_usd")
+            or pos.get("totalCost")
+            or pos.get("totalCostUsd")
+            or pos.get("initialValue")
+            or pos.get("initialValueUsd")
         )
+        if cost_usd is not None and shares_num and shares_num > 0:
+            price_c = cost_usd / shares_num * 100
+
+    # Mark-price fallbacks — only used when neither an explicit cost-basis
+    # field nor a USD cost total is available from the API.
+    if price_c is None:
+        mark_raw = pos.get("currentPrice") or outcome_obj.get("price")
+        if mark_raw is None and idx is not None:
+            prices = (
+                market_obj.get("outcomePrices")
+                or market_obj.get("prices")
+                or market.get("outcomePrices")
+                or market.get("prices")
+                or []
+            )
+            try:
+                i = int(idx)
+                if isinstance(prices, list) and 0 <= i < len(prices):
+                    mark_raw = prices[i]
+            except (ValueError, TypeError):
+                pass
+        price_c = _norm_price_to_cents(mark_raw)
+
+    # Last-resort: derive from a generic USD value field (may be mark value
+    # rather than cost). Accepted only when every other signal is missing so
+    # we at least render *something* instead of "?".
+    if price_c is None:
+        value_usd = _safe_float(pos.get("valueUsd") or pos.get("value_usd"))
         if value_usd is not None and shares_num and shares_num > 0:
             price_c = value_usd / shares_num * 100
 
@@ -1550,11 +1568,24 @@ def fmt_pos(
     title, outcome, shares, avg = display_fields(pos, market)
     title = title[:55]
 
-    try:
-        # avg is in cents, convert to USD.
-        val = f"${float(shares) * float(avg) / 100:,.2f}"
-    except (ValueError, TypeError):
-        val = "N/A"
+    # Use the API's own USD cost when exposed — avoids drift from rounding
+    # `avg` to 2dp when the real avg has more precision (e.g. 0.333…¢).
+    cost_usd_raw = _safe_float(
+        pos.get("costUsd")
+        or pos.get("cost_usd")
+        or pos.get("totalCost")
+        or pos.get("totalCostUsd")
+        or pos.get("initialValue")
+        or pos.get("initialValueUsd")
+    )
+    if cost_usd_raw is not None:
+        val = f"${cost_usd_raw:,.2f}"
+    else:
+        try:
+            # avg is in cents, convert to USD.
+            val = f"${float(shares) * float(avg) / 100:,.2f}"
+        except (ValueError, TypeError):
+            val = "N/A"
 
     emojis = {
         "added": t(chat_id, "fmt_new"),
@@ -1833,10 +1864,24 @@ def fmt_match(
             _, _, total_shares_text, total_price = display_fields(
                 current_pos, current_pos.get("_market")
             )
-            try:
-                total_val = f"${float(total_shares_text) * float(total_price) / 100:,.2f}"
-            except (ValueError, TypeError):
-                total_val = "N/A"
+            # Prefer the API's own USD cost for the total, so rounding the
+            # displayed avg price to 2dp (e.g. 0.33¢ for 0.333…¢) doesn't
+            # drift the total by several dollars on large positions.
+            cost_usd_raw = _safe_float(
+                current_pos.get("costUsd")
+                or current_pos.get("cost_usd")
+                or current_pos.get("totalCost")
+                or current_pos.get("totalCostUsd")
+                or current_pos.get("initialValue")
+                or current_pos.get("initialValueUsd")
+            )
+            if cost_usd_raw is not None:
+                total_val = f"${cost_usd_raw:,.2f}"
+            else:
+                try:
+                    total_val = f"${float(total_shares_text) * float(total_price) / 100:,.2f}"
+                except (ValueError, TypeError):
+                    total_val = "N/A"
             if total_shares is not None:
                 total_line = (
                     f"\n📦 {t(chat_id, 'label_total_pos')}: "
