@@ -38,6 +38,12 @@ _raw_admin = os.environ.get("ADMIN_CHAT_ID", "").strip()
 ADMIN_CHAT_ID = int(_raw_admin) if _raw_admin.lstrip("-").isdigit() else None
 POLL_INTERVAL = 15
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
+# Fills below this USD value are suppressed from 订单成交 notifications to cut
+# dust spam. 0 disables the filter (show every fill, even $0.04 micro-trades).
+try:
+    MIN_FILL_USD = float(os.environ.get("MIN_FILL_USD", "0") or 0)
+except ValueError:
+    MIN_FILL_USD = 0.0
 PREDICT_WEB_BASE = os.environ.get("PREDICT_WEB_BASE", "https://predict.fun/market/")
 GUIDE_IMAGE_PATH = os.environ.get("GUIDE_IMAGE_PATH", os.path.join(os.path.dirname(__file__), "images", "guide_deposit_address.png"))
 
@@ -1426,6 +1432,26 @@ def _fmt_num(v, digits=4):
     return s if s else "0"
 
 
+def _fmt_shares(v) -> str:
+    """Share count with scale-adaptive precision.
+
+    Large holdings don't need four decimals — "76,422" reads cleaner than
+    "76421.9982". Fractional stakes keep their precision so a 1.04-share fill
+    is still distinguishable from 1.05.
+    """
+    if v is None:
+        return "?"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "?"
+    if abs(f) >= 1000:
+        return f"{f:,.0f}"
+    if abs(f) >= 100:
+        return f"{f:,.1f}".rstrip("0").rstrip(".")
+    return _fmt_num(f, digits=4)
+
+
 def display_fields(pos: dict, market: dict | None = None) -> tuple[str, str, str, str]:
     market = market or {}
     market_obj = pos.get("market") if isinstance(pos.get("market"), dict) else {}
@@ -1596,22 +1622,22 @@ def fmt_pos(
 
     # When the size changed, surface the delta so the user can see whether the
     # wallet added to or trimmed an existing position.
-    size_line = f"💹 {t(chat_id, 'label_size')}: <code>{shares}</code> {t(chat_id, 'shares_unit')} @ <code>{avg}c</code>"
-    if label == "changed" and prev_shares is not None:
-        try:
-            new_num = float(shares)
-        except (ValueError, TypeError):
-            new_num = None
-        if new_num is not None:
-            delta = new_num - prev_shares
-            arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "=")
-            prev_text = _fmt_num(prev_shares, digits=4)
-            delta_text = _fmt_num(abs(delta), digits=4)
-            size_line = (
-                f"💹 {t(chat_id, 'label_size')}: <code>{prev_text}</code> → "
-                f"<code>{shares}</code> {t(chat_id, 'shares_unit')} "
-                f"({arrow}{delta_text}) @ <code>{avg}c</code>"
-            )
+    try:
+        new_num = float(shares)
+    except (ValueError, TypeError):
+        new_num = None
+    shares_disp = _fmt_shares(new_num) if new_num is not None else shares
+    size_line = f"💹 {t(chat_id, 'label_size')}: <code>{shares_disp}</code> {t(chat_id, 'shares_unit')} @ <code>{avg}c</code>"
+    if label == "changed" and prev_shares is not None and new_num is not None:
+        delta = new_num - prev_shares
+        arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "=")
+        prev_text = _fmt_shares(prev_shares)
+        delta_text = _fmt_shares(abs(delta))
+        size_line = (
+            f"💹 {t(chat_id, 'label_size')}: <code>{prev_text}</code> → "
+            f"<code>{shares_disp}</code> {t(chat_id, 'shares_unit')} "
+            f"({arrow}{delta_text}) @ <code>{avg}c</code>"
+        )
 
     combined_market = market or pos.get("_market")
     pnl_usd, pnl_pct, _ = pnl_of(pos, combined_market)
@@ -1800,6 +1826,44 @@ def _pick_user_side(match: dict, address: str | None) -> dict:
     return makers[0] if makers and isinstance(makers[0], dict) else {}
 
 
+def _fill_usd_value(match: dict, address: str | None) -> float | None:
+    """USD notional of a fill from the user's perspective.
+
+    Mirrors the shares × price math inside ``fmt_match`` so the poll loop can
+    cheaply filter dust fills before formatting.
+    """
+    our_side = _pick_user_side(match, address)
+    shares = _norm_amount_to_shares(match.get("amountFilled"))
+    if shares is None:
+        shares = _norm_amount_to_shares(our_side.get("amount"))
+    price_c = _norm_price_to_cents(our_side.get("price"))
+    if price_c is None:
+        price_c = _norm_price_to_cents(match.get("priceExecuted"))
+    if shares is None or price_c is None:
+        return None
+    return shares * price_c / 100
+
+
+def _fill_market_outcome_key(match: dict) -> str | None:
+    """Stable ``marketId_outcomeIndex`` key to match fills against positions."""
+    market = match.get("market") if isinstance(match.get("market"), dict) else {}
+    market_id = market.get("id") or ""
+    taker = match.get("taker") if isinstance(match.get("taker"), dict) else {}
+    outcome_obj = None
+    if isinstance(taker.get("outcome"), dict):
+        outcome_obj = taker["outcome"]
+    else:
+        makers = match.get("makers") if isinstance(match.get("makers"), list) else []
+        for m in makers:
+            if isinstance(m, dict) and isinstance(m.get("outcome"), dict):
+                outcome_obj = m["outcome"]
+                break
+    idx = outcome_obj.get("index") if outcome_obj else None
+    if not market_id and idx is None:
+        return None
+    return _position_lookup_key(market_id, idx)
+
+
 def fmt_match(
     match: dict,
     chat_id: int,
@@ -1813,14 +1877,19 @@ def fmt_match(
 
     title = market.get("title") or market.get("question") or str(market.get("id", "?"))
     outcome = outcome_obj.get("name") or "?"
+    quote_type = (our_side.get("quoteType") or "").lower()
     side = _side_text(our_side.get("quoteType", "?"), chat_id)
+    # Color the side to match the rest of the UI (🟢 gain / 🔴 loss). Bid adds
+    # exposure so it mirrors "new position green"; ask reduces it like "closed
+    # red". Falls back to a neutral marker for unknown quoteTypes.
+    side_emoji = "🟢" if quote_type == "bid" else ("🔴" if quote_type == "ask" else "⚪")
     # Prefer the top-level amountFilled so merged fills (consolidate_fills sets
     # amountFilled to the summed shares) display the total, not just the first
     # partial. For non-merged matches, amountFilled equals our_side.amount.
     shares = _norm_amount_to_shares(match.get("amountFilled"))
     if shares is None:
         shares = _norm_amount_to_shares(our_side.get("amount"))
-    shares_text = _fmt_num(shares, digits=4)
+    shares_text = _fmt_shares(shares)
 
     # Price/value come directly from the user's own side entry. ``price`` is
     # an 18-decimal probability fraction (e.g. 2000000000000000 → 0.002 →
@@ -1831,29 +1900,29 @@ def fmt_match(
         # Very old cached fills without a side.price still fall back to the
         # top-level priceExecuted, which always reflects the taker's price.
         price_c = _norm_price_to_cents(match.get("priceExecuted"))
+    fill_value_usd = None
     if shares is not None and price_c is not None:
-        value_text = f"${shares * price_c / 100:,.2f}"
+        fill_value_usd = shares * price_c / 100
+        value_text = f"${fill_value_usd:,.2f}"
     else:
         value_text = "N/A"
 
     price_text = f"{price_c:.2f}" if price_c is not None else "?"
     tx = match.get("transactionHash") or "N/A"
-    tx_short = f"{tx[:10]}...{tx[-6:]}" if isinstance(tx, str) and len(tx) > 20 else str(tx)
-    tx_line = f"{t(chat_id, 'label_tx')}: <code>{tx_short}</code>"
     if isinstance(tx, str) and tx.startswith("0x"):
         tx_url = f"{TX_EXPLORER_BASE.rstrip('/')}/{tx}"
-        tx_line += f' | <a href="{tx_url}">{t(chat_id, "view_tx")}</a>'
-    order_hash = match.get("orderHash") or our_side.get("orderHash")
-    order_line = ""
-    if order_hash:
-        oh = str(order_hash)
-        oh_short = f"{oh[:10]}...{oh[-6:]}" if len(oh) > 20 else oh
-        order_line = f"\n{t(chat_id, 'label_order_hash')}: <code>{oh_short}</code>"
+        tx_line = f'🔗 <a href="{tx_url}">{t(chat_id, "view_tx")}</a>'
+    else:
+        tx_short = f"{tx[:10]}...{tx[-6:]}" if isinstance(tx, str) and len(tx) > 20 else str(tx)
+        tx_line = f"🔗 <code>{tx_short}</code>"
 
     # If we have the wallet's current positions, surface the total holding for
     # this market+outcome so the user can distinguish "this fill" from "what
     # they now hold in total" — especially when adding to an existing stake.
+    # Also computes the before→after delta and floating PnL so a single fill
+    # line subsumes the separate 持仓变化 notification.
     total_line = ""
+    pnl_line = ""
     if positions_by_key:
         market_id = market.get("id") or ""
         outcome_idx = outcome_obj.get("index")
@@ -1861,9 +1930,10 @@ def fmt_match(
         current_pos = positions_by_key.get(lookup_key)
         if current_pos:
             total_shares = pos_size(current_pos)
-            _, _, total_shares_text, total_price = display_fields(
+            _, _, _, total_price = display_fields(
                 current_pos, current_pos.get("_market")
             )
+            total_shares_text = _fmt_shares(total_shares)
             # Prefer the API's own USD cost for the total, so rounding the
             # displayed avg price to 2dp (e.g. 0.33¢ for 0.333…¢) doesn't
             # drift the total by several dollars on large positions.
@@ -1879,27 +1949,38 @@ def fmt_match(
                 total_val = f"${cost_usd_raw:,.2f}"
             else:
                 try:
-                    total_val = f"${float(total_shares_text) * float(total_price) / 100:,.2f}"
+                    total_val = f"${float(total_shares) * float(total_price) / 100:,.2f}" if total_shares is not None else "N/A"
                 except (ValueError, TypeError):
                     total_val = "N/A"
+            # Show avg-cost vs live mark when they diverge (>2% gap) so users
+            # can see unrealized drift without opening /pos.
+            price_detail = f"<code>{total_price}c</code>"
+            pnl_usd, pnl_pct, mark_c = pnl_of(current_pos, current_pos.get("_market"))
+            try:
+                avg_c = float(total_price)
+            except (ValueError, TypeError):
+                avg_c = None
+            if avg_c and mark_c and avg_c > 0 and abs(mark_c - avg_c) / avg_c > 0.02:
+                price_detail = f"<code>{total_price}c</code> → <code>{mark_c:.2f}c</code>"
             if total_shares is not None:
                 total_line = (
                     f"\n📦 {t(chat_id, 'label_total_pos')}: "
                     f"<b>{total_shares_text}</b> {t(chat_id, 'shares_unit')} "
-                    f"@ <code>{total_price}c</code> = <b>{total_val}</b>"
+                    f"@ {price_detail} = <b>{total_val}</b>"
                 )
+            pnl_line = _pnl_line(chat_id, pnl_usd, pnl_pct)
 
     merged_suffix = ""
     merged_count = match.get("_merged_count")
     if isinstance(merged_count, int) and merged_count > 1:
         merged_suffix = t(chat_id, "fills_merged_suffix", count=merged_count)
 
-    title_html = _title_html(title[:60], market)
+    title_html = _title_html(title[:50], market)
     return (
-        f"✅ {side} {outcome} | "
+        f"{side_emoji} {side} {outcome} | "
         f"{t(chat_id, 'label_fill')} {shares_text} @ {price_text}c = {value_text}{merged_suffix}\n"
-        f"{title_html}{total_line}\n"
-        f"{tx_line}{order_line}"
+        f"{title_html}{total_line}{pnl_line}\n"
+        f"{tx_line}"
     )
 
 # ==================== Telegram ====================
@@ -3493,9 +3574,29 @@ async def poll_loop(app: Application):
                                 m for m in matches
                                 if match_key(m) not in w.order_match_snapshot
                             ]
+                            # Dust filter: drop fills whose USD notional is
+                            # below the global MIN_FILL_USD floor. We still
+                            # mark the match_key as seen downstream so the
+                            # next poll doesn't redeliver it.
+                            if MIN_FILL_USD > 0 and new_fills:
+                                new_fills = [
+                                    m for m in new_fills
+                                    if (v := _fill_usd_value(m, w.address)) is None or v >= MIN_FILL_USD
+                                ]
                         else:
                             new_match_keys = None
                             new_fills = []
+
+                        # Markets that have a brand-new fill will already be
+                        # fully described by the 订单成交 block (which now
+                        # shows total holding + delta + PnL). Suppress the
+                        # duplicate 持仓变化 entry for the same market+outcome
+                        # to avoid two near-identical messages in a row.
+                        fill_market_keys: set[str] = set()
+                        for m in new_fills:
+                            k = _fill_market_outcome_key(m)
+                            if k:
+                                fill_market_keys.add(k)
 
                         # Refresh the shares snapshot + the title cache. Hold onto
                         # old titles so "closed" notifications can show a real
@@ -3521,11 +3622,19 @@ async def poll_loop(app: Application):
 
                         blocks: list[str] = []  # For merged combined message.
 
-                        if added or changed or closed:
+                        changed_visible = [
+                            (p, prev) for (p, prev) in changed
+                            if pos_key(p) not in fill_market_keys
+                        ]
+                        added_visible = [
+                            p for p in added
+                            if pos_key(p) not in fill_market_keys
+                        ]
+                        if added_visible or changed_visible or closed:
                             parts = []
-                            for p in added:
+                            for p in added_visible:
                                 parts.append(fmt_pos(p, "added", chat_id, markets.get(p.get("marketId"))))
-                            for p, prev_size in changed:
+                            for p, prev_size in changed_visible:
                                 parts.append(
                                     fmt_pos(
                                         p,
