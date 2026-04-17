@@ -288,10 +288,19 @@ I18N = {
         "usage_interval": "Usage: /interval addr|alias seconds (0 = global)",
         "interval_set": "⏱ Poll interval for <code>{addr}</code>: {sec}s",
         "interval_too_small": "Interval must be 0 (global) or ≥ 5 seconds.",
-        "usage_minfill": "Usage: /minfill addr|alias usd (0 = global default)",
+        "usage_minfill": "Usage: /minfill addr|alias [usd]  (no amount → picker)",
         "minfill_set": "💨 Dust floor for <code>{addr}</code>: ${usd:.2f}",
         "minfill_bad_amount": "Amount must be ≥ 0.",
+        "minfill_bad_number": "Reply must be a non-negative number (e.g. 1.5).",
         "dust_summary": "💨 {count} dust fills folded (${usd:,.2f} total)",
+        "minfill_picker_title": "💨 <b>Dust floor</b> · <code>{addr}</code>",
+        "minfill_picker_current": "Current: <b>${usd:.2f}</b>{fallback}",
+        "minfill_picker_fallback": " <i>(fallback from global)</i>",
+        "minfill_picker_hint": "Pick a preset or ✏️ Custom to type your own.",
+        "minfill_preset_off": "$0 off",
+        "btn_minfill_custom": "✏️ Custom",
+        "minfill_custom_prompt": "Reply with a USD amount (e.g. <code>1.5</code>). 0 = off.",
+        "btn_dust": "💨 Dust",
         # --- Alerts ---
         "usage_alert": "Usage: /alert addr|alias outcome >=|<= price(0-100)",
         "alert_bad_outcome": "Outcome not found for this wallet's position.",
@@ -609,10 +618,19 @@ I18N = {
         "usage_interval": "用法：/interval 地址或备注 秒（0 = 使用全局）",
         "interval_set": "⏱ <code>{addr}</code> 轮询间隔：{sec} 秒",
         "interval_too_small": "间隔必须为 0（使用全局）或 ≥ 5 秒。",
-        "usage_minfill": "用法：/minfill 地址或备注 金额（0 = 使用全局默认）",
+        "usage_minfill": "用法：/minfill 地址或备注 [金额]（不填金额弹选择器）",
         "minfill_set": "💨 <code>{addr}</code> 微单阈值：${usd:.2f}",
         "minfill_bad_amount": "金额必须 ≥ 0。",
+        "minfill_bad_number": "回复必须是非负数字（例如 1.5）。",
         "dust_summary": "💨 今次有 {count} 笔微单，共 ${usd:,.2f}",
+        "minfill_picker_title": "💨 <b>微单阈值</b> · <code>{addr}</code>",
+        "minfill_picker_current": "当前：<b>${usd:.2f}</b>{fallback}",
+        "minfill_picker_fallback": " <i>（来自全局默认）</i>",
+        "minfill_picker_hint": "选一个预设，或点「✏️ 自定义」手动输入。",
+        "minfill_preset_off": "$0 关闭",
+        "btn_minfill_custom": "✏️ 自定义",
+        "minfill_custom_prompt": "回复一个美元数（例如 <code>1.5</code>），填 0 代表关闭。",
+        "btn_dust": "💨 阈值",
         "usage_alert": "用法：/alert 地址或备注 结果名 >=|<= 价格(0-100)",
         "alert_bad_outcome": "该钱包当前持仓中未找到该结果。",
         "alert_bad_op": "运算符只能是 >= 或 <=。",
@@ -2368,10 +2386,13 @@ def _render_list_page(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarku
                 ),
             ]
         )
-        # Row 2: mute toggle · unwatch
+        # Row 2: mute toggle · 💨 dust picker · unwatch
         keyboard.append(
             [
                 InlineKeyboardButton(mute_label, callback_data=f"togglemute:{addr}"),
+                InlineKeyboardButton(
+                    t(chat_id, "btn_dust"), callback_data=f"minfill:open:{addr}"
+                ),
                 InlineKeyboardButton(
                     t(chat_id, "btn_unwatch"), callback_data=f"unwatch:{addr}"
                 ),
@@ -2741,15 +2762,116 @@ async def cmd_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+MINFILL_PRESETS: tuple[float, ...] = (0.0, 0.5, 1.0, 5.0)
+
+
+def _minfill_body(chat_id: int, addr: str, target: WatchedWallet) -> str:
+    """Picker message body showing current effective dust floor."""
+    effective = target.min_fill_usd if target.min_fill_usd > 0 else MIN_FILL_USD
+    fallback = (
+        t(chat_id, "minfill_picker_fallback")
+        if target.min_fill_usd == 0 and MIN_FILL_USD > 0
+        else ""
+    )
+    return "\n".join(
+        [
+            t(chat_id, "minfill_picker_title", addr=fmt_addr(addr)),
+            t(chat_id, "minfill_picker_current", usd=effective, fallback=fallback),
+            t(chat_id, "minfill_picker_hint"),
+        ]
+    )
+
+
+def _minfill_keyboard(chat_id: int, addr: str, target: WatchedWallet) -> InlineKeyboardMarkup:
+    current = target.min_fill_usd
+    preset_row = []
+    for usd in MINFILL_PRESETS:
+        if usd == 0:
+            label = t(chat_id, "minfill_preset_off")
+        else:
+            label = f"${usd:g}"
+        # Highlight the currently selected preset with a checkmark.
+        if abs(current - usd) < 1e-6:
+            label = f"✅ {label}"
+        preset_row.append(
+            InlineKeyboardButton(label, callback_data=f"minfill:set:{addr}:{usd:g}")
+        )
+    return InlineKeyboardMarkup(
+        [
+            preset_row,
+            [
+                InlineKeyboardButton(
+                    t(chat_id, "btn_minfill_custom"),
+                    callback_data=f"minfill:custom:{addr}",
+                ),
+                InlineKeyboardButton(
+                    t(chat_id, "btn_back"),
+                    callback_data=f"minfill:close:{addr}",
+                ),
+            ],
+        ]
+    )
+
+
+async def _show_minfill_picker(
+    update: Update | None,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    addr: str,
+    *,
+    query=None,
+):
+    target = watched.get(chat_id, {}).get(addr)
+    if not target:
+        if query is not None:
+            try:
+                await query.edit_message_text(t(chat_id, "not_found"))
+            except BadRequest:
+                pass
+        elif update is not None and update.message is not None:
+            await update.message.reply_text(t(chat_id, "not_found"))
+        return
+    body = _minfill_body(chat_id, addr, target)
+    markup = _minfill_keyboard(chat_id, addr, target)
+    if query is not None:
+        try:
+            await query.edit_message_text(
+                body, parse_mode="HTML", reply_markup=markup
+            )
+            return
+        except BadRequest:
+            pass
+    if update is not None and update.message is not None:
+        await update.message.reply_text(
+            body, parse_mode="HTML", reply_markup=markup
+        )
+    else:
+        await ctx.bot.send_message(
+            chat_id=chat_id, text=body, parse_mode="HTML", reply_markup=markup
+        )
+
+
+def _set_pending_minfill(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, addr: str):
+    ctx.user_data["pending_minfill"] = {"chat_id": chat_id, "address": addr}
+
+
+def _pop_pending_minfill(ctx: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    return ctx.user_data.pop("pending_minfill", None)
+
+
 async def cmd_minfill(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if len(ctx.args) < 2:
+    if len(ctx.args) < 1:
         await update.message.reply_text(t(chat_id, "usage_minfill"))
         return
     addr = resolve_addr(chat_id, ctx.args[0])
     target = watched.get(chat_id, {}).get(addr) if addr else None
     if not target:
         await update.message.reply_text(t(chat_id, "not_found"))
+        return
+    # /minfill <addr> — open picker.
+    if len(ctx.args) == 1:
+        await _show_minfill_picker(update, ctx, chat_id, addr)
         return
     try:
         usd = float(ctx.args[1])
@@ -3121,6 +3243,38 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_watch(update, ctx)
         return
 
+    # Dust-floor custom-amount reply.
+    pending_minfill = ctx.user_data.get("pending_minfill")
+    if pending_minfill and pending_minfill.get("chat_id") == chat_id:
+        addr = pending_minfill.get("address") or ""
+        target = watched.get(chat_id, {}).get(addr)
+        if not target:
+            _pop_pending_minfill(ctx)
+            return
+        raw = (update.message.text or "").strip().lstrip("$").replace(",", "")
+        try:
+            usd = float(raw)
+        except ValueError:
+            await update.message.reply_text(
+                t(chat_id, "minfill_bad_number"),
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        if usd < 0:
+            await update.message.reply_text(
+                t(chat_id, "minfill_bad_number"),
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        _pop_pending_minfill(ctx)
+        target.min_fill_usd = usd
+        save_watch(target)
+        await update.message.reply_text(
+            t(chat_id, "minfill_set", addr=fmt_addr(addr), usd=usd),
+            parse_mode="HTML",
+        )
+        return
+
     pending = _pop_pending_note_edit(ctx)
     if not pending or pending.get("chat_id") != chat_id:
         return
@@ -3343,6 +3497,57 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "watch_prompt":
         await _prompt_watch_reply(ctx, chat_id)
+        return
+
+    # Dust-floor picker: minfill:{open|set|custom|close}:{addr}[:{usd}]
+    if data.startswith("minfill:"):
+        parts = data.split(":", 3)
+        action = parts[1] if len(parts) > 1 else ""
+        addr = parts[2] if len(parts) > 2 else ""
+        target = watched.get(chat_id, {}).get(addr)
+        if not target:
+            try:
+                await query.edit_message_text(t(chat_id, "not_found"))
+            except BadRequest:
+                pass
+            return
+        if action == "open":
+            await _show_minfill_picker(None, ctx, chat_id, addr, query=query)
+            return
+        if action == "set" and len(parts) >= 4:
+            try:
+                usd = float(parts[3])
+            except ValueError:
+                return
+            if usd < 0:
+                return
+            target.min_fill_usd = usd
+            save_watch(target)
+            await _show_minfill_picker(None, ctx, chat_id, addr, query=query)
+            return
+        if action == "custom":
+            _set_pending_minfill(ctx, chat_id, addr)
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=t(chat_id, "minfill_custom_prompt"),
+                parse_mode="HTML",
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        if action == "close":
+            try:
+                await query.edit_message_text(
+                    t(
+                        chat_id,
+                        "minfill_set",
+                        addr=fmt_addr(addr),
+                        usd=(target.min_fill_usd if target.min_fill_usd > 0 else MIN_FILL_USD),
+                    ),
+                    parse_mode="HTML",
+                )
+            except BadRequest:
+                pass
+            return
         return
 
     # /help browser callbacks.
