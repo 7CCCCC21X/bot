@@ -128,7 +128,13 @@ db_lock = threading.Lock()
 I18N = {
     "en": {
         "choose_lang": "🌐 Choose language:",
+        "btn_watch_wallet": "➕ Watch wallet",
         "btn_watch_guide": "📖 How to find wallet address",
+        "watch_reply_prompt": "Please reply with the wallet address you want to watch (0x...)",
+        "watch_reply_invalid": (
+            "❌ That's not a valid wallet address.\n\n"
+            "Please reply with a valid Ethereum address starting with <code>0x</code> (42 characters)."
+        ),
         "watch_guide_caption": (
             "📖 <b>How to find your Predict.fun wallet address</b>\n\n"
             "1. Go to Predict.fun and log in\n"
@@ -439,7 +445,13 @@ I18N = {
     },
     "zh": {
         "choose_lang": "🌐 选择语言：",
+        "btn_watch_wallet": "➕ 关注钱包",
         "btn_watch_guide": "📖 如何找到钱包地址",
+        "watch_reply_prompt": "请发送要关注的钱包地址 (0x...)",
+        "watch_reply_invalid": (
+            "❌ 这不是一个有效的钱包地址。\n\n"
+            "请发送以 <code>0x</code> 开头的有效以太坊地址（42 个字符）。"
+        ),
         "watch_guide_caption": (
             "📖 <b>如何找到你的 Predict.fun 钱包地址</b>\n\n"
             "1. 打开 Predict.fun 并登录\n"
@@ -1825,6 +1837,7 @@ def _start_keyboard(chat_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🇺🇸 English", callback_data="lang_en"),
                 InlineKeyboardButton("🇨🇳 中文", callback_data="lang_zh"),
             ],
+            [InlineKeyboardButton(t(chat_id, "btn_watch_wallet"), callback_data="watch_prompt")],
             [InlineKeyboardButton(t(chat_id, "btn_watch_guide"), callback_data="watch_guide")],
             [InlineKeyboardButton(t(chat_id, "btn_help"), callback_data="help_root")],
         ]
@@ -1950,14 +1963,25 @@ async def _render_orders(
     return "\n\n".join(lines), markup
 
 
+async def _prompt_watch_reply(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Ask the user to reply with a wallet address to watch."""
+    _set_pending_watch(ctx, chat_id)
+    await ctx.bot.send_message(
+        chat_id=chat_id,
+        text=t(chat_id, "watch_reply_prompt"),
+        parse_mode="HTML",
+        reply_markup=ForceReply(selective=True),
+    )
+
+
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if not ctx.args:
-        # No args — user likely tapped /watch from the command menu. Show
-        # the wallet-discovery guide plus a concrete 3-line format example
-        # instead of a terse "Usage" line.
-        await _send_watch_guide(ctx, chat_id)
+        # No args — prompt the user to reply with an address so they don't
+        # have to retype /watch. Mirrors the reply-to-watch flow seen in other
+        # predict bots for convenience.
+        await _prompt_watch_reply(ctx, chat_id)
         return
 
     # Multi-address mode: if every argument is a well-formed 0x address, watch
@@ -2767,11 +2791,40 @@ def _pop_pending_note_edit(ctx: ContextTypes.DEFAULT_TYPE) -> dict | None:
     return ctx.user_data.pop("pending_note_edit", None)
 
 
+def _set_pending_watch(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    ctx.user_data["pending_watch"] = {"chat_id": chat_id}
+
+
+def _pop_pending_watch(ctx: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    return ctx.user_data.pop("pending_watch", None)
+
+
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle free-text messages. Currently only the note-edit reply flow."""
+    """Handle free-text replies to bot prompts (note-edit / watch-address)."""
     if not update.message or update.message.text is None:
         return
     chat_id = update.effective_chat.id
+
+    # Reply-to-watch flow: user tapped the "➕ Watch wallet" button or sent
+    # /watch with no args, then replied to our ForceReply prompt with an
+    # address.
+    pending_watch = ctx.user_data.get("pending_watch")
+    if pending_watch and pending_watch.get("chat_id") == chat_id:
+        tokens = [tok for tok in update.message.text.split() if tok.strip()]
+        first = tokens[0] if tokens else ""
+        if not (first.startswith("0x") and len(first) == 42):
+            # Keep the pending state so the next reply is still captured.
+            await update.message.reply_text(
+                t(chat_id, "watch_reply_invalid"),
+                parse_mode="HTML",
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        _pop_pending_watch(ctx)
+        ctx.args = tokens
+        await cmd_watch(update, ctx)
+        return
+
     pending = _pop_pending_note_edit(ctx)
     if not pending or pending.get("chat_id") != chat_id:
         return
@@ -2990,6 +3043,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "watch_guide":
         await _send_watch_guide(ctx, chat_id)
+        return
+
+    if data == "watch_prompt":
+        await _prompt_watch_reply(ctx, chat_id)
         return
 
     # /help browser callbacks.
