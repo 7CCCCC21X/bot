@@ -33,6 +33,9 @@ from telegram.ext import (
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
 PREDICT_API = "https://api.predict.fun"
+# Optional: admin chat id for /raw debug command. Leave unset to disable.
+_raw_admin = os.environ.get("ADMIN_CHAT_ID", "").strip()
+ADMIN_CHAT_ID = int(_raw_admin) if _raw_admin.lstrip("-").isdigit() else None
 POLL_INTERVAL = 15
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
 PREDICT_WEB_BASE = os.environ.get("PREDICT_WEB_BASE", "https://predict.fun/market/")
@@ -2421,6 +2424,87 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_raw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: dump the raw matches + one position JSON for debugging.
+
+    Usage: /raw 0xAddress [count]
+    Gated by the ADMIN_CHAT_ID env var. Returns a .json file so nothing is
+    clipped by Telegram's 4096-char message limit.
+    """
+    chat_id = update.effective_chat.id
+    if ADMIN_CHAT_ID is None or chat_id != ADMIN_CHAT_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /raw 0xAddress [count]")
+        return
+    addr = ctx.args[0].strip()
+    if not (addr.startswith("0x") and len(addr) == 42):
+        await update.message.reply_text("Invalid address")
+        return
+    try:
+        count = int(ctx.args[1]) if len(ctx.args) > 1 else 10
+    except ValueError:
+        count = 10
+    count = max(1, min(count, 50))
+
+    async with aiohttp.ClientSession() as session:
+        matches_url = f"{PREDICT_API}/v1/orders/matches"
+        matches_params = {"signerAddress": addr, "first": str(count)}
+        positions_url = f"{PREDICT_API}/v1/positions/{addr}"
+        try:
+            async with session.get(
+                matches_url,
+                params=matches_params,
+                headers=_headers(),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                matches_status = r.status
+                matches_body = await r.text()
+        except Exception as e:
+            matches_status = 0
+            matches_body = f"error: {e}"
+        try:
+            async with session.get(
+                positions_url,
+                headers=_headers(),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                positions_status = r.status
+                positions_body = await r.text()
+        except Exception as e:
+            positions_status = 0
+            positions_body = f"error: {e}"
+
+    def _parse(body: str):
+        try:
+            return json.loads(body)
+        except Exception:
+            return body
+
+    payload = {
+        "address": addr,
+        "requested_at": int(time.time()),
+        "matches": {
+            "url": matches_url,
+            "params": matches_params,
+            "status": matches_status,
+            "body": _parse(matches_body),
+        },
+        "positions": {
+            "url": positions_url,
+            "status": positions_status,
+            "body": _parse(positions_body),
+        },
+    }
+    buf = BytesIO(json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"))
+    buf.seek(0)
+    await ctx.bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(buf, filename=f"raw_{addr[:10]}.json"),
+        caption=f"raw matches(first={count}) + positions for {addr[:10]}…{addr[-4:]}",
+    )
+
+
 async def cmd_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if len(ctx.args) < 2:
@@ -3511,6 +3595,7 @@ def main():
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("import", cmd_import))
+    app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_handler(CommandHandler("threshold", cmd_threshold))
     app.add_handler(CommandHandler("interval", cmd_interval))
     app.add_handler(CommandHandler("alert", cmd_alert))
