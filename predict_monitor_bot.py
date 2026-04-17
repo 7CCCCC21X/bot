@@ -33,6 +33,9 @@ from telegram.ext import (
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
 PREDICT_API = "https://api.predict.fun"
+# Optional: admin chat id for /raw debug command. Leave unset to disable.
+_raw_admin = os.environ.get("ADMIN_CHAT_ID", "").strip()
+ADMIN_CHAT_ID = int(_raw_admin) if _raw_admin.lstrip("-").isdigit() else None
 POLL_INTERVAL = 15
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
 PREDICT_WEB_BASE = os.environ.get("PREDICT_WEB_BASE", "https://predict.fun/market/")
@@ -128,7 +131,13 @@ db_lock = threading.Lock()
 I18N = {
     "en": {
         "choose_lang": "🌐 Choose language:",
+        "btn_watch_wallet": "➕ Watch wallet",
         "btn_watch_guide": "📖 How to find wallet address",
+        "watch_reply_prompt": "Please reply with the wallet address you want to watch (0x...)",
+        "watch_reply_invalid": (
+            "❌ That's not a valid wallet address.\n\n"
+            "Please reply with a valid Ethereum address starting with <code>0x</code> (42 characters)."
+        ),
         "watch_guide_caption": (
             "📖 <b>How to find your Predict.fun wallet address</b>\n\n"
             "1. Go to Predict.fun and log in\n"
@@ -439,7 +448,13 @@ I18N = {
     },
     "zh": {
         "choose_lang": "🌐 选择语言：",
+        "btn_watch_wallet": "➕ 关注钱包",
         "btn_watch_guide": "📖 如何找到钱包地址",
+        "watch_reply_prompt": "请发送要关注的钱包地址 (0x...)",
+        "watch_reply_invalid": (
+            "❌ 这不是一个有效的钱包地址。\n\n"
+            "请发送以 <code>0x</code> 开头的有效以太坊地址（42 个字符）。"
+        ),
         "watch_guide_caption": (
             "📖 <b>如何找到你的 Predict.fun 钱包地址</b>\n\n"
             "1. 打开 Predict.fun 并登录\n"
@@ -1825,6 +1840,7 @@ def _start_keyboard(chat_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🇺🇸 English", callback_data="lang_en"),
                 InlineKeyboardButton("🇨🇳 中文", callback_data="lang_zh"),
             ],
+            [InlineKeyboardButton(t(chat_id, "btn_watch_wallet"), callback_data="watch_prompt")],
             [InlineKeyboardButton(t(chat_id, "btn_watch_guide"), callback_data="watch_guide")],
             [InlineKeyboardButton(t(chat_id, "btn_help"), callback_data="help_root")],
         ]
@@ -1950,14 +1966,25 @@ async def _render_orders(
     return "\n\n".join(lines), markup
 
 
+async def _prompt_watch_reply(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Ask the user to reply with a wallet address to watch."""
+    _set_pending_watch(ctx, chat_id)
+    await ctx.bot.send_message(
+        chat_id=chat_id,
+        text=t(chat_id, "watch_reply_prompt"),
+        parse_mode="HTML",
+        reply_markup=ForceReply(selective=True),
+    )
+
+
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if not ctx.args:
-        # No args — user likely tapped /watch from the command menu. Show
-        # the wallet-discovery guide plus a concrete 3-line format example
-        # instead of a terse "Usage" line.
-        await _send_watch_guide(ctx, chat_id)
+        # No args — prompt the user to reply with an address so they don't
+        # have to retype /watch. Mirrors the reply-to-watch flow seen in other
+        # predict bots for convenience.
+        await _prompt_watch_reply(ctx, chat_id)
         return
 
     # Multi-address mode: if every argument is a well-formed 0x address, watch
@@ -2397,6 +2424,98 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_chatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Echo the caller's chat id. Handy for filling ADMIN_CHAT_ID on deploys."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    uid = user.id if user else "?"
+    await update.message.reply_text(
+        f"chat_id: <code>{chat_id}</code>\nuser_id: <code>{uid}</code>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_raw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: dump the raw matches + one position JSON for debugging.
+
+    Usage: /raw 0xAddress [count]
+    Gated by the ADMIN_CHAT_ID env var. Returns a .json file so nothing is
+    clipped by Telegram's 4096-char message limit.
+    """
+    chat_id = update.effective_chat.id
+    if ADMIN_CHAT_ID is None or chat_id != ADMIN_CHAT_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /raw 0xAddress [count]")
+        return
+    addr = ctx.args[0].strip()
+    if not (addr.startswith("0x") and len(addr) == 42):
+        await update.message.reply_text("Invalid address")
+        return
+    try:
+        count = int(ctx.args[1]) if len(ctx.args) > 1 else 10
+    except ValueError:
+        count = 10
+    count = max(1, min(count, 50))
+
+    async with aiohttp.ClientSession() as session:
+        matches_url = f"{PREDICT_API}/v1/orders/matches"
+        matches_params = {"signerAddress": addr, "first": str(count)}
+        positions_url = f"{PREDICT_API}/v1/positions/{addr}"
+        try:
+            async with session.get(
+                matches_url,
+                params=matches_params,
+                headers=_headers(),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                matches_status = r.status
+                matches_body = await r.text()
+        except Exception as e:
+            matches_status = 0
+            matches_body = f"error: {e}"
+        try:
+            async with session.get(
+                positions_url,
+                headers=_headers(),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                positions_status = r.status
+                positions_body = await r.text()
+        except Exception as e:
+            positions_status = 0
+            positions_body = f"error: {e}"
+
+    def _parse(body: str):
+        try:
+            return json.loads(body)
+        except Exception:
+            return body
+
+    payload = {
+        "address": addr,
+        "requested_at": int(time.time()),
+        "matches": {
+            "url": matches_url,
+            "params": matches_params,
+            "status": matches_status,
+            "body": _parse(matches_body),
+        },
+        "positions": {
+            "url": positions_url,
+            "status": positions_status,
+            "body": _parse(positions_body),
+        },
+    }
+    buf = BytesIO(json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"))
+    buf.seek(0)
+    await ctx.bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(buf, filename=f"raw_{addr[:10]}.json"),
+        caption=f"raw matches(first={count}) + positions for {addr[:10]}…{addr[-4:]}",
+    )
+
+
 async def cmd_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if len(ctx.args) < 2:
@@ -2767,11 +2886,40 @@ def _pop_pending_note_edit(ctx: ContextTypes.DEFAULT_TYPE) -> dict | None:
     return ctx.user_data.pop("pending_note_edit", None)
 
 
+def _set_pending_watch(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    ctx.user_data["pending_watch"] = {"chat_id": chat_id}
+
+
+def _pop_pending_watch(ctx: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    return ctx.user_data.pop("pending_watch", None)
+
+
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle free-text messages. Currently only the note-edit reply flow."""
+    """Handle free-text replies to bot prompts (note-edit / watch-address)."""
     if not update.message or update.message.text is None:
         return
     chat_id = update.effective_chat.id
+
+    # Reply-to-watch flow: user tapped the "➕ Watch wallet" button or sent
+    # /watch with no args, then replied to our ForceReply prompt with an
+    # address.
+    pending_watch = ctx.user_data.get("pending_watch")
+    if pending_watch and pending_watch.get("chat_id") == chat_id:
+        tokens = [tok for tok in update.message.text.split() if tok.strip()]
+        first = tokens[0] if tokens else ""
+        if not (first.startswith("0x") and len(first) == 42):
+            # Keep the pending state so the next reply is still captured.
+            await update.message.reply_text(
+                t(chat_id, "watch_reply_invalid"),
+                parse_mode="HTML",
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        _pop_pending_watch(ctx)
+        ctx.args = tokens
+        await cmd_watch(update, ctx)
+        return
+
     pending = _pop_pending_note_edit(ctx)
     if not pending or pending.get("chat_id") != chat_id:
         return
@@ -2990,6 +3138,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "watch_guide":
         await _send_watch_guide(ctx, chat_id)
+        return
+
+    if data == "watch_prompt":
+        await _prompt_watch_reply(ctx, chat_id)
         return
 
     # /help browser callbacks.
@@ -3454,6 +3606,8 @@ def main():
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("import", cmd_import))
+    app.add_handler(CommandHandler("raw", cmd_raw))
+    app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("threshold", cmd_threshold))
     app.add_handler(CommandHandler("interval", cmd_interval))
     app.add_handler(CommandHandler("alert", cmd_alert))
