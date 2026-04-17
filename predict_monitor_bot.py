@@ -133,7 +133,10 @@ I18N = {
         "choose_lang": "🌐 Choose language:",
         "btn_watch_wallet": "➕ Watch wallet",
         "btn_watch_guide": "📖 How to find wallet address",
-        "watch_reply_prompt": "Please reply with the wallet address you want to watch (0x...)",
+        "watch_reply_prompt": (
+            "📝 <b>Reply with a wallet address to watch</b>\n"
+            "<i>Just send a single 0x… address in your reply — no /watch prefix needed.</i>"
+        ),
         "watch_reply_invalid": (
             "❌ That's not a valid wallet address.\n\n"
             "Please reply with a valid Ethereum address starting with <code>0x</code> (42 characters)."
@@ -450,7 +453,10 @@ I18N = {
         "choose_lang": "🌐 选择语言：",
         "btn_watch_wallet": "➕ 关注钱包",
         "btn_watch_guide": "📖 如何找到钱包地址",
-        "watch_reply_prompt": "请发送要关注的钱包地址 (0x...)",
+        "watch_reply_prompt": (
+            "📝 <b>回复这条消息，发送要关注的钱包地址</b>\n"
+            "<i>直接粘贴 0x… 开头的地址即可，不用再输入 /watch。</i>"
+        ),
         "watch_reply_invalid": (
             "❌ 这不是一个有效的钱包地址。\n\n"
             "请发送以 <code>0x</code> 开头的有效以太坊地址（42 个字符）。"
@@ -2002,9 +2008,11 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if not ctx.args:
-        # No args — prompt the user to reply with an address so they don't
-        # have to retype /watch. Mirrors the reply-to-watch flow seen in other
-        # predict bots for convenience.
+        # No args — show the full visual guide (image + numbered steps +
+        # format examples) so new users still learn how to find their
+        # wallet address, then follow up with a compact ForceReply so
+        # experienced users can just paste the address and go.
+        await _send_watch_guide(ctx, chat_id)
         await _prompt_watch_reply(ctx, chat_id)
         return
 
