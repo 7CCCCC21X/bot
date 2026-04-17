@@ -1393,9 +1393,11 @@ def _norm_price_to_cents(price):
     p = _safe_float(price)
     if p is None:
         return None
-    # Some endpoints return fixed-point numbers where cents are scaled by 1e17.
+    # predict.fun returns prices as 18-decimal probability fractions
+    # (e.g. 2000000000000000 → 0.002 → 0.2¢). Decimal-string prices
+    # like "0.002" or "0.997" skip the scaling step and go straight to ×100.
     if abs(p) >= 1e6:
-        p = p / 1e17
+        p = p / 1e18
     if 0 <= p <= 1:
         p = p * 100
     return p
@@ -1730,50 +1732,69 @@ def _position_lookup_key(market_id, outcome_index) -> str:
     return f"{market_id or ''}_{outcome_index if outcome_index is not None else ''}"
 
 
+def _pick_user_side(match: dict, address: str | None) -> dict:
+    """Return the side (maker entry or taker) belonging to ``address``.
+
+    predict.fun's matches API reports each fill with two complementary
+    sides — our user is usually the maker (listed in ``makers[]``) but can
+    also be the taker. For neg-risk markets, the two sides can even hold
+    different outcomes (user sells Yes at 0.3¢ while counter-taker sells No
+    at 99.7¢ and they merge). We must identify OUR side by ``signer`` so the
+    quoteType/outcome/price reflect the user's actual trade — not the
+    complementary leg.
+
+    Falls back to the taker when no address is provided or no side matches,
+    preserving the pre-fix behavior as a safety net.
+    """
+    taker = match.get("taker") if isinstance(match.get("taker"), dict) else {}
+    makers = match.get("makers") if isinstance(match.get("makers"), list) else []
+    if address:
+        addr_lower = address.lower()
+        for m in makers:
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("signer") or "").lower() == addr_lower:
+                return m
+        if str(taker.get("signer") or "").lower() == addr_lower:
+            return taker
+    # No match — fall back to taker, or first maker if taker missing.
+    if taker:
+        return taker
+    return makers[0] if makers and isinstance(makers[0], dict) else {}
+
+
 def fmt_match(
     match: dict,
     chat_id: int,
     positions_by_key: dict | None = None,
+    address: str | None = None,
 ) -> str:
     market = match.get("market") if isinstance(match.get("market"), dict) else {}
-    taker = match.get("taker") if isinstance(match.get("taker"), dict) else {}
-    outcome_obj = taker.get("outcome") if isinstance(taker.get("outcome"), dict) else {}
+
+    our_side = _pick_user_side(match, address)
+    outcome_obj = our_side.get("outcome") if isinstance(our_side.get("outcome"), dict) else {}
 
     title = market.get("title") or market.get("question") or str(market.get("id", "?"))
     outcome = outcome_obj.get("name") or "?"
-    side = _side_text(taker.get("quoteType", "?"), chat_id)
+    side = _side_text(our_side.get("quoteType", "?"), chat_id)
+    # Prefer the top-level amountFilled so merged fills (consolidate_fills sets
+    # amountFilled to the summed shares) display the total, not just the first
+    # partial. For non-merged matches, amountFilled equals our_side.amount.
     shares = _norm_amount_to_shares(match.get("amountFilled"))
+    if shares is None:
+        shares = _norm_amount_to_shares(our_side.get("amount"))
     shares_text = _fmt_num(shares, digits=4)
 
-    # Derive executed price and total USD value from on-chain filled amounts
-    # whenever possible — these are the ground truth from the settlement. The
-    # API's `priceExecuted` / `taker.price` fields are only used as a fallback,
-    # because they can arrive in varying scales that are easy to misinterpret.
-    maker_amt = _norm_amount_to_shares(match.get("makerAmountFilled"))
-    taker_amt = _norm_amount_to_shares(match.get("takerAmountFilled"))
-
-    price_c = None
-    total_usd = None
-    if (
-        shares is not None and shares > 0
-        and maker_amt is not None and maker_amt > 0
-        and taker_amt is not None and taker_amt > 0
-    ):
-        # One side is the position token (matches `amountFilled`), the other is
-        # the collateral (USD). Pick whichever is closer to `shares` as the
-        # position side; the other is the collateral total.
-        if abs(maker_amt - shares) <= abs(taker_amt - shares):
-            total_usd = taker_amt
-        else:
-            total_usd = maker_amt
-        price_c = total_usd / shares * 100
-
+    # Price/value come directly from the user's own side entry. ``price`` is
+    # an 18-decimal probability fraction (e.g. 2000000000000000 → 0.002 →
+    # 0.2¢). Value is shares × price — what the user paid (Bid) or received
+    # (Ask), before fees.
+    price_c = _norm_price_to_cents(our_side.get("price"))
     if price_c is None:
-        price_c = _norm_price_to_cents(match.get("priceExecuted") or taker.get("price"))
-
-    if total_usd is not None:
-        value_text = f"${total_usd:,.2f}"
-    elif shares is not None and price_c is not None:
+        # Very old cached fills without a side.price still fall back to the
+        # top-level priceExecuted, which always reflects the taker's price.
+        price_c = _norm_price_to_cents(match.get("priceExecuted"))
+    if shares is not None and price_c is not None:
         value_text = f"${shares * price_c / 100:,.2f}"
     else:
         value_text = "N/A"
@@ -1785,7 +1806,7 @@ def fmt_match(
     if isinstance(tx, str) and tx.startswith("0x"):
         tx_url = f"{TX_EXPLORER_BASE.rstrip('/')}/{tx}"
         tx_line += f' | <a href="{tx_url}">{t(chat_id, "view_tx")}</a>'
-    order_hash = match.get("orderHash") or taker.get("orderHash")
+    order_hash = match.get("orderHash") or our_side.get("orderHash")
     order_line = ""
     if order_hash:
         oh = str(order_hash)
@@ -1949,7 +1970,7 @@ async def _render_orders(
     chunk = matches[start : start + ORDERS_PAGE_SIZE]
 
     lines = [t(chat_id, "orders_header", addr=fmt_addr(addr), count=len(matches)), ""]
-    lines.extend(fmt_match(m, chat_id, positions_by_key) for m in chunk)
+    lines.extend(fmt_match(m, chat_id, positions_by_key, address=addr) for m in chunk)
 
     nav: list[InlineKeyboardButton] = []
     if page > 0:
@@ -3476,7 +3497,7 @@ async def poll_loop(app: Application):
                         if new_fills:
                             merged_fills = consolidate_fills(new_fills)
                             fill_lines = [
-                                fmt_match(m, chat_id, positions_by_key)
+                                fmt_match(m, chat_id, positions_by_key, address=w.address)
                                 for m in merged_fills[:5]
                             ]
                             blocks.append(
