@@ -36,7 +36,10 @@ PREDICT_API = "https://api.predict.fun"
 # Optional: admin chat id for /raw debug command. Leave unset to disable.
 _raw_admin = os.environ.get("ADMIN_CHAT_ID", "").strip()
 ADMIN_CHAT_ID = int(_raw_admin) if _raw_admin.lstrip("-").isdigit() else None
-POLL_INTERVAL = 15
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
+# Small inter-wallet delay to avoid burst-hammering the upstream API when many
+# wallets are watched. 0 disables it entirely.
+POLL_WALLET_DELAY = float(os.environ.get("POLL_WALLET_DELAY", "0.2"))
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
 PREDICT_WEB_BASE = os.environ.get("PREDICT_WEB_BASE", "https://predict.fun/market/")
 GUIDE_IMAGE_PATH = os.environ.get("GUIDE_IMAGE_PATH", os.path.join(os.path.dirname(__file__), "images", "guide_deposit_address.png"))
@@ -1938,7 +1941,11 @@ async def _fetch_positions_with_markets(session, addr):
     if positions is None:
         return None, {}
     market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
-    markets = {mid: await fetch_market(session, mid) for mid in market_ids}
+    mid_list = list(market_ids)
+    market_results = await asyncio.gather(
+        *(fetch_market(session, mid) for mid in mid_list)
+    )
+    markets = dict(zip(mid_list, market_results))
     for p in positions:
         p["_market"] = markets.get(p.get("marketId"), {})
     return positions, {pos_key(p): p for p in positions}
@@ -3406,8 +3413,13 @@ async def poll_loop(app: Application):
                         ):
                             continue
 
-                        positions_raw = await fetch_positions(session, w.address)
-                        matches_raw = await fetch_order_matches(session, w.address, first=20)
+                        # Run positions + matches in parallel — they're
+                        # independent endpoints, so serialising them just
+                        # doubles the per-wallet latency.
+                        positions_raw, matches_raw = await asyncio.gather(
+                            fetch_positions(session, w.address),
+                            fetch_order_matches(session, w.address, first=20),
+                        )
 
                         # B1 fix: count as failure if EITHER call failed.
                         # Reset only when BOTH succeed.
@@ -3473,7 +3485,14 @@ async def poll_loop(app: Application):
                         positions = positions_raw or []
                         matches = matches_raw or []
                         market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
-                        markets = {mid: await fetch_market(session, mid) for mid in market_ids}
+                        # Fetch markets concurrently. fetch_market dedupes via
+                        # market_cache, so repeat IDs across polls hit memory
+                        # and only the first encounter pays the network cost.
+                        mid_list = list(market_ids)
+                        market_results = await asyncio.gather(
+                            *(fetch_market(session, mid) for mid in mid_list)
+                        )
+                        markets = dict(zip(mid_list, market_results))
                         for p in positions:
                             p["_market"] = markets.get(p.get("marketId"), {})
                         positions_by_key = {pos_key(p): p for p in positions}
@@ -3609,7 +3628,8 @@ async def poll_loop(app: Application):
                     except Exception as e:
                         logger.error(f"Poll error {addr}: {e}")
 
-                    await asyncio.sleep(1)
+                    if POLL_WALLET_DELAY > 0:
+                        await asyncio.sleep(POLL_WALLET_DELAY)
 
             await asyncio.sleep(POLL_INTERVAL)
 
