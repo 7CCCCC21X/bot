@@ -36,7 +36,7 @@ PREDICT_API = "https://api.predict.fun"
 # Optional: admin chat id for /raw debug command. Leave unset to disable.
 _raw_admin = os.environ.get("ADMIN_CHAT_ID", "").strip()
 ADMIN_CHAT_ID = int(_raw_admin) if _raw_admin.lstrip("-").isdigit() else None
-POLL_INTERVAL = 15
+POLL_INTERVAL = 5
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
 # Fallback dust floor used when a wallet has no per-wallet `min_fill_usd` set.
 # Set MIN_FILL_USD=0 to disable by default (every fill shows, even $0.04 dust).
