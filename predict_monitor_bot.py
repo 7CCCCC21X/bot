@@ -72,7 +72,7 @@ LIST_PAGE_SIZE = 8
 HELP_CATEGORIES: list[tuple[str, list[str]]] = [
     ("watch", ["watch", "unwatch", "list", "stop"]),
     ("query", ["pos", "orders"]),
-    ("other", ["settings", "start"]),
+    ("other", ["settings", "defaults", "start"]),
 ]
 
 
@@ -536,6 +536,12 @@ I18N = {
             "Shows current language, global poll interval, watch count and muted count. "
             "Language buttons toggle EN/中文 in place."
         ),
+        "help_cmd_defaults": (
+            "<b>/defaults</b> — Chat-wide micro-fill defaults\n\n"
+            "Set the default dust floor and dust-summary interval that apply to every "
+            "wallet in this chat that hasn't been customized via the 💨 button on its "
+            "watch card. Wallet-level overrides always win."
+        ),
         "help_cmd_lang": (
             "<b>/lang</b> — Switch bot language\n\n"
             "<b>Usage</b>\n"
@@ -896,6 +902,11 @@ I18N = {
         "help_cmd_settings": (
             "<b>/settings</b> — 偏好面板\n\n"
             "显示当前语言、全局轮询间隔、监控数和静音数，下面有语言切换按钮。"
+        ),
+        "help_cmd_defaults": (
+            "<b>/defaults</b> — 聊天级小额默认\n\n"
+            "统一设置本聊天里所有钱包共享的小额阈值和汇总间隔，适用于没在 /list 的 💨 按钮"
+            "里单独调过的钱包。单钱包自己的设置始终优先。"
         ),
         "help_cmd_lang": (
             "<b>/lang</b> — 切换机器人语言\n\n"
@@ -2214,7 +2225,12 @@ def _start_keyboard(chat_id: int) -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(t(chat_id, "btn_watch_wallet"), callback_data="watch_prompt")],
             [InlineKeyboardButton(t(chat_id, "btn_watch_guide"), callback_data="watch_guide")],
-            [InlineKeyboardButton(t(chat_id, "btn_help"), callback_data="help_root")],
+            [
+                InlineKeyboardButton(
+                    t(chat_id, "btn_chatdef_open"), callback_data="cdef:open"
+                ),
+                InlineKeyboardButton(t(chat_id, "btn_help"), callback_data="help_root"),
+            ],
         ]
     )
 
@@ -4715,6 +4731,7 @@ async def on_startup(app: Application):
             BotCommand("pos", "查询持仓 / View positions"),
             BotCommand("orders", "最近成交 / Recent fills"),
             BotCommand("settings", "偏好设置 / Settings"),
+            BotCommand("defaults", "小额默认 / Micro-fill defaults"),
             BotCommand("stop", "停止全部监控 / Stop all"),
         ]
     )
