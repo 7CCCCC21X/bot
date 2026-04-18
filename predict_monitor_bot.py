@@ -46,15 +46,14 @@ try:
     MIN_FILL_USD = float(os.environ.get("MIN_FILL_USD", "1") or 1)
 except ValueError:
     MIN_FILL_USD = 1.0
-# Fallback dust-summary flush interval (seconds). 0 = flush every poll (legacy
-# behavior: a 💨 summary line fires in the same poll as the dust fill). When
-# >0, dust fills accumulate in memory and flush together once this many
-# seconds have elapsed since the last flush. Per-wallet `dust_interval_s`
-# overrides this.
+# Fallback dust-summary flush interval (seconds). Defaults to 8 hours so
+# micro-fill summaries batch instead of firing on every poll. Set to 0 to
+# restore the legacy "flush every poll" behavior globally, or override per
+# wallet via /dustinterval.
 try:
-    DUST_INTERVAL = int(os.environ.get("DUST_INTERVAL", "0") or 0)
+    DUST_INTERVAL = int(os.environ.get("DUST_INTERVAL", "28800") or 28800)
 except ValueError:
-    DUST_INTERVAL = 0
+    DUST_INTERVAL = 28800
 if DUST_INTERVAL < 0:
     DUST_INTERVAL = 0
 PREDICT_WEB_BASE = os.environ.get("PREDICT_WEB_BASE", "https://predict.fun/market/")
@@ -312,13 +311,13 @@ I18N = {
         "interval_too_small": "Interval must be 0 (global) or ≥ 5 seconds.",
         "usage_dustinterval": (
             "Usage: /dustinterval addr|alias seconds  "
-            "(0 = flush every poll, suffix m/h allowed, e.g. 5m)"
+            "(0 = use global default, suffix m/h allowed, e.g. 8h)"
         ),
         "dustinterval_set": (
             "💨 Dust-summary interval for <code>{addr}</code>: {sec}s "
-            "(0 = every poll)"
+            "(0 = global default)"
         ),
-        "dustinterval_too_small": "Dust interval must be 0 (off) or ≥ 30 seconds.",
+        "dustinterval_too_small": "Dust interval must be 0 (global default) or ≥ 30 seconds.",
         "usage_minfill": "Usage: /minfill addr|alias [usd]  (no amount → picker)",
         "minfill_set": "💨 Dust floor for <code>{addr}</code>: ${usd:.2f}",
         "minfill_bad_amount": "Amount must be ≥ 0.",
@@ -484,12 +483,14 @@ I18N = {
         ),
         "help_cmd_dustinterval": (
             "<b>/dustinterval</b> — Batch dust-fill summaries\n\n"
-            "Instead of firing a 💨 summary every poll whenever sub-threshold fills appear, "
-            "accumulate them and emit one combined summary per interval. "
-            "0 (default) = no batching. Minimum when set is 30 seconds. Suffix m/h allowed.\n\n"
+            "Sub-threshold fills accumulate and flush together once the window elapses, "
+            "instead of firing a 💨 summary every poll. "
+            "The default is <b>8 hours</b>; 0 falls back to the global default, "
+            "minimum when overridden is 30 seconds. Suffix m/h allowed.\n\n"
             "<b>Usage</b>\n"
+            "• <code>/dustinterval alice 8h</code>  (one summary every 8 hours)\n"
             "• <code>/dustinterval alice 5m</code>  (one summary every 5 minutes)\n"
-            "• <code>/dustinterval alice 0</code>  (back to per-poll)"
+            "• <code>/dustinterval alice 0</code>  (use the global default)"
         ),
         "help_cmd_settings": (
             "<b>/settings</b> — Preferences card\n\n"
@@ -660,12 +661,12 @@ I18N = {
         "interval_too_small": "间隔必须为 0（使用全局）或 ≥ 5 秒。",
         "usage_dustinterval": (
             "用法：/dustinterval 地址或备注 秒"
-            "（0 = 每次轮询都汇总，可加 m/h 后缀，如 5m）"
+            "（0 = 使用全局默认，可加 m/h 后缀，如 8h）"
         ),
         "dustinterval_set": (
-            "💨 <code>{addr}</code> 微单汇总间隔：{sec} 秒（0 = 每次轮询）"
+            "💨 <code>{addr}</code> 微单汇总间隔：{sec} 秒（0 = 全局默认）"
         ),
-        "dustinterval_too_small": "微单汇总间隔必须为 0（关闭）或 ≥ 30 秒。",
+        "dustinterval_too_small": "微单汇总间隔必须为 0（全局默认）或 ≥ 30 秒。",
         "usage_minfill": "用法：/minfill 地址或备注 [金额]（不填金额弹选择器）",
         "minfill_set": "💨 <code>{addr}</code> 微单阈值：${usd:.2f}",
         "minfill_bad_amount": "金额必须 ≥ 0。",
@@ -813,11 +814,13 @@ I18N = {
         ),
         "help_cmd_dustinterval": (
             "<b>/dustinterval</b> — 微单汇总节流\n\n"
-            "默认每次轮询只要有微单就立刻发 💨 汇总。开启节流后，微单会在内存里堆积，"
-            "到达间隔后才合并成一条提醒。0（默认）= 不节流；设置时最小 30 秒；可加 m/h 后缀。\n\n"
+            "微单会在内存里堆积，到达间隔后才合并成一条 💨 汇总提醒，"
+            "不再每次轮询都打扰。默认 <b>8 小时</b>；填 0 = 使用全局默认；"
+            "自定义时最小 30 秒；可加 m/h 后缀。\n\n"
             "<b>用法</b>\n"
+            "• <code>/dustinterval 张三 8h</code>（每 8 小时汇总一次）\n"
             "• <code>/dustinterval 张三 5m</code>（每 5 分钟汇总一次）\n"
-            "• <code>/dustinterval 张三 0</code>（恢复每次轮询）"
+            "• <code>/dustinterval 张三 0</code>（回到全局默认）"
         ),
         "help_cmd_settings": (
             "<b>/settings</b> — 偏好面板\n\n"
