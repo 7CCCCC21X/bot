@@ -724,12 +724,13 @@ I18N = {
         "minfill_bad_number": "回复必须是非负数字（例如 1.5）。",
         "dust_summary": "💨 今次有 {count} 笔小额，共 ${usd:,.2f}",
         "minfill_picker_title": "💨 <b>小额提醒设置</b> · <code>{addr}</code>",
-        "minfill_picker_floor": "💰 <b>多少美元以下算小额：</b>${usd:.2f}{fallback}",
-        "minfill_picker_interval": "⏱ <b>这些小额多久合并一次：</b>{interval}{fallback}",
+        "minfill_picker_floor": "💰 <b>成交额小于多少美元不单独提醒：</b>${usd:.2f}{fallback}",
+        "minfill_picker_interval": "⏱ <b>这些小额多久合并提醒一次：</b>{interval}{fallback}",
         "minfill_picker_fallback": "<i>（跟随默认）</i>",
         "minfill_picker_hint": (
-            "低于上面金额的成交会攒起来，每隔一段时间合并成一条 "
-            "「💨 N 笔小额」提醒。点按钮改，✏️ 是自定义。"
+            "例：金额 $1、间隔 8 小时 = 小于 $1 的成交不立刻提醒，"
+            "攒够 8 小时合并成一条「💨 今次有 N 笔小额，共 $X」。\n"
+            "点按钮改，✏️ 自定义。"
         ),
         "minfill_preset_off": "🌐 默认",
         "btn_minfill_custom": "✏️",
@@ -759,13 +760,14 @@ I18N = {
         "dust_btn_seconds": "{sec} 秒",
         "btn_chatdef_open": "💨 小额提醒默认",
         "chatdef_picker_title": "💨 <b>小额提醒 · 本聊天默认</b>",
-        "chatdef_picker_floor": "💰 <b>多少美元以下算小额：</b>${usd:.2f}{fallback}",
-        "chatdef_picker_interval": "⏱ <b>这些小额多久合并一次：</b>{interval}{fallback}",
+        "chatdef_picker_floor": "💰 <b>成交额小于多少美元不单独提醒：</b>${usd:.2f}{fallback}",
+        "chatdef_picker_interval": "⏱ <b>这些小额多久合并提醒一次：</b>{interval}{fallback}",
         "chatdef_picker_fallback": "<i>（当前使用系统内置值）</i>",
         "chatdef_picker_hint": (
-            "以上是本聊天所有钱包共用的默认值；"
-            "单钱包在 /list 的 💨 按钮里自己调过的会优先。\n"
-            "点按钮改，✏️ 是自定义。"
+            "例：金额 $1、间隔 8 小时 = 小于 $1 的成交不立刻提醒，"
+            "攒够 8 小时合并成一条「💨 今次有 N 笔小额，共 $X」。\n\n"
+            "这是本聊天所有钱包的默认；单钱包在 /list 的 💨 按钮里"
+            "自己调过的会优先。点按钮改，✏️ 自定义。"
         ),
         "chatdef_saved": "💨 默认已保存。",
         "usage_alert": "用法：/alert 地址或备注 结果名 >=|<= 价格(0-100)",
@@ -918,12 +920,12 @@ I18N = {
         ),
         "help_cmd_defaults": (
             "<b>/defaults</b> — 小额提醒默认\n\n"
-            "小额成交（低于一定美元的买卖）会被攒起来合并成一条「💨 N 笔小额」提醒，"
-            "免得刷屏。\n\n"
+            "<b>小于某个美元的成交不单独提醒</b>，而是攒起来每隔一段时间"
+            "合并成一条「💨 今次有 N 笔小额，共 $X」，免得刷屏。\n\n"
             "这里设两个数字：\n"
-            "• <b>多少美元以下算小额</b>\n"
-            "• <b>这些小额多久合并发一次</b>\n\n"
-            "设好后，本聊天里没单独调过的钱包都跟这个默认。"
+            "• <b>多小算小额</b>（例：$1 = 交易额 &lt; $1 的成交不单独提醒）\n"
+            "• <b>多久合并一次</b>（例：8 小时 = 攒 8 小时发一条汇总）\n\n"
+            "设好后，本聊天所有没单独调过的钱包都跟这个默认。"
             "想给某个钱包单独调，去 /list 点它的 💨 按钮。"
         ),
         "help_cmd_lang": (
