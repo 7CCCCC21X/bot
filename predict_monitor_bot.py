@@ -357,10 +357,13 @@ I18N = {
         "dustinterval_set_default": (
             "💨 <code>{addr}</code> will follow the global dust-summary default."
         ),
-        "dust_label_every_poll": "every poll",
-        "dust_label_hours": "{hours}h",
-        "dust_label_minutes": "{mins}m",
-        "dust_label_seconds": "{sec}s",
+        "dust_label_every_poll": "every poll (no batching)",
+        "dust_label_hours": "every {hours}h",
+        "dust_label_minutes": "every {mins}m",
+        "dust_label_seconds": "every {sec}s",
+        "dust_btn_hours": "{hours}h",
+        "dust_btn_minutes": "{mins}m",
+        "dust_btn_seconds": "{sec}s",
         "btn_chatdef_open": "💨 Micro-fill defaults",
         "chatdef_picker_title": "💨 <b>Micro-fill defaults</b> (this chat)",
         "chatdef_picker_floor": "💰 <b>Default floor:</b> ${usd:.2f}{fallback} — applies to wallets that haven't set their own",
@@ -720,18 +723,22 @@ I18N = {
         "minfill_bad_amount": "金额必须 ≥ 0。",
         "minfill_bad_number": "回复必须是非负数字（例如 1.5）。",
         "dust_summary": "💨 今次有 {count} 笔小额，共 ${usd:,.2f}",
-        "minfill_picker_title": "💨 <b>小额设置</b> · <code>{addr}</code>",
-        "minfill_picker_floor": "💰 <b>阈值：</b>${usd:.2f}{fallback} — 低于此值折叠成汇总",
-        "minfill_picker_interval": "⏱ <b>多久汇总一次：</b>{interval}{fallback}",
-        "minfill_picker_fallback": "<i>（全局默认）</i>",
-        "minfill_picker_hint": "点按钮切换 — ✏️ 是自定义。",
-        "minfill_preset_off": "$0 关闭",
+        "minfill_picker_title": "💨 <b>小额提醒设置</b> · <code>{addr}</code>",
+        "minfill_picker_floor": "💰 <b>成交额小于多少美元不单独提醒：</b>${usd:.2f}{fallback}",
+        "minfill_picker_interval": "⏱ <b>这些小额多久合并提醒一次：</b>{interval}{fallback}",
+        "minfill_picker_fallback": "<i>（跟随默认）</i>",
+        "minfill_picker_hint": (
+            "例：金额 $1、间隔 8 小时 = 小于 $1 的成交不立刻提醒，"
+            "攒够 8 小时合并成一条「💨 今次有 N 笔小额，共 $X」。\n"
+            "点按钮改，✏️ 自定义。"
+        ),
+        "minfill_preset_off": "🌐 默认",
         "btn_minfill_custom": "✏️",
-        "minfill_custom_prompt": "回复一个美元数（例如 <code>1.5</code>），填 0 代表关闭。",
-        "btn_dust": "💨 小额",
+        "minfill_custom_prompt": "回复一个美元数（例如 <code>1.5</code>）。填 0 = 跟随默认。",
+        "btn_dust": "💨 小额提醒",
         "btn_dustinterval_custom": "✏️",
         "btn_dustinterval_default": "🌐 默认",
-        "dustinterval_preset_every_poll": "每次",
+        "dustinterval_preset_every_poll": "每笔都发",
         "dustinterval_custom_prompt": (
             "回复一个间隔："
             "<code>30m</code>、<code>8h</code>、<code>3600</code>（秒）、"
@@ -744,17 +751,25 @@ I18N = {
         "dustinterval_set_default": (
             "💨 <code>{addr}</code> 已改回跟随全局小额汇总默认。"
         ),
-        "dust_label_every_poll": "每次轮询都发",
-        "dust_label_hours": "{hours} 小时",
-        "dust_label_minutes": "{mins} 分钟",
-        "dust_label_seconds": "{sec} 秒",
-        "btn_chatdef_open": "💨 小额默认",
-        "chatdef_picker_title": "💨 <b>小额默认设置</b>（本聊天）",
-        "chatdef_picker_floor": "💰 <b>默认阈值：</b>${usd:.2f}{fallback} — 没单独设置的钱包会用这个",
-        "chatdef_picker_interval": "⏱ <b>默认汇总间隔：</b>{interval}{fallback}",
-        "chatdef_picker_fallback": "<i>（系统默认）</i>",
-        "chatdef_picker_hint": "单钱包自己设的值还是优先。",
-        "chatdef_saved": "💨 默认设置已保存。",
+        "dust_label_every_poll": "不合并，每笔都发",
+        "dust_label_hours": "每 {hours} 小时一次",
+        "dust_label_minutes": "每 {mins} 分钟一次",
+        "dust_label_seconds": "每 {sec} 秒一次",
+        "dust_btn_hours": "{hours} 小时",
+        "dust_btn_minutes": "{mins} 分钟",
+        "dust_btn_seconds": "{sec} 秒",
+        "btn_chatdef_open": "💨 小额提醒默认",
+        "chatdef_picker_title": "💨 <b>小额提醒 · 本聊天默认</b>",
+        "chatdef_picker_floor": "💰 <b>成交额小于多少美元不单独提醒：</b>${usd:.2f}{fallback}",
+        "chatdef_picker_interval": "⏱ <b>这些小额多久合并提醒一次：</b>{interval}{fallback}",
+        "chatdef_picker_fallback": "<i>（当前使用系统内置值）</i>",
+        "chatdef_picker_hint": (
+            "例：金额 $1、间隔 8 小时 = 小于 $1 的成交不立刻提醒，"
+            "攒够 8 小时合并成一条「💨 今次有 N 笔小额，共 $X」。\n\n"
+            "这是本聊天所有钱包的默认；单钱包在 /list 的 💨 按钮里"
+            "自己调过的会优先。点按钮改，✏️ 自定义。"
+        ),
+        "chatdef_saved": "💨 默认已保存。",
         "usage_alert": "用法：/alert 地址或备注 结果名 >=|<= 价格(0-100)",
         "alert_bad_outcome": "该钱包当前持仓中未找到该结果。",
         "alert_bad_op": "运算符只能是 >= 或 <=。",
@@ -904,9 +919,14 @@ I18N = {
             "显示当前语言、全局轮询间隔、监控数和静音数，下面有语言切换按钮。"
         ),
         "help_cmd_defaults": (
-            "<b>/defaults</b> — 聊天级小额默认\n\n"
-            "统一设置本聊天里所有钱包共享的小额阈值和汇总间隔，适用于没在 /list 的 💨 按钮"
-            "里单独调过的钱包。单钱包自己的设置始终优先。"
+            "<b>/defaults</b> — 小额提醒默认\n\n"
+            "<b>小于某个美元的成交不单独提醒</b>，而是攒起来每隔一段时间"
+            "合并成一条「💨 今次有 N 笔小额，共 $X」，免得刷屏。\n\n"
+            "这里设两个数字：\n"
+            "• <b>多小算小额</b>（例：$1 = 交易额 &lt; $1 的成交不单独提醒）\n"
+            "• <b>多久合并一次</b>（例：8 小时 = 攒 8 小时发一条汇总）\n\n"
+            "设好后，本聊天所有没单独调过的钱包都跟这个默认。"
+            "想给某个钱包单独调，去 /list 点它的 💨 按钮。"
         ),
         "help_cmd_lang": (
             "<b>/lang</b> — 切换机器人语言\n\n"
@@ -3025,7 +3045,7 @@ DUSTINTERVAL_PRESETS: tuple[int, ...] = (-1, 1800, 3600, 28800)
 
 
 def _fmt_dust_interval(chat_id: int, sec: int) -> str:
-    """Human-readable label for an effective dust-interval in seconds.
+    """Human-readable label for an effective dust-interval (used in the body).
 
     `sec == 0` here represents "every poll" (effective); callers that need to
     distinguish "follow global" should pass the resolved value in.
@@ -3104,13 +3124,14 @@ def _minfill_body(chat_id: int, addr: str, target: WatchedWallet) -> str:
 
 
 def _dust_preset_label(chat_id: int, sec: int) -> str:
+    """Short label for an interval preset button — keeps buttons compact."""
     if sec < 0:
         return t(chat_id, "dustinterval_preset_every_poll")
     if sec % 3600 == 0:
-        return t(chat_id, "dust_label_hours", hours=sec // 3600)
+        return t(chat_id, "dust_btn_hours", hours=sec // 3600)
     if sec % 60 == 0:
-        return t(chat_id, "dust_label_minutes", mins=sec // 60)
-    return t(chat_id, "dust_label_seconds", sec=sec)
+        return t(chat_id, "dust_btn_minutes", mins=sec // 60)
+    return t(chat_id, "dust_btn_seconds", sec=sec)
 
 
 def _minfill_keyboard(chat_id: int, addr: str, target: WatchedWallet) -> InlineKeyboardMarkup:
