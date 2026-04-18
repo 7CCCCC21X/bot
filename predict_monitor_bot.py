@@ -329,14 +329,34 @@ I18N = {
         "minfill_bad_amount": "Amount must be ≥ 0.",
         "minfill_bad_number": "Reply must be a non-negative number (e.g. 1.5).",
         "dust_summary": "💨 {count} dust fills folded (${usd:,.2f} total)",
-        "minfill_picker_title": "💨 <b>Dust floor</b> · <code>{addr}</code>",
-        "minfill_picker_current": "Current: <b>${usd:.2f}</b>{fallback}",
-        "minfill_picker_fallback": " <i>(fallback from global)</i>",
-        "minfill_picker_hint": "Pick a preset or ✏️ Custom to type your own.",
+        "minfill_picker_title": "💨 <b>Micro-fill settings</b> · <code>{addr}</code>",
+        "minfill_picker_floor": "💰 <b>Floor:</b> ${usd:.2f}{fallback} — fills below this fold into a summary",
+        "minfill_picker_interval": "⏱ <b>Summary every:</b> {interval}{fallback}",
+        "minfill_picker_fallback": " <i>(global default)</i>",
+        "minfill_picker_hint": "Tap a preset to change — ✏️ for custom.",
         "minfill_preset_off": "$0 off",
-        "btn_minfill_custom": "✏️ Custom",
+        "btn_minfill_custom": "✏️",
         "minfill_custom_prompt": "Reply with a USD amount (e.g. <code>1.5</code>). 0 = off.",
-        "btn_dust": "💨 Dust",
+        "btn_dust": "💨 Micro-fills",
+        "btn_dustinterval_custom": "✏️",
+        "btn_dustinterval_default": "🌐 Default",
+        "dustinterval_preset_every_poll": "Every poll",
+        "dustinterval_custom_prompt": (
+            "Reply with an interval: "
+            "<code>30m</code>, <code>8h</code>, <code>3600</code> (seconds), "
+            "<code>off</code> = every poll, <code>default</code> = use global."
+        ),
+        "dustinterval_bad_input": (
+            "Unrecognized. Try e.g. <code>30m</code>, <code>8h</code>, "
+            "<code>off</code>, or <code>default</code>. Minimum custom value is 30s."
+        ),
+        "dustinterval_set_default": (
+            "💨 <code>{addr}</code> will follow the global dust-summary default."
+        ),
+        "dust_label_every_poll": "every poll",
+        "dust_label_hours": "{hours}h",
+        "dust_label_minutes": "{mins}m",
+        "dust_label_seconds": "{sec}s",
         # --- Alerts ---
         "usage_alert": "Usage: /alert addr|alias outcome >=|<= price(0-100)",
         "alert_bad_outcome": "Outcome not found for this wallet's position.",
@@ -683,14 +703,34 @@ I18N = {
         "minfill_bad_amount": "金额必须 ≥ 0。",
         "minfill_bad_number": "回复必须是非负数字（例如 1.5）。",
         "dust_summary": "💨 今次有 {count} 笔微单，共 ${usd:,.2f}",
-        "minfill_picker_title": "💨 <b>微单阈值</b> · <code>{addr}</code>",
-        "minfill_picker_current": "当前：<b>${usd:.2f}</b>{fallback}",
-        "minfill_picker_fallback": " <i>（来自全局默认）</i>",
-        "minfill_picker_hint": "选一个预设，或点「✏️ 自定义」手动输入。",
+        "minfill_picker_title": "💨 <b>微单设置</b> · <code>{addr}</code>",
+        "minfill_picker_floor": "💰 <b>阈值：</b>${usd:.2f}{fallback} — 低于此值折叠成汇总",
+        "minfill_picker_interval": "⏱ <b>多久汇总一次：</b>{interval}{fallback}",
+        "minfill_picker_fallback": "<i>（全局默认）</i>",
+        "minfill_picker_hint": "点按钮切换 — ✏️ 是自定义。",
         "minfill_preset_off": "$0 关闭",
-        "btn_minfill_custom": "✏️ 自定义",
+        "btn_minfill_custom": "✏️",
         "minfill_custom_prompt": "回复一个美元数（例如 <code>1.5</code>），填 0 代表关闭。",
-        "btn_dust": "💨 阈值",
+        "btn_dust": "💨 微单",
+        "btn_dustinterval_custom": "✏️",
+        "btn_dustinterval_default": "🌐 默认",
+        "dustinterval_preset_every_poll": "每次",
+        "dustinterval_custom_prompt": (
+            "回复一个间隔："
+            "<code>30m</code>、<code>8h</code>、<code>3600</code>（秒）、"
+            "<code>off</code>（每次都发）、<code>default</code>（回到全局默认）。"
+        ),
+        "dustinterval_bad_input": (
+            "看不懂。试试 <code>30m</code>、<code>8h</code>、"
+            "<code>off</code> 或 <code>default</code>，自定义数值最少 30 秒。"
+        ),
+        "dustinterval_set_default": (
+            "💨 <code>{addr}</code> 已改回跟随全局微单汇总默认。"
+        ),
+        "dust_label_every_poll": "每次轮询都发",
+        "dust_label_hours": "{hours} 小时",
+        "dust_label_minutes": "{mins} 分钟",
+        "dust_label_seconds": "{sec} 秒",
         "usage_alert": "用法：/alert 地址或备注 结果名 >=|<= 价格(0-100)",
         "alert_bad_outcome": "该钱包当前持仓中未找到该结果。",
         "alert_bad_op": "运算符只能是 >= 或 <=。",
@@ -2859,86 +2899,155 @@ async def cmd_dustinterval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not target:
         await update.message.reply_text(t(chat_id, "not_found"))
         return
-    raw = ctx.args[1].strip().lower()
-    if raw in ("off", "disable", "disabled", "关闭", "每次"):
-        sec = -1
-    else:
-        mult = 1
-        if raw.endswith("m"):
-            raw, mult = raw[:-1], 60
-        elif raw.endswith("h"):
-            raw, mult = raw[:-1], 3600
-        elif raw.endswith("s"):
-            raw = raw[:-1]
-        try:
-            sec = int(raw) * mult
-        except ValueError:
-            await update.message.reply_text(t(chat_id, "usage_dustinterval"))
-            return
-        if sec < -1 or (sec > 0 and sec < 30):
-            await update.message.reply_text(t(chat_id, "dustinterval_too_small"))
-            return
+    sec = _parse_dust_interval_raw(ctx.args[1])
+    if sec is None:
+        await update.message.reply_text(t(chat_id, "dustinterval_too_small"))
+        return
+    await _apply_dust_interval(ctx, chat_id, addr, target, sec)
+
+
+async def _apply_dust_interval(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    addr: str,
+    target: WatchedWallet,
+    sec: int,
+):
+    """Persist a new dust interval and send the right confirmation message."""
     target.dust_interval_s = sec
-    # Changing the setting mid-batch: switching to 0/-1 will drain on the
-    # next poll. A new positive value restarts the batch window.
+    # Switching to 0/-1 lets the next poll drain; a new positive value
+    # restarts the batch window so it honors the new duration.
     if sec > 0 and target.pending_dust_fills:
         target.last_dust_flush = time.time()
+    save_watch(target)
     if sec == -1:
         reply = t(chat_id, "dustinterval_off", addr=fmt_addr(addr))
+    elif sec == 0:
+        reply = t(chat_id, "dustinterval_set_default", addr=fmt_addr(addr))
     else:
         reply = t(chat_id, "dustinterval_set", addr=fmt_addr(addr), sec=sec)
-    await update.message.reply_text(reply, parse_mode="HTML")
+    await ctx.bot.send_message(chat_id=chat_id, text=reply, parse_mode="HTML")
 
 
 MINFILL_PRESETS: tuple[float, ...] = (0.0, 0.5, 1.0, 5.0)
+# Dust-interval presets, in seconds. -1 is the "every poll" sentinel; 0 is
+# not a preset because it means "follow global default" (available via the
+# dedicated Default button).
+DUSTINTERVAL_PRESETS: tuple[int, ...] = (-1, 1800, 3600, 28800)
+
+
+def _fmt_dust_interval(chat_id: int, sec: int) -> str:
+    """Human-readable label for an effective dust-interval in seconds.
+
+    `sec == 0` here represents "every poll" (effective); callers that need to
+    distinguish "follow global" should pass the resolved value in.
+    """
+    if sec <= 0:
+        return t(chat_id, "dust_label_every_poll")
+    if sec % 3600 == 0:
+        return t(chat_id, "dust_label_hours", hours=sec // 3600)
+    if sec % 60 == 0:
+        return t(chat_id, "dust_label_minutes", mins=sec // 60)
+    return t(chat_id, "dust_label_seconds", sec=sec)
+
+
+def _effective_dust_interval(target: WatchedWallet) -> int:
+    """Resolve the effective interval honoring -1/0/positive sentinels."""
+    if target.dust_interval_s < 0:
+        return 0
+    if target.dust_interval_s > 0:
+        return target.dust_interval_s
+    return DUST_INTERVAL
 
 
 def _minfill_body(chat_id: int, addr: str, target: WatchedWallet) -> str:
-    """Picker message body showing current effective dust floor."""
-    effective = target.min_fill_usd if target.min_fill_usd > 0 else MIN_FILL_USD
-    fallback = (
+    """Picker body: shows both dust floor and dust-summary interval."""
+    floor = target.min_fill_usd if target.min_fill_usd > 0 else MIN_FILL_USD
+    floor_fallback = (
         t(chat_id, "minfill_picker_fallback")
         if target.min_fill_usd == 0 and MIN_FILL_USD > 0
         else ""
     )
+    interval_sec = _effective_dust_interval(target)
+    interval_label = _fmt_dust_interval(chat_id, interval_sec)
+    interval_fallback = (
+        t(chat_id, "minfill_picker_fallback") if target.dust_interval_s == 0 else ""
+    )
     return "\n".join(
         [
             t(chat_id, "minfill_picker_title", addr=fmt_addr(addr)),
-            t(chat_id, "minfill_picker_current", usd=effective, fallback=fallback),
+            "",
+            t(chat_id, "minfill_picker_floor", usd=floor, fallback=floor_fallback),
+            t(
+                chat_id,
+                "minfill_picker_interval",
+                interval=interval_label,
+                fallback=interval_fallback,
+            ),
+            "",
             t(chat_id, "minfill_picker_hint"),
         ]
     )
 
 
+def _dust_preset_label(chat_id: int, sec: int) -> str:
+    if sec < 0:
+        return t(chat_id, "dustinterval_preset_every_poll")
+    if sec % 3600 == 0:
+        return t(chat_id, "dust_label_hours", hours=sec // 3600)
+    if sec % 60 == 0:
+        return t(chat_id, "dust_label_minutes", mins=sec // 60)
+    return t(chat_id, "dust_label_seconds", sec=sec)
+
+
 def _minfill_keyboard(chat_id: int, addr: str, target: WatchedWallet) -> InlineKeyboardMarkup:
+    # Row 1 — dust-floor presets (💰).
     current = target.min_fill_usd
-    preset_row = []
+    floor_row = []
     for usd in MINFILL_PRESETS:
         if usd == 0:
             label = t(chat_id, "minfill_preset_off")
         else:
             label = f"${usd:g}"
-        # Highlight the currently selected preset with a checkmark.
         if abs(current - usd) < 1e-6:
             label = f"✅ {label}"
-        preset_row.append(
+        floor_row.append(
             InlineKeyboardButton(label, callback_data=f"minfill:set:{addr}:{usd:g}")
         )
-    return InlineKeyboardMarkup(
-        [
-            preset_row,
-            [
-                InlineKeyboardButton(
-                    t(chat_id, "btn_minfill_custom"),
-                    callback_data=f"minfill:custom:{addr}",
-                ),
-                InlineKeyboardButton(
-                    t(chat_id, "btn_back"),
-                    callback_data=f"minfill:close:{addr}",
-                ),
-            ],
-        ]
+    floor_row.append(
+        InlineKeyboardButton(
+            t(chat_id, "btn_minfill_custom"),
+            callback_data=f"minfill:custom:{addr}",
+        )
     )
+
+    # Row 2 — dust-interval presets (⏱).
+    interval_row = []
+    for sec in DUSTINTERVAL_PRESETS:
+        label = _dust_preset_label(chat_id, sec)
+        if sec == target.dust_interval_s:
+            label = f"✅ {label}"
+        interval_row.append(
+            InlineKeyboardButton(label, callback_data=f"minfill:dset:{addr}:{sec}")
+        )
+    interval_row.append(
+        InlineKeyboardButton(
+            t(chat_id, "btn_dustinterval_custom"),
+            callback_data=f"minfill:dcustom:{addr}",
+        )
+    )
+
+    # Row 3 — follow-global + back.
+    default_label = t(chat_id, "btn_dustinterval_default")
+    if target.dust_interval_s == 0:
+        default_label = f"✅ {default_label}"
+    bottom_row = [
+        InlineKeyboardButton(default_label, callback_data=f"minfill:ddefault:{addr}"),
+        InlineKeyboardButton(
+            t(chat_id, "btn_back"), callback_data=f"minfill:close:{addr}"
+        ),
+    ]
+    return InlineKeyboardMarkup([floor_row, interval_row, bottom_row])
 
 
 async def _show_minfill_picker(
@@ -2985,6 +3094,46 @@ def _set_pending_minfill(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, addr: str
 
 def _pop_pending_minfill(ctx: ContextTypes.DEFAULT_TYPE) -> dict | None:
     return ctx.user_data.pop("pending_minfill", None)
+
+
+def _set_pending_dustinterval(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, addr: str):
+    ctx.user_data["pending_dustinterval"] = {"chat_id": chat_id, "address": addr}
+
+
+def _pop_pending_dustinterval(ctx: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    return ctx.user_data.pop("pending_dustinterval", None)
+
+
+def _parse_dust_interval_raw(raw: str) -> int | None:
+    """Parse a user-supplied interval string into a stored sentinel value.
+
+    Returns the integer seconds to persist (-1 = off, 0 = follow global,
+    positive = custom). Returns None when the input is unparseable or the
+    value is out of range (nonzero positive below 30s).
+    """
+    raw = raw.strip().lower().lstrip("=")
+    if not raw:
+        return None
+    if raw in ("off", "disable", "disabled", "关闭", "每次"):
+        return -1
+    if raw in ("default", "global", "默认", "全局"):
+        return 0
+    mult = 1
+    if raw.endswith("m"):
+        raw, mult = raw[:-1], 60
+    elif raw.endswith("h"):
+        raw, mult = raw[:-1], 3600
+    elif raw.endswith("s"):
+        raw = raw[:-1]
+    try:
+        sec = int(raw) * mult
+    except ValueError:
+        return None
+    if sec < -1:
+        return None
+    if sec > 0 and sec < 30:
+        return None
+    return sec
 
 
 async def cmd_minfill(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3403,6 +3552,25 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Dust-interval custom reply (from the picker's ✏️ button).
+    pending_dust = ctx.user_data.get("pending_dustinterval")
+    if pending_dust and pending_dust.get("chat_id") == chat_id:
+        addr = pending_dust.get("address") or ""
+        target = watched.get(chat_id, {}).get(addr)
+        if not target:
+            _pop_pending_dustinterval(ctx)
+            return
+        sec = _parse_dust_interval_raw(update.message.text or "")
+        if sec is None:
+            await update.message.reply_text(
+                t(chat_id, "dustinterval_bad_input"),
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        _pop_pending_dustinterval(ctx)
+        await _apply_dust_interval(ctx, chat_id, addr, target, sec)
+        return
+
     pending = _pop_pending_note_edit(ctx)
     if not pending or pending.get("chat_id") != chat_id:
         return
@@ -3627,7 +3795,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _prompt_watch_reply(ctx, chat_id)
         return
 
-    # Dust-floor picker: minfill:{open|set|custom|close}:{addr}[:{usd}]
+    # Dust picker: minfill:{open|set|custom|close|dset|dcustom|ddefault}:{addr}[:{value}]
+    # (the prefix is "minfill" for legacy reasons; the picker now covers both
+    # the dust floor and the dust-summary interval)
     if data.startswith("minfill:"):
         parts = data.split(":", 3)
         action = parts[1] if len(parts) > 1 else ""
@@ -3658,6 +3828,37 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.bot.send_message(
                 chat_id=chat_id,
                 text=t(chat_id, "minfill_custom_prompt"),
+                parse_mode="HTML",
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        if action == "dset" and len(parts) >= 4:
+            try:
+                sec = int(parts[3])
+            except ValueError:
+                return
+            if sec < -1 or (sec > 0 and sec < 30):
+                return
+            prev = target.dust_interval_s
+            target.dust_interval_s = sec
+            # Restart the batch window if we just switched to a new positive
+            # interval while dust was buffered; switching to 0/-1 lets the
+            # next poll drain naturally.
+            if sec > 0 and target.pending_dust_fills and prev != sec:
+                target.last_dust_flush = time.time()
+            save_watch(target)
+            await _show_minfill_picker(None, ctx, chat_id, addr, query=query)
+            return
+        if action == "ddefault":
+            target.dust_interval_s = 0
+            save_watch(target)
+            await _show_minfill_picker(None, ctx, chat_id, addr, query=query)
+            return
+        if action == "dcustom":
+            _set_pending_dustinterval(ctx, chat_id, addr)
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=t(chat_id, "dustinterval_custom_prompt"),
                 parse_mode="HTML",
                 reply_markup=ForceReply(selective=True),
             )
