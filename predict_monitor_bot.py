@@ -310,14 +310,20 @@ I18N = {
         "interval_set": "⏱ Poll interval for <code>{addr}</code>: {sec}s",
         "interval_too_small": "Interval must be 0 (global) or ≥ 5 seconds.",
         "usage_dustinterval": (
-            "Usage: /dustinterval addr|alias seconds  "
-            "(0 = use global default, suffix m/h allowed, e.g. 8h)"
+            "Usage: /dustinterval addr|alias seconds|off  "
+            "(0 = global default, off = every poll, suffix m/h allowed)"
         ),
         "dustinterval_set": (
             "💨 Dust-summary interval for <code>{addr}</code>: {sec}s "
             "(0 = global default)"
         ),
-        "dustinterval_too_small": "Dust interval must be 0 (global default) or ≥ 30 seconds.",
+        "dustinterval_off": (
+            "💨 Dust batching disabled for <code>{addr}</code> — "
+            "every poll fires a summary."
+        ),
+        "dustinterval_too_small": (
+            "Dust interval must be 0 (global default), off, or ≥ 30 seconds."
+        ),
         "usage_minfill": "Usage: /minfill addr|alias [usd]  (no amount → picker)",
         "minfill_set": "💨 Dust floor for <code>{addr}</code>: ${usd:.2f}",
         "minfill_bad_amount": "Amount must be ≥ 0.",
@@ -486,10 +492,12 @@ I18N = {
             "Sub-threshold fills accumulate and flush together once the window elapses, "
             "instead of firing a 💨 summary every poll. "
             "The default is <b>8 hours</b>; 0 falls back to the global default, "
+            "<code>off</code> disables batching on that wallet (fires every poll), "
             "minimum when overridden is 30 seconds. Suffix m/h allowed.\n\n"
             "<b>Usage</b>\n"
             "• <code>/dustinterval alice 8h</code>  (one summary every 8 hours)\n"
             "• <code>/dustinterval alice 5m</code>  (one summary every 5 minutes)\n"
+            "• <code>/dustinterval alice off</code>  (disable batching — every poll)\n"
             "• <code>/dustinterval alice 0</code>  (use the global default)"
         ),
         "help_cmd_settings": (
@@ -660,13 +668,16 @@ I18N = {
         "interval_set": "⏱ <code>{addr}</code> 轮询间隔：{sec} 秒",
         "interval_too_small": "间隔必须为 0（使用全局）或 ≥ 5 秒。",
         "usage_dustinterval": (
-            "用法：/dustinterval 地址或备注 秒"
-            "（0 = 使用全局默认，可加 m/h 后缀，如 8h）"
+            "用法：/dustinterval 地址或备注 秒|off"
+            "（0 = 使用全局默认，off = 每次轮询都发，可加 m/h 后缀）"
         ),
         "dustinterval_set": (
             "💨 <code>{addr}</code> 微单汇总间隔：{sec} 秒（0 = 全局默认）"
         ),
-        "dustinterval_too_small": "微单汇总间隔必须为 0（全局默认）或 ≥ 30 秒。",
+        "dustinterval_off": (
+            "💨 <code>{addr}</code> 微单节流已关闭——每次轮询都发汇总。"
+        ),
+        "dustinterval_too_small": "微单汇总间隔必须为 0（全局默认）、off，或 ≥ 30 秒。",
         "usage_minfill": "用法：/minfill 地址或备注 [金额]（不填金额弹选择器）",
         "minfill_set": "💨 <code>{addr}</code> 微单阈值：${usd:.2f}",
         "minfill_bad_amount": "金额必须 ≥ 0。",
@@ -816,10 +827,12 @@ I18N = {
             "<b>/dustinterval</b> — 微单汇总节流\n\n"
             "微单会在内存里堆积，到达间隔后才合并成一条 💨 汇总提醒，"
             "不再每次轮询都打扰。默认 <b>8 小时</b>；填 0 = 使用全局默认；"
+            "填 <code>off</code> = 该钱包彻底关掉节流（每次轮询都发）；"
             "自定义时最小 30 秒；可加 m/h 后缀。\n\n"
             "<b>用法</b>\n"
             "• <code>/dustinterval 张三 8h</code>（每 8 小时汇总一次）\n"
             "• <code>/dustinterval 张三 5m</code>（每 5 分钟汇总一次）\n"
+            "• <code>/dustinterval 张三 off</code>（关闭节流，每次轮询都发）\n"
             "• <code>/dustinterval 张三 0</code>（回到全局默认）"
         ),
         "help_cmd_settings": (
@@ -2833,7 +2846,9 @@ async def cmd_dustinterval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Set per-wallet dust-summary flush interval.
 
     Accepts an integer number of seconds, or a trailing unit: "5m" = 300s,
-    "1h" = 3600s. 0 disables batching (legacy: flush every poll).
+    "1h" = 3600s. Stored sentinels: 0 = fall back to global default, -1 =
+    explicitly disabled (every poll). Users can also pass "off" / "关闭"
+    to disable batching on a single wallet.
     """
     chat_id = update.effective_chat.id
     if len(ctx.args) < 2:
@@ -2845,32 +2860,34 @@ async def cmd_dustinterval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t(chat_id, "not_found"))
         return
     raw = ctx.args[1].strip().lower()
-    mult = 1
-    if raw.endswith("m"):
-        raw, mult = raw[:-1], 60
-    elif raw.endswith("h"):
-        raw, mult = raw[:-1], 3600
-    elif raw.endswith("s"):
-        raw = raw[:-1]
-    try:
-        sec = int(raw) * mult
-    except ValueError:
-        await update.message.reply_text(t(chat_id, "usage_dustinterval"))
-        return
-    if sec < 0 or (sec != 0 and sec < 30):
-        await update.message.reply_text(t(chat_id, "dustinterval_too_small"))
-        return
+    if raw in ("off", "disable", "disabled", "关闭", "每次"):
+        sec = -1
+    else:
+        mult = 1
+        if raw.endswith("m"):
+            raw, mult = raw[:-1], 60
+        elif raw.endswith("h"):
+            raw, mult = raw[:-1], 3600
+        elif raw.endswith("s"):
+            raw = raw[:-1]
+        try:
+            sec = int(raw) * mult
+        except ValueError:
+            await update.message.reply_text(t(chat_id, "usage_dustinterval"))
+            return
+        if sec < -1 or (sec > 0 and sec < 30):
+            await update.message.reply_text(t(chat_id, "dustinterval_too_small"))
+            return
     target.dust_interval_s = sec
-    # Changing the setting mid-batch: if the new interval is 0, the next
-    # poll will drain whatever was buffered. If it's a new nonzero value,
-    # restart the batch window so it honors the new duration.
+    # Changing the setting mid-batch: switching to 0/-1 will drain on the
+    # next poll. A new positive value restarts the batch window.
     if sec > 0 and target.pending_dust_fills:
         target.last_dust_flush = time.time()
-    save_watch(target)
-    await update.message.reply_text(
-        t(chat_id, "dustinterval_set", addr=fmt_addr(addr), sec=sec),
-        parse_mode="HTML",
-    )
+    if sec == -1:
+        reply = t(chat_id, "dustinterval_off", addr=fmt_addr(addr))
+    else:
+        reply = t(chat_id, "dustinterval_set", addr=fmt_addr(addr), sec=sec)
+    await update.message.reply_text(reply, parse_mode="HTML")
 
 
 MINFILL_PRESETS: tuple[float, ...] = (0.0, 0.5, 1.0, 5.0)
@@ -4032,15 +4049,19 @@ async def poll_loop(app: Application):
                         # interval is >0, defer this poll's dust fills into
                         # w.pending_dust_fills and only flush after the
                         # interval has elapsed since the batch window
-                        # started. Interval of 0 keeps the legacy behavior
-                        # (flush every poll). last_dust_flush==0 means "no
-                        # active batch window"; it's stamped when the first
-                        # dust of a batch arrives and reset on flush.
-                        effective_dust_interval = (
-                            w.dust_interval_s
-                            if w.dust_interval_s > 0
-                            else DUST_INTERVAL
-                        )
+                        # started. Effective value of 0 = flush every poll.
+                        # Per-wallet semantics: -1 = explicitly disabled
+                        # (every poll), 0 = fall back to global default,
+                        # positive = custom interval.
+                        # last_dust_flush==0 means "no active batch
+                        # window"; it's stamped when the first dust of a
+                        # batch arrives and reset on flush.
+                        if w.dust_interval_s < 0:
+                            effective_dust_interval = 0
+                        elif w.dust_interval_s > 0:
+                            effective_dust_interval = w.dust_interval_s
+                        else:
+                            effective_dust_interval = DUST_INTERVAL
                         dust_to_emit: list[dict] = []
                         if dust_fills:
                             if effective_dust_interval > 0:
