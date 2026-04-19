@@ -2343,6 +2343,18 @@ async def _render_orders(
     async with aiohttp.ClientSession() as session:
         matches = await fetch_order_matches(session, addr, first=ORDERS_FETCH_LIMIT)
         positions, positions_by_key = await _fetch_positions_with_markets(session, addr)
+        # The orders API returns a stub market on each match (usually just id
+        # + a few fields), which leaves market_url() without a slug and
+        # produces /market/{uuid} links that 404. Backfill with the cached
+        # /v1/markets/{id} payload so title + slug line up with the page the
+        # user actually traded.
+        for m in matches or []:
+            mm = m.get("market") if isinstance(m.get("market"), dict) else {}
+            mid = mm.get("id")
+            if mid:
+                fresh = await fetch_market(session, mid)
+                if fresh:
+                    m["market"] = {**mm, **fresh}
 
     if matches is None and positions is None:
         return t(chat_id, "fetch_error_msg"), None
@@ -4490,9 +4502,22 @@ async def poll_loop(app: Application):
                         positions = positions_raw or []
                         matches = matches_raw or []
                         market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
+                        for m in matches:
+                            mm = m.get("market") if isinstance(m.get("market"), dict) else {}
+                            mid = mm.get("id")
+                            if mid:
+                                market_ids.add(mid)
                         markets = {mid: await fetch_market(session, mid) for mid in market_ids}
                         for p in positions:
                             p["_market"] = markets.get(p.get("marketId"), {})
+                        for m in matches:
+                            mm = m.get("market") if isinstance(m.get("market"), dict) else {}
+                            fresh = markets.get(mm.get("id")) or {}
+                            if fresh:
+                                # Merge: fresh /v1/markets/{id} fields (slug,
+                                # title, …) take precedence over the stub the
+                                # orders API returned.
+                                m["market"] = {**mm, **fresh}
                         positions_by_key = {pos_key(p): p for p in positions}
 
                         if positions_ok:
