@@ -224,9 +224,9 @@ I18N = {
         "fmt_changed": "🔄 Changed",
         "fmt_closed": "🔴 Closed",
         "fmt_more": "\n\n...and {count} more",
-        "poll_header": "<b>Predict.fun</b> <code>{addr}</code>\n\n",
+        "poll_header": "<b>Predict.fun</b> <code>{addr}</code>{note}\n\n",
         "closed_item": "Closed: {key}",
-        "fills_header": "<b>Order Fill</b> <code>{addr}</code>\n\n",
+        "fills_header": "<b>Order Fill</b> <code>{addr}</code>{note}\n\n",
         "label_size": "Size",
         "label_value": "Value",
         "label_tx": "Tx",
@@ -306,7 +306,7 @@ I18N = {
         "resolve_win": "🏆 你的仓位命中了（held outcome won）",
         "resolve_lose": "💀 你的仓位未命中（held outcome lost）",
         "label_resolve_outcome": "Winning outcome",
-        "poll_resolve_header": "🏁 <b>Market resolved</b> <code>{addr}</code>\n\n",
+        "poll_resolve_header": "🏁 <b>Market resolved</b> <code>{addr}</code>{note}\n\n",
         # --- Threshold / interval ---
         "usage_threshold": "Usage: /threshold addr|alias pct",
         "threshold_set": "🎚 Min-change filter for <code>{addr}</code>: {pct}%",
@@ -621,9 +621,9 @@ I18N = {
         "fmt_changed": "🔄 持仓变化",
         "fmt_closed": "🔴 已平仓",
         "fmt_more": "\n\n...还有 {count} 条变动",
-        "poll_header": "<b>Predict.fun</b> <code>{addr}</code>\n\n",
+        "poll_header": "<b>Predict.fun</b> <code>{addr}</code>{note}\n\n",
         "closed_item": "已平仓：{key}",
-        "fills_header": "<b>订单成交</b> <code>{addr}</code>\n\n",
+        "fills_header": "<b>订单成交</b> <code>{addr}</code>{note}\n\n",
         "label_size": "数量",
         "label_value": "价值",
         "label_tx": "哈希",
@@ -701,7 +701,7 @@ I18N = {
         "resolve_win": "🏆 持仓方向命中",
         "resolve_lose": "💀 持仓方向未命中",
         "label_resolve_outcome": "获胜结果",
-        "poll_resolve_header": "🏁 <b>市场已结算</b> <code>{addr}</code>\n\n",
+        "poll_resolve_header": "🏁 <b>市场已结算</b> <code>{addr}</code>{note}\n\n",
         "usage_threshold": "用法：/threshold 地址或备注 百分比",
         "threshold_set": "🎚 <code>{addr}</code> 最小变动过滤：{pct}%",
         "usage_interval": "用法：/interval 地址或备注 秒（0 = 使用全局）",
@@ -2343,6 +2343,18 @@ async def _render_orders(
     async with aiohttp.ClientSession() as session:
         matches = await fetch_order_matches(session, addr, first=ORDERS_FETCH_LIMIT)
         positions, positions_by_key = await _fetch_positions_with_markets(session, addr)
+        # The orders API returns a stub market on each match (usually just id
+        # + a few fields), which leaves market_url() without a slug and
+        # produces /market/{uuid} links that 404. Backfill with the cached
+        # /v1/markets/{id} payload so title + slug line up with the page the
+        # user actually traded.
+        for m in matches or []:
+            mm = m.get("market") if isinstance(m.get("market"), dict) else {}
+            mid = mm.get("id")
+            if mid:
+                fresh = await fetch_market(session, mid)
+                if fresh:
+                    m["market"] = {**mm, **fresh}
 
     if matches is None and positions is None:
         return t(chat_id, "fetch_error_msg"), None
@@ -2356,7 +2368,7 @@ async def _render_orders(
     start = page * ORDERS_PAGE_SIZE
     chunk = matches[start : start + ORDERS_PAGE_SIZE]
 
-    lines = [t(chat_id, "orders_header", addr=fmt_addr(addr), count=len(matches)), ""]
+    lines = [t(chat_id, "orders_header", addr=addr, count=len(matches)), ""]
     lines.extend(fmt_match(m, chat_id, positions_by_key, address=addr) for m in chunk)
 
     nav: list[InlineKeyboardButton] = []
@@ -4490,9 +4502,22 @@ async def poll_loop(app: Application):
                         positions = positions_raw or []
                         matches = matches_raw or []
                         market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
+                        for m in matches:
+                            mm = m.get("market") if isinstance(m.get("market"), dict) else {}
+                            mid = mm.get("id")
+                            if mid:
+                                market_ids.add(mid)
                         markets = {mid: await fetch_market(session, mid) for mid in market_ids}
                         for p in positions:
                             p["_market"] = markets.get(p.get("marketId"), {})
+                        for m in matches:
+                            mm = m.get("market") if isinstance(m.get("market"), dict) else {}
+                            fresh = markets.get(mm.get("id")) or {}
+                            if fresh:
+                                # Merge: fresh /v1/markets/{id} fields (slug,
+                                # title, …) take precedence over the stub the
+                                # orders API returned.
+                                m["market"] = {**mm, **fresh}
                         positions_by_key = {pos_key(p): p for p in positions}
 
                         if positions_ok:
@@ -4558,7 +4583,8 @@ async def poll_loop(app: Application):
                             w.position_titles = new_titles
                             w.position_snapshot = {pos_key(p): pos_size(p) for p in positions}
                         w.last_check = time.time()
-                        display_addr = fmt_addr(w.address) + (f" · {w.note}" if w.note else "")
+                        display_addr = w.address
+                        display_note = f" · {_html_escape(w.note)}" if w.note else ""
 
                         # --- Detect market resolutions (fires once per market) ---
                         resolutions = _detect_resolutions(
@@ -4596,7 +4622,7 @@ async def poll_loop(app: Application):
                                 parts.append(
                                     f"{t(chat_id, 'fmt_closed')} <b>{_html_escape(title)}</b>"
                                 )
-                            block = t(chat_id, "poll_header", addr=display_addr) + "\n\n".join(parts[:8])
+                            block = t(chat_id, "poll_header", addr=display_addr, note=display_note) + "\n\n".join(parts[:8])
                             if len(parts) > 8:
                                 block += t(chat_id, "fmt_more", count=len(parts) - 8)
                             blocks.append(block)
@@ -4653,7 +4679,7 @@ async def poll_loop(app: Application):
                                     )
                                 )
                             blocks.append(
-                                t(chat_id, "fills_header", addr=display_addr)
+                                t(chat_id, "fills_header", addr=display_addr, note=display_note)
                                 + "\n\n".join(fill_lines)
                             )
 
@@ -4664,7 +4690,7 @@ async def poll_loop(app: Application):
                                     fmt_resolution(chat_id, market, winning_idx, held_idx)
                                 )
                             blocks.append(
-                                t(chat_id, "poll_resolve_header", addr=display_addr)
+                                t(chat_id, "poll_resolve_header", addr=display_addr, note=display_note)
                                 + "\n\n".join(lines)
                             )
 
