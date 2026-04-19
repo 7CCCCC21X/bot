@@ -1402,7 +1402,17 @@ def resolve_addr(chat_id: int, arg: str) -> str | None:
 def market_url(market: dict | None) -> str | None:
     if not isinstance(market, dict):
         return None
-    slug = market.get("slug") or market.get("marketSlug") or market.get("id")
+    # predict.fun's public URL is /market/<category_slug> (e.g.
+    # english-premier-league-winner). The plain ``id`` fallback produces
+    # /market/1565 which hits a placeholder page, so only fall back to it
+    # when no slug-like field is available.
+    slug = (
+        market.get("slug")
+        or market.get("marketSlug")
+        or market.get("categorySlug")
+        or market.get("category_slug")
+        or market.get("id")
+    )
     if not slug:
         return None
     return f"{PREDICT_WEB_BASE.rstrip('/')}/{slug}"
@@ -2094,9 +2104,35 @@ def _fill_usd_value(match: dict, address: str | None) -> float | None:
     return shares * price_c / 100
 
 
+def _match_market_view(match: dict) -> dict:
+    """Return the best market dict for a trade record.
+
+    The orders API returns two shapes depending on endpoint/version: a nested
+    ``match["market"]`` dict (carrying an id plus sometimes a generic category
+    title like "Match Winner") and/or flat per-trade fields
+    ``market_id`` / ``market_title`` / ``category_slug``. The flat fields are
+    the ones that line up with predict.fun's public URL
+    (``/market/<category_slug>``) and with the specific item the trade was
+    against (e.g. "Chelsea"), so we prefer them for title/slug when set,
+    falling back to the nested dict otherwise. Never mutates input.
+    """
+    nested = match.get("market") if isinstance(match.get("market"), dict) else {}
+    out = dict(nested)
+    flat_id = match.get("market_id")
+    if flat_id is not None and not out.get("id"):
+        out["id"] = flat_id
+    flat_title = match.get("market_title")
+    if flat_title:
+        out["title"] = flat_title
+    flat_slug = match.get("category_slug") or match.get("categorySlug")
+    if flat_slug:
+        out["slug"] = flat_slug
+    return out
+
+
 def _fill_market_outcome_key(match: dict) -> str | None:
     """Stable ``marketId_outcomeIndex`` key to match fills against positions."""
-    market = match.get("market") if isinstance(match.get("market"), dict) else {}
+    market = _match_market_view(match)
     market_id = market.get("id") or ""
     taker = match.get("taker") if isinstance(match.get("taker"), dict) else {}
     outcome_obj = None
@@ -2120,13 +2156,18 @@ def fmt_match(
     positions_by_key: dict | None = None,
     address: str | None = None,
 ) -> str:
-    market = match.get("market") if isinstance(match.get("market"), dict) else {}
+    market = _match_market_view(match)
 
     our_side = _pick_user_side(match, address)
     outcome_obj = our_side.get("outcome") if isinstance(our_side.get("outcome"), dict) else {}
 
     title = market.get("title") or market.get("question") or str(market.get("id", "?"))
-    outcome = outcome_obj.get("name") or "?"
+    outcome = (
+        outcome_obj.get("name")
+        or match.get("outcome_name")
+        or match.get("outcomeName")
+        or "?"
+    )
     quote_type = (our_side.get("quoteType") or "").lower()
     side = _side_text(our_side.get("quoteType", "?"), chat_id)
     # Color the side to match the rest of the UI (🟢 gain / 🔴 loss). Bid adds
@@ -2343,18 +2384,23 @@ async def _render_orders(
     async with aiohttp.ClientSession() as session:
         matches = await fetch_order_matches(session, addr, first=ORDERS_FETCH_LIMIT)
         positions, positions_by_key = await _fetch_positions_with_markets(session, addr)
-        # The orders API returns a stub market on each match (usually just id
-        # + a few fields), which leaves market_url() without a slug and
-        # produces /market/{uuid} links that 404. Backfill with the cached
+        # The orders API returns a stub market on each match (sometimes just
+        # an id, sometimes a flat market_id/market_title/category_slug trio),
+        # which leaves market_url() without a proper slug and produces
+        # /market/{uuid} links that 404. Backfill with the cached
         # /v1/markets/{id} payload so title + slug line up with the page the
         # user actually traded.
         for m in matches or []:
-            mm = m.get("market") if isinstance(m.get("market"), dict) else {}
-            mid = mm.get("id")
-            if mid:
-                fresh = await fetch_market(session, mid)
-                if fresh:
-                    m["market"] = {**mm, **fresh}
+            view = _match_market_view(m)
+            mid = view.get("id")
+            fresh = await fetch_market(session, mid) if mid else {}
+            merged = {**view, **(fresh or {})}
+            if view.get("title"):
+                merged["title"] = view["title"]
+            if view.get("slug"):
+                merged["slug"] = view["slug"]
+            if merged:
+                m["market"] = merged
 
     if matches is None and positions is None:
         return t(chat_id, "fetch_error_msg"), None
@@ -4388,8 +4434,18 @@ def _detect_resolutions(
         resolved, winning = market_resolution(market)
         if not resolved:
             continue
+        # predict.fun flips `status` to "closed" when trading ends, which can
+        # happen hours or days before the winning outcome is recorded. Firing
+        # a 市场已结算 alert at that point produces "获胜结果: ?" and, worse,
+        # stamps resolved_markets so the real resolution never alerts. Wait
+        # until a winning index is actually present.
+        if winning is None:
+            continue
         prior = w.resolved_markets.get(str(mid))
-        if prior:
+        # Re-alert if an older build stamped a stub entry with winning=None
+        # before this guard existed — otherwise those wallets would silently
+        # miss the real resolution.
+        if prior and prior.get("winning") is not None:
             continue
         # Try to find which outcome (if any) this wallet held.
         held_idx: int | None = None
@@ -4503,21 +4559,30 @@ async def poll_loop(app: Application):
                         matches = matches_raw or []
                         market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
                         for m in matches:
-                            mm = m.get("market") if isinstance(m.get("market"), dict) else {}
-                            mid = mm.get("id")
+                            mid = _match_market_view(m).get("id")
                             if mid:
                                 market_ids.add(mid)
                         markets = {mid: await fetch_market(session, mid) for mid in market_ids}
                         for p in positions:
                             p["_market"] = markets.get(p.get("marketId"), {})
                         for m in matches:
-                            mm = m.get("market") if isinstance(m.get("market"), dict) else {}
-                            fresh = markets.get(mm.get("id")) or {}
-                            if fresh:
-                                # Merge: fresh /v1/markets/{id} fields (slug,
-                                # title, …) take precedence over the stub the
-                                # orders API returned.
-                                m["market"] = {**mm, **fresh}
+                            view = _match_market_view(m)
+                            fresh = markets.get(view.get("id")) or {}
+                            # Fold both the flat match fields and the cached
+                            # /v1/markets/{id} payload into match["market"] so
+                            # downstream helpers (title, slug, URL) see the
+                            # richest possible dict regardless of which API
+                            # shape the upstream returned.
+                            merged = {**view, **fresh}
+                            # Don't let the generic category title from
+                            # /v1/markets/{id} overwrite a specific per-trade
+                            # market_title the orders API gave us.
+                            if view.get("title"):
+                                merged["title"] = view["title"]
+                            if view.get("slug"):
+                                merged["slug"] = view["slug"]
+                            if merged:
+                                m["market"] = merged
                         positions_by_key = {pos_key(p): p for p in positions}
 
                         if positions_ok:
