@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import re
 import time
 import json
 import sqlite3
@@ -175,7 +176,8 @@ I18N = {
         "btn_watch_guide": "📖 How to find wallet address",
         "watch_reply_prompt": (
             "📝 <b>Reply with a wallet address to watch</b>\n"
-            "<i>Just send a single 0x… address in your reply — no /watch prefix needed.</i>"
+            "<i>Paste a single 0x… address, or one per line for a batch "
+            "(optionally <code>&lt;addr&gt; note</code>). No /watch prefix.</i>"
         ),
         "watch_reply_invalid": (
             "❌ That's not a valid wallet address.\n\n"
@@ -579,7 +581,8 @@ I18N = {
         "btn_watch_guide": "📖 如何找到钱包地址",
         "watch_reply_prompt": (
             "📝 <b>回复这条消息，发送要关注的钱包地址</b>\n"
-            "<i>直接粘贴 0x… 开头的地址即可，不用再输入 /watch。</i>"
+            "<i>一行一个 0x 地址，可在地址后面跟备注（空格、- 或 ：分隔）。"
+            "不用再输入 /watch。</i>"
         ),
         "watch_reply_invalid": (
             "❌ 这不是一个有效的钱包地址。\n\n"
@@ -2487,37 +2490,39 @@ async def _prompt_watch_reply(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
     )
 
 
-_NOTE_SEP_CHARS = "-—–:：·｜|"
+_NOTE_SEP_CHARS = "-—–:：·｜|,，;；"
+_ADDR_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
 
 def _parse_watch_pairs(text: str) -> list[tuple[str, str]]:
     """Parse /watch (or watch-reply) input into (address, note) pairs.
 
+    Rule: **one line = one address**. For every non-blank line we pull the
+    first 0x… address off the line and treat everything after it as the
+    note. Duplicate addresses within the same input (case-insensitive) are
+    folded together so pasting the same wallet twice won't double-count.
+
     Supported shapes:
       - "<addr>"                              → 1 pair, no note
       - "<addr> <note words>"                 → 1 pair with note
-      - "<addr1> <addr2> <addr3>"             → N pairs, no notes
-      - Multi-line, one "<addr>[ sep note]"   → N pairs with per-line notes
-        per line. Common separators (- — – : ：· ｜ |) are trimmed off so
-        users can paste "addr - 备注" or "addr：备注" naturally.
+      - Multi-line "<addr>[ sep note]" per    → N pairs, one per line
+        line (common separators - — – : ： · ｜ | , ， ; ； are trimmed
+        off the note).
+
+    Back-compat: a single-line "<addr1> <addr2> …" paste (the legacy
+    multi-address form) is still accepted — any extra 0x addresses on
+    that one line each become their own pair with an empty note.
     """
     if not text:
         return []
     text = text.lstrip()
-    # Drop a leading slash command ("/watch ...") on the first line so the
-    # first address isn't shadowed by it.
+    # Drop a leading slash command ("/watch ..." or "/watch@bot ...") on
+    # the first line so the first address isn't shadowed by it.
     if text.startswith("/"):
         head, _, tail = text.partition("\n")
-        head_tokens = head.split(maxsplit=1)
-        first_remainder = head_tokens[1] if len(head_tokens) > 1 else ""
-        text = first_remainder + ("\n" + tail if tail else "")
-
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return []
-
-    def _is_addr(s: str) -> bool:
-        return s.startswith("0x") and len(s) == 42
+        head_after = head.split(maxsplit=1)
+        head_remainder = head_after[1] if len(head_after) > 1 else ""
+        text = head_remainder + (("\n" + tail) if tail else "")
 
     def _strip_note(raw: str) -> str:
         raw = raw.strip()
@@ -2527,24 +2532,44 @@ def _parse_watch_pairs(text: str) -> list[tuple[str, str]]:
             raw = raw[1:].lstrip()
         return raw
 
-    if len(lines) > 1:
-        pairs: list[tuple[str, str]] = []
-        for ln in lines:
-            toks = ln.split(maxsplit=1)
-            if not toks or not _is_addr(toks[0]):
-                continue
-            note = _strip_note(toks[1]) if len(toks) > 1 else ""
-            pairs.append((toks[0], note))
-        return pairs
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
 
-    tokens = lines[0].split()
-    if not tokens:
-        return []
-    if len(tokens) > 1 and all(_is_addr(t) for t in tokens):
-        return [(t, "") for t in tokens]
-    addr = tokens[0]
-    note = _strip_note(" ".join(tokens[1:])) if len(tokens) > 1 else ""
-    return [(addr, note)]
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    is_multi_line = len(lines) > 1
+    for line in lines:
+        matches = list(_ADDR_RE.finditer(line))
+        if not matches:
+            continue
+        first = matches[0]
+        addr = first.group(0)
+        # Note = the slice between this address and the next one on the
+        # same line (so a stray second address never leaks into the note
+        # text). EOL when there's only one address on the line.
+        if len(matches) > 1:
+            note_slice = line[first.end() : matches[1].start()]
+        else:
+            note_slice = line[first.end() :]
+        note = _strip_note(note_slice)
+
+        key = addr.lower()
+        if key not in seen:
+            seen.add(key)
+            pairs.append((addr, note))
+
+        # Extra 0x addresses on a single-line paste → each gets its own
+        # pair with an empty note. Ignored on multi-line pastes to honor
+        # the one-address-per-line rule.
+        if not is_multi_line:
+            for m in matches[1:]:
+                extra = m.group(0)
+                ek = extra.lower()
+                if ek in seen:
+                    continue
+                seen.add(ek)
+                pairs.append((extra, ""))
+
+    return pairs
 
 
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
