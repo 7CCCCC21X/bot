@@ -1833,6 +1833,33 @@ def _title_html(title: str, market: dict | None) -> str:
     return safe_title
 
 
+def _title_cache_entry(pos: dict, market: dict | None = None) -> dict:
+    """Build the per-position cache record used for 已平仓 notifications.
+
+    Stores title + outcome + slug so the 已平仓 card can still render the
+    outcome label and a clickable market link after the position disappears
+    from /v1/positions.
+    """
+    title, outcome, _, _ = display_fields(pos, market or {})
+    combined = market or pos.get("_market") or {}
+    nested = pos.get("market") if isinstance(pos.get("market"), dict) else {}
+    slug = (
+        combined.get("slug")
+        or combined.get("marketSlug")
+        or combined.get("categorySlug")
+        or combined.get("category_slug")
+        or nested.get("slug")
+        or nested.get("marketSlug")
+        or nested.get("categorySlug")
+        or nested.get("category_slug")
+    )
+    return {
+        "title": (title or "")[:80],
+        "outcome": outcome or "",
+        "slug": slug,
+    }
+
+
 def _pnl_line(chat_id: int, pnl_usd: float | None, pnl_pct: float | None) -> str:
     if pnl_usd is None or pnl_pct is None:
         return ""
@@ -2535,10 +2562,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             matches = matches or []
 
             snapshot = {pos_key(p): pos_size(p) for p in positions}
-            title_cache = {}
-            for p in positions:
-                title, _, _, _ = display_fields(p, p.get("_market"))
-                title_cache[pos_key(p)] = title[:80]
+            title_cache = {pos_key(p): _title_cache_entry(p) for p in positions}
             watched[chat_id][addr] = WatchedWallet(
                 address=addr,
                 chat_id=chat_id,
@@ -3763,10 +3787,7 @@ async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             positions = positions or []
             matches = matches or []
             snapshot = {pos_key(p): pos_size(p) for p in positions}
-            title_cache = {}
-            for p in positions:
-                title, _, _, _ = display_fields(p, p.get("_market"))
-                title_cache[pos_key(p)] = title[:80]
+            title_cache = {pos_key(p): _title_cache_entry(p) for p in positions}
             watched[chat_id][addr] = WatchedWallet(
                 address=addr,
                 chat_id=chat_id,
@@ -4636,10 +4657,10 @@ async def poll_loop(app: Application):
                         # Refresh the shares snapshot + the title cache. Hold onto
                         # old titles so "closed" notifications can show a real
                         # market name even though the position is gone now.
-                        new_titles: dict[str, str] = {}
-                        for p in positions:
-                            title, _, _, _ = display_fields(p, p.get("_market"))
-                            new_titles[pos_key(p)] = title[:80]
+                        new_titles: dict[str, dict] = {
+                            pos_key(p): _title_cache_entry(p, p.get("_market"))
+                            for p in positions
+                        }
                         old_titles = dict(w.position_titles)
                         # Preserve titles for keys that have disappeared this
                         # poll so we can still render their resolution notice.
@@ -4681,12 +4702,32 @@ async def poll_loop(app: Application):
                                     )
                                 )
                             for k in closed:
-                                title = merged_titles.get(k) or t(
-                                    chat_id, "close_fallback", key=k
+                                entry = merged_titles.get(k)
+                                if isinstance(entry, dict):
+                                    title = entry.get("title") or t(
+                                        chat_id, "close_fallback", key=k
+                                    )
+                                    outcome = entry.get("outcome") or ""
+                                    slug = entry.get("slug")
+                                    market_stub = (
+                                        {"slug": slug} if slug else None
+                                    )
+                                    title_html = _title_html(title, market_stub)
+                                else:
+                                    # Legacy cache entry (plain title string).
+                                    title_html = _html_escape(
+                                        entry
+                                        or t(chat_id, "close_fallback", key=k)
+                                    )
+                                    outcome = ""
+                                closed_line = (
+                                    f"{t(chat_id, 'fmt_closed')} <b>{title_html}</b>"
                                 )
-                                parts.append(
-                                    f"{t(chat_id, 'fmt_closed')} <b>{_html_escape(title)}</b>"
-                                )
+                                if outcome:
+                                    closed_line += (
+                                        f"\n✅ <b>{_html_escape(outcome)}</b>"
+                                    )
+                                parts.append(closed_line)
                             block = t(chat_id, "poll_header", addr=display_addr, note=display_note) + "\n\n".join(parts[:8])
                             if len(parts) > 8:
                                 block += t(chat_id, "fmt_more", count=len(parts) - 8)
