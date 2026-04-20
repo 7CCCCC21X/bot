@@ -2470,6 +2470,66 @@ async def _prompt_watch_reply(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
     )
 
 
+_NOTE_SEP_CHARS = "-—–:：·｜|"
+
+
+def _parse_watch_pairs(text: str) -> list[tuple[str, str]]:
+    """Parse /watch (or watch-reply) input into (address, note) pairs.
+
+    Supported shapes:
+      - "<addr>"                              → 1 pair, no note
+      - "<addr> <note words>"                 → 1 pair with note
+      - "<addr1> <addr2> <addr3>"             → N pairs, no notes
+      - Multi-line, one "<addr>[ sep note]"   → N pairs with per-line notes
+        per line. Common separators (- — – : ：· ｜ |) are trimmed off so
+        users can paste "addr - 备注" or "addr：备注" naturally.
+    """
+    if not text:
+        return []
+    text = text.lstrip()
+    # Drop a leading slash command ("/watch ...") on the first line so the
+    # first address isn't shadowed by it.
+    if text.startswith("/"):
+        head, _, tail = text.partition("\n")
+        head_tokens = head.split(maxsplit=1)
+        first_remainder = head_tokens[1] if len(head_tokens) > 1 else ""
+        text = first_remainder + ("\n" + tail if tail else "")
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return []
+
+    def _is_addr(s: str) -> bool:
+        return s.startswith("0x") and len(s) == 42
+
+    def _strip_note(raw: str) -> str:
+        raw = raw.strip()
+        # Eat any leading separator chars (and the whitespace after them) so
+        # "addr - 备注" / "addr：备注" / "addr | 备注" all yield "备注".
+        while raw and raw[0] in _NOTE_SEP_CHARS:
+            raw = raw[1:].lstrip()
+        return raw
+
+    if len(lines) > 1:
+        pairs: list[tuple[str, str]] = []
+        for ln in lines:
+            toks = ln.split(maxsplit=1)
+            if not toks or not _is_addr(toks[0]):
+                continue
+            note = _strip_note(toks[1]) if len(toks) > 1 else ""
+            pairs.append((toks[0], note))
+        return pairs
+
+    tokens = lines[0].split()
+    if not tokens:
+        return []
+    if len(tokens) > 1 and all(_is_addr(t) for t in tokens):
+        return [(t, "") for t in tokens]
+    addr = tokens[0]
+    note = _strip_note(" ".join(tokens[1:])) if len(tokens) > 1 else ""
+    return [(addr, note)]
+
+
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
@@ -2482,42 +2542,58 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _prompt_watch_reply(ctx, chat_id)
         return
 
-    # Multi-address mode: if every argument is a well-formed 0x address, watch
-    # them all. Otherwise, fall back to "<addr> <note ...>" semantics.
+    # Parse the raw message text — using ctx.args alone collapses multi-line
+    # input ("addr - note" per line) into a flat token stream, which used to
+    # silently keep only the first address.
+    pairs = _parse_watch_pairs(update.message.text or "")
+
     def _is_addr(a: str) -> bool:
         return a.startswith("0x") and len(a) == 42
 
-    raw_args = [a.strip() for a in ctx.args if a.strip()]
-    multi_mode = len(raw_args) > 1 and all(_is_addr(a) for a in raw_args)
+    # Fallback for code paths that hand us ctx.args without a real message
+    # body (callbacks, programmatic invocations).
+    if not pairs and ctx.args:
+        raw_args = [a.strip() for a in ctx.args if a.strip()]
+        if raw_args:
+            if len(raw_args) > 1 and all(_is_addr(a) for a in raw_args):
+                pairs = [(a, "") for a in raw_args]
+            else:
+                addr = raw_args[0]
+                note = " ".join(raw_args[1:]).strip()
+                while note and note[0] in _NOTE_SEP_CHARS:
+                    note = note[1:].lstrip()
+                pairs = [(addr, note)]
 
-    if multi_mode:
-        addresses = raw_args
-        base_note = ""
-    else:
-        addresses = [raw_args[0]]
-        base_note = " ".join(raw_args[1:]).strip()
+    if not pairs:
+        await update.message.reply_text(
+            t(chat_id, "invalid_address"), parse_mode="HTML"
+        )
+        return
 
-    # Duplicate-note handling (T12): if the first address is already watched
-    # and the user supplied a new note, ask before overwriting instead of
-    # silently skipping.
+    multi_mode = len(pairs) > 1
+    first_addr, first_note = pairs[0]
+
+    # Duplicate-note handling (T12): single-address case where the address
+    # is already watched and the supplied note differs — ask before
+    # overwriting instead of silently skipping.
     if (
         not multi_mode
-        and base_note
-        and _is_addr(addresses[0])
-        and addresses[0] in watched.get(chat_id, {})
-        and watched[chat_id][addresses[0]].note != base_note
+        and first_note
+        and _is_addr(first_addr)
+        and first_addr in watched.get(chat_id, {})
+        and watched[chat_id][first_addr].note != first_note
     ):
-        existing = watched[chat_id][addresses[0]]
+        existing = watched[chat_id][first_addr]
         keyboard = InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
                         t(chat_id, "btn_overwrite_note"),
-                        callback_data=f"watchover:{addresses[0]}:{base_note[:50]}",
+                        callback_data=f"watchover:{first_addr}:{first_note[:50]}",
                     ),
                     InlineKeyboardButton(
                         t(chat_id, "btn_cancel"),
-                        callback_data=f"watchover:{addresses[0]}:__CANCEL__",
+                        callback_data=f"watchover:{first_addr}:__CANCEL__",
                     ),
                 ]
             ]
@@ -2526,9 +2602,9 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             t(
                 chat_id,
                 "dup_watch_prompt",
-                addr=fmt_addr(addresses[0]),
+                addr=fmt_addr(first_addr),
                 old=_html_escape(existing.note or "(none)"),
-                new=_html_escape(base_note),
+                new=_html_escape(first_note),
             ),
             parse_mode="HTML",
             reply_markup=keyboard,
@@ -2544,7 +2620,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     last_count = 0
 
     async with aiohttp.ClientSession() as session:
-        for addr in addresses:
+        for addr, note in pairs:
             if not _is_addr(addr):
                 skipped += 1
                 continue
@@ -2566,7 +2642,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             watched[chat_id][addr] = WatchedWallet(
                 address=addr,
                 chat_id=chat_id,
-                note=base_note if len(addresses) == 1 else "",
+                note=note,
                 position_snapshot=snapshot,
                 position_titles=title_cache,
                 order_match_snapshot={match_key(m) for m in matches},
@@ -2587,8 +2663,8 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             count=last_count,
             interval=POLL_INTERVAL,
         )
-    elif skipped == 1 and added == 0 and _is_addr(raw_args[0]):
-        final_text = t(chat_id, "already_watching", addr=fmt_addr(raw_args[0]))
+    elif skipped == 1 and added == 0 and _is_addr(first_addr):
+        final_text = t(chat_id, "already_watching", addr=fmt_addr(first_addr))
     else:
         final_text = t(chat_id, "invalid_address")
 
