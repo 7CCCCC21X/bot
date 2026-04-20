@@ -162,6 +162,9 @@ chat_notify: dict[int, str] = {}
 # "min_fill_usd" (0 = inherit env MIN_FILL_USD) and "dust_interval_s"
 # (0 = inherit env DUST_INTERVAL, -1 = every poll, >0 = that many seconds).
 chat_defaults: dict[int, dict] = {}
+# In-memory bulk-selection state for the watch list. Selecting checkboxes in
+# /list lives here only — never persisted. Keyed by chat_id.
+bulk_selection: dict[int, set[str]] = {}
 NOTIFY_MODES = ("split", "merged")
 db_lock = threading.Lock()
 
@@ -242,6 +245,13 @@ I18N = {
         "btn_unmute": "🔔 Unmute",
         "btn_refresh": "🔄 Refresh",
         "btn_market_link": "🌐 Market",
+        "btn_bulk_enter": "☑️ Multi-select",
+        "btn_bulk_exit": "↩ Exit",
+        "btn_bulk_all": "Select page",
+        "btn_bulk_clear": "Clear",
+        "btn_bulk_unwatch": "🛑 Unwatch ({n})",
+        "bulk_unwatch_done": "Unwatched {count} wallet(s).",
+        "bulk_no_selection": "No wallets selected.",
         "label_fill": "Fill",
         "label_total_pos": "Total position",
         "label_prev_shares": "Prev",
@@ -639,6 +649,13 @@ I18N = {
         "btn_unmute": "🔔 提醒",
         "btn_refresh": "🔄 刷新",
         "btn_market_link": "🌐 查看市场",
+        "btn_bulk_enter": "☑️ 多选",
+        "btn_bulk_exit": "↩ 退出多选",
+        "btn_bulk_all": "本页全选",
+        "btn_bulk_clear": "清空",
+        "btn_bulk_unwatch": "🛑 取消选中 ({n})",
+        "bulk_unwatch_done": "已取消监控 {count} 个钱包。",
+        "bulk_no_selection": "未选择任何钱包。",
         "label_fill": "本次成交",
         "label_total_pos": "总持仓",
         "label_prev_shares": "原持仓",
@@ -2727,12 +2744,27 @@ def _wallet_badge(chat_id: int, w: WatchedWallet) -> str:
     return t(chat_id, "label_watching_flag")
 
 
-def _render_list_page(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+def _render_list_page(
+    chat_id: int,
+    page: int,
+    select_mode: bool = False,
+) -> tuple[str, InlineKeyboardMarkup | None]:
     wallets = list(watched.get(chat_id, {}).items())
     total_pages = max(1, (len(wallets) + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     start = page * LIST_PAGE_SIZE
     chunk = wallets[start : start + LIST_PAGE_SIZE]
+
+    selected = bulk_selection.get(chat_id, set())
+    # Drop addresses that no longer exist (e.g. unwatched elsewhere) so the
+    # selection count never goes stale.
+    if selected:
+        live_addrs = set(watched.get(chat_id, {}).keys())
+        stale = selected - live_addrs
+        if stale:
+            selected -= stale
+            bulk_selection[chat_id] = selected
+    page_suffix = f":s" if select_mode else ""
 
     lines = [t(chat_id, "watch_list")]
     keyboard: list[list[InlineKeyboardButton]] = []
@@ -2740,43 +2772,69 @@ def _render_list_page(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarku
         flag = _wallet_badge(chat_id, w)
         note = f" · <b>{_html_escape(w.note)}</b>" if w.note else ""
         relt = _relative_time(chat_id, w.last_check)
+        # In select mode, prefix each line with the checkbox state so the
+        # text body itself shows what's currently selected (the buttons can
+        # only fit one row per wallet).
+        prefix = ""
+        if select_mode:
+            prefix = ("☑️ " if addr in selected else "☐ ")
         lines.append(
-            f"{flag} <code>{addr}</code>{note}\n"
+            f"{prefix}{flag} <code>{addr}</code>{note}\n"
             f"    {len(w.position_snapshot)} pos · {t(chat_id, 'label_last_check')}: {relt}"
         )
         label_title = (w.note or fmt_addr(addr))[:18]
-        mute_label = t(chat_id, "btn_unmute") if w.muted else t(chat_id, "btn_mute")
-        # Row 1: Positions · Fills · ✏️ (edit note)
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    f"{t(chat_id, 'btn_view_positions')} {label_title}",
-                    callback_data=f"pos:{addr}",
-                ),
-                InlineKeyboardButton(
-                    t(chat_id, "btn_view_orders"), callback_data=f"orders:{addr}"
-                ),
-                InlineKeyboardButton(
-                    t(chat_id, "btn_edit_note"), callback_data=f"editnote:{addr}"
-                ),
-            ]
-        )
-        # Row 2: mute toggle · 💨 dust picker · unwatch
-        keyboard.append(
-            [
-                InlineKeyboardButton(mute_label, callback_data=f"togglemute:{addr}"),
-                InlineKeyboardButton(
-                    t(chat_id, "btn_dust"), callback_data=f"minfill:open:{addr}"
-                ),
-                InlineKeyboardButton(
-                    t(chat_id, "btn_unwatch"), callback_data=f"unwatch:{addr}"
-                ),
-            ]
-        )
+        if select_mode:
+            mark = "☑️" if addr in selected else "☐"
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"{mark} {label_title}",
+                        callback_data=f"bulk:tog:{addr}:{page}",
+                    ),
+                ]
+            )
+        else:
+            mute_label = t(chat_id, "btn_unmute") if w.muted else t(chat_id, "btn_mute")
+            # Row 1: Positions · Fills · ✏️ (edit note)
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"{t(chat_id, 'btn_view_positions')} {label_title}",
+                        callback_data=f"pos:{addr}",
+                    ),
+                    InlineKeyboardButton(
+                        t(chat_id, "btn_view_orders"), callback_data=f"orders:{addr}"
+                    ),
+                    InlineKeyboardButton(
+                        t(chat_id, "btn_edit_note"), callback_data=f"editnote:{addr}"
+                    ),
+                ]
+            )
+            # Row 2: mute toggle · 💨 dust picker · unwatch (page-scoped so
+            # the list returns to the same page after the action).
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        mute_label, callback_data=f"togglemute:{addr}:{page}"
+                    ),
+                    InlineKeyboardButton(
+                        t(chat_id, "btn_dust"), callback_data=f"minfill:open:{addr}"
+                    ),
+                    InlineKeyboardButton(
+                        t(chat_id, "btn_unwatch"),
+                        callback_data=f"unwatch:{addr}:{page}",
+                    ),
+                ]
+            )
     if total_pages > 1:
         nav = []
         if page > 0:
-            nav.append(InlineKeyboardButton("⬅", callback_data=f"list_page:{page - 1}"))
+            nav.append(
+                InlineKeyboardButton(
+                    "⬅",
+                    callback_data=f"list_page:{page - 1}{page_suffix}",
+                )
+            )
         nav.append(
             InlineKeyboardButton(
                 t(chat_id, "list_page_indicator", page=page + 1, total=total_pages),
@@ -2784,8 +2842,48 @@ def _render_list_page(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarku
             )
         )
         if page < total_pages - 1:
-            nav.append(InlineKeyboardButton("➡", callback_data=f"list_page:{page + 1}"))
+            nav.append(
+                InlineKeyboardButton(
+                    "➡",
+                    callback_data=f"list_page:{page + 1}{page_suffix}",
+                )
+            )
         keyboard.append(nav)
+
+    if select_mode:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    t(chat_id, "btn_bulk_all"),
+                    callback_data=f"bulk:all:{page}",
+                ),
+                InlineKeyboardButton(
+                    t(chat_id, "btn_bulk_clear"),
+                    callback_data=f"bulk:clear:{page}",
+                ),
+                InlineKeyboardButton(
+                    t(chat_id, "btn_bulk_exit"),
+                    callback_data=f"bulk:exit:{page}",
+                ),
+            ]
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    t(chat_id, "btn_bulk_unwatch", n=len(selected)),
+                    callback_data=f"bulk:del:{page}",
+                ),
+            ]
+        )
+    elif wallets:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    t(chat_id, "btn_bulk_enter"),
+                    callback_data=f"bulk:enter:{page}",
+                ),
+            ]
+        )
 
     markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     return "\n".join(lines), markup
@@ -4161,18 +4259,28 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("unwatch:"):
-        addr = data.split(":", 1)[1].strip()
+        # unwatch:<addr>[:<page>] — keep the user on the same page after the
+        # row disappears instead of jumping back to page 1.
+        parts = data.split(":")
+        addr = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            page = int(parts[2]) if len(parts) > 2 else 0
+        except ValueError:
+            page = 0
         if addr in watched.get(chat_id, {}):
             del watched[chat_id][addr]
             delete_watch(chat_id, addr)
-        # Refresh the list in place.
+            bulk_selection.get(chat_id, set()).discard(addr)
+        # Refresh the list in place; clamping in _render_list_page handles
+        # the "removed last item on the last page" case.
         if watched.get(chat_id):
-            text, markup = _render_list_page(chat_id, 0)
+            text, markup = _render_list_page(chat_id, page)
             try:
                 await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
             except BadRequest:
                 pass
         else:
+            bulk_selection.pop(chat_id, None)
             try:
                 await query.edit_message_text(t(chat_id, "no_watched_wallets"))
             except BadRequest:
@@ -4180,12 +4288,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("togglemute:"):
-        addr = data.split(":", 1)[1].strip()
+        parts = data.split(":")
+        addr = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            page = int(parts[2]) if len(parts) > 2 else 0
+        except ValueError:
+            page = 0
         target = watched.get(chat_id, {}).get(addr)
         if target:
             target.muted = not target.muted
             save_watch(target)
-            text, markup = _render_list_page(chat_id, 0)
+            text, markup = _render_list_page(chat_id, page)
             try:
                 await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
             except BadRequest:
@@ -4193,15 +4306,131 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("list_page:"):
+        # list_page:<page>[:s] — :s suffix preserves multi-select mode while
+        # paging.
+        parts = data.split(":")
         try:
-            page = int(data.split(":", 1)[1])
-        except ValueError:
+            page = int(parts[1])
+        except (ValueError, IndexError):
             return
-        text, markup = _render_list_page(chat_id, page)
+        select_mode = len(parts) > 2 and parts[2] == "s"
+        text, markup = _render_list_page(chat_id, page, select_mode=select_mode)
         try:
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
         except BadRequest:
             pass
+        return
+
+    if data.startswith("bulk:"):
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+
+        def _page_arg(idx: int) -> int:
+            try:
+                return int(parts[idx])
+            except (ValueError, IndexError):
+                return 0
+
+        if action == "enter":
+            page = _page_arg(2)
+            bulk_selection.setdefault(chat_id, set())
+            text, markup = _render_list_page(chat_id, page, select_mode=True)
+            try:
+                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+            except BadRequest:
+                pass
+            return
+
+        if action == "exit":
+            page = _page_arg(2)
+            bulk_selection.pop(chat_id, None)
+            text, markup = _render_list_page(chat_id, page, select_mode=False)
+            try:
+                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+            except BadRequest:
+                pass
+            return
+
+        if action == "tog":
+            addr = parts[2] if len(parts) > 2 else ""
+            page = _page_arg(3)
+            if addr in watched.get(chat_id, {}):
+                sel = bulk_selection.setdefault(chat_id, set())
+                if addr in sel:
+                    sel.discard(addr)
+                else:
+                    sel.add(addr)
+            text, markup = _render_list_page(chat_id, page, select_mode=True)
+            try:
+                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+            except BadRequest:
+                pass
+            return
+
+        if action == "all":
+            page = _page_arg(2)
+            wallets = list(watched.get(chat_id, {}).items())
+            start = page * LIST_PAGE_SIZE
+            chunk = wallets[start : start + LIST_PAGE_SIZE]
+            sel = bulk_selection.setdefault(chat_id, set())
+            sel.update(addr for addr, _ in chunk)
+            text, markup = _render_list_page(chat_id, page, select_mode=True)
+            try:
+                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+            except BadRequest:
+                pass
+            return
+
+        if action == "clear":
+            page = _page_arg(2)
+            bulk_selection[chat_id] = set()
+            text, markup = _render_list_page(chat_id, page, select_mode=True)
+            try:
+                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+            except BadRequest:
+                pass
+            return
+
+        if action == "del":
+            page = _page_arg(2)
+            sel = bulk_selection.get(chat_id, set())
+            if not sel:
+                try:
+                    await query.answer(
+                        t(chat_id, "bulk_no_selection"), show_alert=False
+                    )
+                except Exception:
+                    pass
+                return
+            removed = 0
+            for addr in list(sel):
+                if addr in watched.get(chat_id, {}):
+                    del watched[chat_id][addr]
+                    delete_watch(chat_id, addr)
+                    removed += 1
+            bulk_selection.pop(chat_id, None)
+            try:
+                await query.answer(
+                    t(chat_id, "bulk_unwatch_done", count=removed),
+                    show_alert=False,
+                )
+            except Exception:
+                pass
+            if watched.get(chat_id):
+                text, markup = _render_list_page(chat_id, page, select_mode=False)
+                try:
+                    await query.edit_message_text(
+                        text, parse_mode="HTML", reply_markup=markup
+                    )
+                except BadRequest:
+                    pass
+            else:
+                try:
+                    await query.edit_message_text(t(chat_id, "no_watched_wallets"))
+                except BadRequest:
+                    pass
+            return
+
         return
 
     # editnote:<addr> — prompt the user to reply with the new note.
