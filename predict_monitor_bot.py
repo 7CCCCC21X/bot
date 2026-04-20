@@ -1897,6 +1897,7 @@ def fmt_pos(
     chat_id: int,
     market: dict | None = None,
     prev_shares: float | None = None,
+    match: dict | None = None,
 ) -> str:
     title, outcome, shares, avg = display_fields(pos, market)
     title = title[:55]
@@ -1947,15 +1948,30 @@ def fmt_pos(
         )
 
     combined_market = market or pos.get("_market")
+    # Fall back to the position's nested ``market`` dict so the title link
+    # still renders when /v1/markets/{id} returned nothing (empty _market).
+    nested_market = pos.get("market") if isinstance(pos.get("market"), dict) else {}
+    if isinstance(combined_market, dict):
+        link_market = {**nested_market, **combined_market}
+    else:
+        link_market = nested_market
     pnl_usd, pnl_pct, _ = pnl_of(pos, combined_market)
     pnl_line = _pnl_line(chat_id, pnl_usd, pnl_pct) if label != "closed" else ""
 
+    tx_line = ""
+    if match:
+        tx = match.get("transactionHash")
+        if isinstance(tx, str) and tx.startswith("0x"):
+            tx_url = f"{TX_EXPLORER_BASE.rstrip('/')}/{tx}"
+            tx_line = f'\n🔗 <a href="{tx_url}">{t(chat_id, "view_tx")}</a>'
+
     return (
-        f"{emoji} <b>{_title_html(title, combined_market)}</b>\n"
+        f"{emoji} <b>{_title_html(title, link_market)}</b>\n"
         f"✅ <b>{outcome}</b>\n"
         f"{size_line}\n"
         f"💰 {t(chat_id, 'label_value')}: <b>{val}</b>"
         f"{pnl_line}"
+        f"{tx_line}"
     )
 
 
@@ -5026,10 +5042,30 @@ async def poll_loop(app: Application):
                             p for p in added
                             if pos_key(p) not in fill_market_keys
                         ]
+                        # Map market+outcome → most recent fill so 新开仓 /
+                        # 持仓变化 cards can surface the on-chain tx hash even
+                        # when the fill itself wasn't emitted separately (e.g.
+                        # suppressed as dust or already seen in a prior poll).
+                        # ``matches`` arrives newest-first from the API, so the
+                        # first entry per key is the freshest.
+                        matches_by_key: dict[str, dict] = {}
+                        for m in matches:
+                            k = _fill_market_outcome_key(m)
+                            if k and k not in matches_by_key:
+                                matches_by_key[k] = m
+
                         if added_visible or changed_visible or closed:
                             parts = []
                             for p in added_visible:
-                                parts.append(fmt_pos(p, "added", chat_id, markets.get(p.get("marketId"))))
+                                parts.append(
+                                    fmt_pos(
+                                        p,
+                                        "added",
+                                        chat_id,
+                                        markets.get(p.get("marketId")),
+                                        match=matches_by_key.get(pos_key(p)),
+                                    )
+                                )
                             for p, prev_size in changed_visible:
                                 parts.append(
                                     fmt_pos(
@@ -5038,6 +5074,7 @@ async def poll_loop(app: Application):
                                         chat_id,
                                         markets.get(p.get("marketId")),
                                         prev_shares=prev_size,
+                                        match=matches_by_key.get(pos_key(p)),
                                     )
                                 )
                             for k in closed:
