@@ -4809,6 +4809,15 @@ async def poll_loop(app: Application):
             for chat_id, wallets in list(watched.items()):
                 for addr, w in list(wallets.items()):
                     try:
+                        # The outer iteration uses a list() snapshot, so a
+                        # /unwatch (or bulk delete) that lands between two
+                        # polls would otherwise leave the snapshotted entry
+                        # alive long enough for save_watch() to resurrect
+                        # it in the DB — and a container restart would then
+                        # reload the "deleted" wallet on load_state. Bail
+                        # immediately if the user already removed it.
+                        if addr not in watched.get(chat_id, {}):
+                            continue
                         # Per-wallet interval gating: skip wallets whose
                         # personal interval hasn't elapsed. 0 = use global.
                         if (
@@ -5141,7 +5150,11 @@ async def poll_loop(app: Application):
 
                         if new_match_keys is not None:
                             w.order_match_snapshot = set(list(new_match_keys)[:100])
-                        save_watch(w)
+                        # Re-check after all the awaits — a delete that
+                        # arrived while we were talking to predict.fun
+                        # must not be overwritten by this snapshot.
+                        if addr in watched.get(chat_id, {}):
+                            save_watch(w)
                     except Exception as e:
                         logger.error(f"Poll error {addr}: {e}")
 
