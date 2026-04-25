@@ -4,9 +4,10 @@ import logging
 import re
 import time
 import json
+import csv
 import sqlite3
 import threading
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -260,6 +261,8 @@ I18N = {
         "btn_bulk_all": "Select page",
         "btn_bulk_clear": "Clear",
         "btn_bulk_unwatch": "🛑 Unwatch ({n})",
+        "btn_copy_addrs": "📋 Copy addrs",
+        "copy_addrs_caption": "{count} addresses (long-press to copy)",
         "bulk_unwatch_done": "Unwatched {count} wallet(s).",
         "bulk_no_selection": "No wallets selected.",
         "label_fill": "Fill",
@@ -574,8 +577,11 @@ I18N = {
         ),
         "help_cmd_export": (
             "<b>/export</b> — Download your watch list\n\n"
-            "Emits a <code>predict_watches.json</code> file with every watched address, note and muted flag. "
-            "Use /import to restore it later."
+            "Default emits a <code>predict_watches.json</code> file with every watched address, note and muted flag. "
+            "Use /import to restore it later.\n\n"
+            "Pass a format to get a paste-friendly file instead:\n"
+            "• <code>/export txt</code> — one address per line\n"
+            "• <code>/export csv</code> — address,note,muted,positions,last_check"
         ),
         "help_cmd_import": (
             "<b>/import</b> — Bulk-import a watch list\n\n"
@@ -665,6 +671,8 @@ I18N = {
         "btn_bulk_all": "本页全选",
         "btn_bulk_clear": "清空",
         "btn_bulk_unwatch": "🛑 取消选中 ({n})",
+        "btn_copy_addrs": "📋 复制地址",
+        "copy_addrs_caption": "{count} 个地址（长按复制）",
         "bulk_unwatch_done": "已取消监控 {count} 个钱包。",
         "bulk_no_selection": "未选择任何钱包。",
         "label_fill": "本次成交",
@@ -965,7 +973,10 @@ I18N = {
         ),
         "help_cmd_export": (
             "<b>/export</b> — 导出监控列表\n\n"
-            "生成 <code>predict_watches.json</code>，包含每个钱包的地址、备注、静音状态。可以用 /import 恢复。"
+            "默认生成 <code>predict_watches.json</code>，包含每个钱包的地址、备注、静音状态。可以用 /import 恢复。\n\n"
+            "也可以指定格式得到便于复制 / 导入其他工具的文件：\n"
+            "• <code>/export txt</code> — 每行一个地址\n"
+            "• <code>/export csv</code> — address,note,muted,positions,last_check"
         ),
         "help_cmd_import": (
             "<b>/import</b> — 批量导入监控列表\n\n"
@@ -2931,6 +2942,10 @@ def _render_list_page(
                     t(chat_id, "btn_bulk_enter"),
                     callback_data=f"bulk:enter:{page}",
                 ),
+                InlineKeyboardButton(
+                    t(chat_id, "btn_copy_addrs"),
+                    callback_data="listcopy",
+                ),
             ]
         )
 
@@ -3129,26 +3144,49 @@ async def cmd_defaults(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     wallets = watched.get(chat_id, {})
-    payload = {
-        "chat_id": chat_id,
-        "lang": get_lang(chat_id),
-        "exported_at": int(time.time()),
-        "watches": [
-            {
-                "address": a,
-                "note": w.note,
-                "muted": w.muted,
-                "positions": len(w.position_snapshot),
-                "last_check": w.last_check,
-            }
-            for a, w in wallets.items()
-        ],
-    }
-    buf = BytesIO(json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"))
+    fmt = (ctx.args[0].lower() if ctx.args else "json").strip()
+    if fmt not in {"json", "txt", "csv"}:
+        fmt = "json"
+
+    if fmt == "txt":
+        # One address per line — paste-friendly for other tools / scripts.
+        body = "\n".join(addr for addr in wallets.keys())
+        filename = "predict_watches.txt"
+    elif fmt == "csv":
+        # Quote notes through csv so commas / newlines in备注 don't break rows.
+        out = StringIO()
+        writer = csv.writer(out)
+        writer.writerow(["address", "note", "muted", "positions", "last_check"])
+        for a, w in wallets.items():
+            writer.writerow(
+                [a, w.note, int(bool(w.muted)), len(w.position_snapshot), int(w.last_check)]
+            )
+        body = out.getvalue()
+        filename = "predict_watches.csv"
+    else:
+        payload = {
+            "chat_id": chat_id,
+            "lang": get_lang(chat_id),
+            "exported_at": int(time.time()),
+            "watches": [
+                {
+                    "address": a,
+                    "note": w.note,
+                    "muted": w.muted,
+                    "positions": len(w.position_snapshot),
+                    "last_check": w.last_check,
+                }
+                for a, w in wallets.items()
+            ],
+        }
+        body = json.dumps(payload, indent=2, ensure_ascii=False)
+        filename = "predict_watches.json"
+
+    buf = BytesIO(body.encode("utf-8"))
     buf.seek(0)
     await ctx.bot.send_document(
         chat_id=chat_id,
-        document=InputFile(buf, filename="predict_watches.json"),
+        document=InputFile(buf, filename=filename),
         caption=t(chat_id, "export_caption", count=len(wallets)),
     )
 
@@ -4368,6 +4406,38 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
         except BadRequest:
             pass
+        return
+
+    if data == "listcopy":
+        addrs = list(watched.get(chat_id, {}).keys())
+        if not addrs:
+            try:
+                await query.answer(t(chat_id, "no_watched_wallets"), show_alert=False)
+            except Exception:
+                pass
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        joined = "\n".join(addrs)
+        # <pre> renders as a tap-to-copy block on Telegram clients. Stay clear
+        # of the 4096-char message ceiling (43 chars per address × ~95 fits
+        # comfortably; anything bigger goes out as a .txt attachment).
+        if len(joined) <= 3800:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=f"<pre>{_html_escape(joined)}</pre>",
+                parse_mode="HTML",
+            )
+        else:
+            buf = BytesIO(joined.encode("utf-8"))
+            buf.seek(0)
+            await ctx.bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(buf, filename="predict_addresses.txt"),
+                caption=t(chat_id, "copy_addrs_caption", count=len(addrs)),
+            )
         return
 
     if data.startswith("bulk:"):
