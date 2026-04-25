@@ -38,6 +38,14 @@ PREDICT_API = "https://api.predict.fun"
 _raw_admin = os.environ.get("ADMIN_CHAT_ID", "").strip()
 ADMIN_CHAT_ID = int(_raw_admin) if _raw_admin.lstrip("-").isdigit() else None
 POLL_INTERVAL = 5
+# Maximum number of wallets polled concurrently within a single cycle. The old
+# loop processed wallets serially with a 1-second gap between each, so a chat
+# watching N wallets saw a cycle of roughly N + POLL_INTERVAL seconds. Polling
+# in parallel keeps end-to-end latency near POLL_INTERVAL regardless of N.
+try:
+    POLL_CONCURRENCY = max(1, int(os.environ.get("POLL_CONCURRENCY", "8") or 8))
+except ValueError:
+    POLL_CONCURRENCY = 8
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
 # Fallback dust floor used when a wallet has no per-wallet `min_fill_usd` set.
 # Set MIN_FILL_USD=0 to disable by default (every fill shows, even $0.04 dust).
@@ -4844,11 +4852,14 @@ def _detect_resolutions(
 async def poll_loop(app: Application):
     await asyncio.sleep(3)
     logger.info("Poll loop started")
+    sem = asyncio.Semaphore(POLL_CONCURRENCY)
 
     async with aiohttp.ClientSession() as session:
         while True:
-            for chat_id, wallets in list(watched.items()):
-                for addr, w in list(wallets.items()):
+            cycle_started = time.monotonic()
+
+            async def _poll_one(chat_id, addr, w):
+                async with sem:
                     try:
                         # The outer iteration uses a list() snapshot, so a
                         # /unwatch (or bulk delete) that lands between two
@@ -4858,14 +4869,14 @@ async def poll_loop(app: Application):
                         # reload the "deleted" wallet on load_state. Bail
                         # immediately if the user already removed it.
                         if addr not in watched.get(chat_id, {}):
-                            continue
+                            return
                         # Per-wallet interval gating: skip wallets whose
                         # personal interval hasn't elapsed. 0 = use global.
                         if (
                             w.poll_interval_s
                             and (time.time() - w.last_check) < w.poll_interval_s
                         ):
-                            continue
+                            return
 
                         positions_raw = await fetch_positions(session, w.address)
                         matches_raw = await fetch_order_matches(session, w.address, first=20)
@@ -4900,8 +4911,7 @@ async def poll_loop(app: Application):
                                     )
                             if all_failed:
                                 # No data at all — can't meaningfully diff.
-                                await asyncio.sleep(1)
-                                continue
+                                return
 
                         # Both succeeded → recover state and notify if needed.
                         if not any_failed:
@@ -5220,9 +5230,16 @@ async def poll_loop(app: Application):
                     except Exception as e:
                         logger.error(f"Poll error {addr}: {e}")
 
-                    await asyncio.sleep(1)
+            tasks = [
+                _poll_one(chat_id, addr, w)
+                for chat_id, wallets in list(watched.items())
+                for addr, w in list(wallets.items())
+            ]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-            await asyncio.sleep(POLL_INTERVAL)
+            elapsed = time.monotonic() - cycle_started
+            await asyncio.sleep(max(0.0, POLL_INTERVAL - elapsed))
 
 # ==================== Main ====================
 
