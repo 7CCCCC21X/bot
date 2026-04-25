@@ -7,9 +7,11 @@ import json
 import csv
 import sqlite3
 import threading
+from collections import deque
 from io import BytesIO, StringIO
 from pathlib import Path
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 
 import aiohttp
 from telegram import (
@@ -153,6 +155,13 @@ class WatchedWallet:
     # Transient runtime counters (not persisted).
     fetch_errors: int = 0
     error_notified: bool = False
+    # Rate-limit cooldown state (transient). `rate_limit_until` is a wall-clock
+    # epoch second; while now < rate_limit_until, the polling loop skips this
+    # wallet entirely. `rate_limit_level` counts consecutive 429s and drives
+    # the exponential backoff fallback when no Retry-After header is present.
+    rate_limit_until: float = 0
+    rate_limit_level: int = 0
+    rate_limit_notified: bool = False
     # Transient dust-summary accumulator. Holds match dicts for dust fills
     # that haven't been flushed yet (only used when the effective
     # dust_interval > 0). Not persisted — on restart the snapshot dedupe
@@ -175,6 +184,13 @@ chat_defaults: dict[int, dict] = {}
 # In-memory bulk-selection state for the watch list. Selecting checkboxes in
 # /list lives here only — never persisted. Keyed by chat_id.
 bulk_selection: dict[int, set[str]] = {}
+# Rolling per-endpoint API status log. Each entry is (epoch_s, label) where
+# label ∈ {"ok", "429", "5xx", "timeout", "other"}. Powers /apistatus. Capped
+# at 2000 entries per endpoint (~roughly the last several hours of polling).
+api_stats: dict[str, deque] = {
+    "positions": deque(maxlen=2000),
+    "matches": deque(maxlen=2000),
+}
 NOTIFY_MODES = ("split", "merged")
 db_lock = threading.Lock()
 
@@ -301,6 +317,8 @@ I18N = {
         "export_caption": "Your watch list ({count} wallets)",
         "fetch_error_alert": "⚠️ Failed to reach Predict.fun API {count}× for <code>{addr}</code>. Will keep retrying silently.",
         "fetch_error_msg": "⚠️ Predict.fun API is unavailable right now. Try again in a moment.",
+        "rate_limited_alert": "🚦 Predict.fun rate-limited <code>{addr}</code>. Pausing {backoff}s; will auto-resume.",
+        "rate_limit_recovered": "✅ Rate limit cleared for <code>{addr}</code>.",
         "relt_never": "never",
         "relt_just_now": "just now",
         "relt_seconds": "{n}s ago",
@@ -723,6 +741,8 @@ I18N = {
         "export_caption": "监控列表（{count} 个钱包）",
         "fetch_error_alert": "⚠️ 连续 {count} 次无法访问 Predict.fun API：<code>{addr}</code>。会继续静默重试。",
         "fetch_error_msg": "⚠️ Predict.fun API 暂时无响应，请稍后再试。",
+        "rate_limited_alert": "🚦 Predict.fun 限流：<code>{addr}</code>，暂停 {backoff} 秒后自动恢复。",
+        "rate_limit_recovered": "✅ <code>{addr}</code> 限流已恢复。",
         "relt_never": "未执行",
         "relt_just_now": "刚刚",
         "relt_seconds": "{n} 秒前",
@@ -1355,11 +1375,49 @@ def _headers():
     }
 
 
-async def fetch_positions(session: aiohttp.ClientSession, address: str) -> list[dict] | None:
-    """Return positions list, or ``None`` on transport/HTTP error.
+@dataclass
+class RateLimited:
+    """Sentinel returned by fetch_* helpers when the API responded with 429.
+
+    Carries the parsed Retry-After hint (seconds) when the server provided one.
+    The polling loop uses this to set a per-wallet cooldown.
+    """
+    retry_after_s: float | None = None
+
+
+def _record_api(endpoint: str, label: str) -> None:
+    """Append a (timestamp, label) entry to the rolling api_stats deque."""
+    bucket = api_stats.get(endpoint)
+    if bucket is not None:
+        bucket.append((time.time(), label))
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse an HTTP Retry-After header value (seconds or HTTP-date)."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    return max(0.0, dt.timestamp() - time.time())
+
+
+async def fetch_positions(
+    session: aiohttp.ClientSession, address: str
+) -> list[dict] | RateLimited | None:
+    """Return positions list, ``RateLimited`` on 429, or ``None`` on other errors.
 
     An empty list means the wallet genuinely has no positions; ``None`` lets
-    callers track consecutive failures for alerting.
+    callers track consecutive failures for alerting; a ``RateLimited`` instance
+    signals the caller should back off polling for this wallet.
     """
     url = f"{PREDICT_API}/v1/positions/{address}"
     try:
@@ -1369,12 +1427,25 @@ async def fetch_positions(session: aiohttp.ClientSession, address: str) -> list[
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             if resp.status == 200:
+                _record_api("positions", "ok")
                 data = await resp.json()
                 return data.get("data", []) if data.get("success") else []
 
+            if resp.status == 429:
+                _record_api("positions", "429")
+                logger.warning(f"Positions API 429 (rate limited) for {address}")
+                return RateLimited(_parse_retry_after(resp.headers.get("Retry-After")))
+
+            label = "5xx" if resp.status >= 500 else "other"
+            _record_api("positions", label)
             logger.warning(f"Positions API {resp.status} for {address}")
             return None
+    except asyncio.TimeoutError:
+        _record_api("positions", "timeout")
+        logger.error(f"fetch_positions timeout for {address}")
+        return None
     except Exception as e:
+        _record_api("positions", "timeout")
         logger.error(f"fetch_positions error: {e}")
         return None
 
@@ -1405,7 +1476,7 @@ async def fetch_order_matches(
     session: aiohttp.ClientSession,
     address: str,
     first: int = 20,
-) -> list[dict] | None:
+) -> list[dict] | RateLimited | None:
     url = f"{PREDICT_API}/v1/orders/matches"
     params = {
         "signerAddress": address,
@@ -1419,11 +1490,25 @@ async def fetch_order_matches(
             timeout=aiohttp.ClientTimeout(total=12),
         ) as resp:
             if resp.status == 200:
+                _record_api("matches", "ok")
                 data = await resp.json()
                 return data.get("data", []) if data.get("success") else []
+
+            if resp.status == 429:
+                _record_api("matches", "429")
+                logger.warning(f"Orders matches API 429 (rate limited) for {address}")
+                return RateLimited(_parse_retry_after(resp.headers.get("Retry-After")))
+
+            label = "5xx" if resp.status >= 500 else "other"
+            _record_api("matches", label)
             logger.warning(f"Orders matches API {resp.status} for {address}")
             return None
+    except asyncio.TimeoutError:
+        _record_api("matches", "timeout")
+        logger.error(f"fetch_order_matches timeout for {address}")
+        return None
     except Exception as e:
+        _record_api("matches", "timeout")
         logger.error(f"fetch_order_matches error: {e}")
         return None
 
@@ -2418,7 +2503,7 @@ async def _fetch_positions_with_markets(session, addr):
     wallet that legitimately has none).
     """
     positions = await fetch_positions(session, addr)
-    if positions is None:
+    if positions is None or isinstance(positions, RateLimited):
         return None, {}
     market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
     markets = {mid: await fetch_market(session, mid) for mid in market_ids}
@@ -2489,6 +2574,8 @@ async def _render_orders(
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     async with aiohttp.ClientSession() as session:
         matches = await fetch_order_matches(session, addr, first=ORDERS_FETCH_LIMIT)
+        if isinstance(matches, RateLimited):
+            matches = None
         positions, positions_by_key = await _fetch_positions_with_markets(session, addr)
         # The orders API returns a stub market on each match (sometimes just
         # an id, sometimes a flat market_id/market_title/category_slug trio),
@@ -2749,6 +2836,10 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             positions = await fetch_positions(session, addr)
             matches = await fetch_order_matches(session, addr, first=30)
+            if isinstance(positions, RateLimited):
+                positions = None
+            if isinstance(matches, RateLimited):
+                matches = None
             if positions is None and matches is None:
                 # Treat as skipped — can't establish a snapshot reliably.
                 skipped += 1
@@ -3323,6 +3414,58 @@ async def cmd_raw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         document=InputFile(buf, filename=f"raw_{addr[:10]}.json"),
         caption=f"raw matches(first={count}) + positions for {addr[:10]}…{addr[-4:]}",
     )
+
+
+async def cmd_apistatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin-only diagnostic: show recent Predict.fun API status counts and
+    any wallets currently in rate-limit cooldown.
+
+    Usage: /apistatus
+    Gated by ADMIN_CHAT_ID like /raw. Aggregates the last 30 minutes of the
+    rolling api_stats deque.
+    """
+    chat_id = update.effective_chat.id
+    if ADMIN_CHAT_ID is None or chat_id != ADMIN_CHAT_ID:
+        return
+
+    now = time.time()
+    window_s = 30 * 60
+    labels = ("ok", "429", "5xx", "timeout", "other")
+
+    lines = [f"API stats (last {window_s // 60} min, rolling)"]
+    for endpoint in ("positions", "matches"):
+        bucket = api_stats.get(endpoint) or ()
+        counts = {lbl: 0 for lbl in labels}
+        for ts, lbl in bucket:
+            if now - ts <= window_s:
+                counts[lbl] = counts.get(lbl, 0) + 1
+        lines.append(
+            f"{endpoint:<9} {counts['ok']} ok · {counts['429']} rate-limited · "
+            f"{counts['5xx']} 5xx · {counts['timeout']} timeout · {counts['other']} other"
+        )
+
+    throttled = []
+    for cid, wallets in watched.items():
+        for addr_, w in wallets.items():
+            if w.rate_limit_until and w.rate_limit_until > now:
+                throttled.append((w.rate_limit_until - now, addr_, cid, w.rate_limit_level))
+    throttled.sort()
+
+    lines.append("")
+    if throttled:
+        lines.append(f"Currently throttled: {len(throttled)} wallets")
+        for remaining, addr_, cid, level in throttled[:20]:
+            lines.append(
+                f"  • {addr_[:10]}…{addr_[-4:]} (chat {cid}) "
+                f"— retry in {int(remaining)}s (level {level})"
+            )
+        if len(throttled) > 20:
+            lines.append(f"  … and {len(throttled) - 20} more")
+    else:
+        lines.append("Currently throttled: none")
+
+    body = "\n".join(lines)
+    await update.message.reply_text(f"<pre>{body}</pre>", parse_mode="HTML")
 
 
 async def cmd_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4084,6 +4227,10 @@ async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             positions = await fetch_positions(session, addr)
             matches = await fetch_order_matches(session, addr, first=30)
+            if isinstance(positions, RateLimited):
+                positions = None
+            if isinstance(matches, RateLimited):
+                matches = None
             if positions is None and matches is None:
                 skipped += 1
                 continue
@@ -5018,8 +5165,63 @@ async def poll_loop(app: Application):
                         ):
                             return
 
+                        # Rate-limit cooldown gate: if the API recently 429'd
+                        # for this wallet, skip both calls until the backoff
+                        # window expires. The window is set when fetch_*
+                        # returns a RateLimited sentinel below.
+                        if w.rate_limit_until and time.time() < w.rate_limit_until:
+                            return
+
                         positions_raw = await fetch_positions(session, w.address)
                         matches_raw = await fetch_order_matches(session, w.address, first=20)
+
+                        # 429 handling: extract Retry-After (preferring the
+                        # larger of the two endpoints' hints), apply
+                        # exponential backoff, and emit a one-shot Telegram
+                        # alert once we've been throttled twice in a row.
+                        rl_results = [
+                            r for r in (positions_raw, matches_raw)
+                            if isinstance(r, RateLimited)
+                        ]
+                        if rl_results:
+                            retry_after = max(
+                                (r.retry_after_s or 0) for r in rl_results
+                            )
+                            w.rate_limit_level += 1
+                            backoff = (
+                                retry_after
+                                if retry_after > 0
+                                else min(30 * (2 ** (w.rate_limit_level - 1)), 300)
+                            )
+                            w.rate_limit_until = time.time() + backoff
+                            if (
+                                w.rate_limit_level >= 2
+                                and not w.rate_limit_notified
+                                and not w.muted
+                            ):
+                                try:
+                                    await app.bot.send_message(
+                                        chat_id=chat_id,
+                                        text=t(
+                                            chat_id,
+                                            "rate_limited_alert",
+                                            addr=fmt_addr(w.address),
+                                            backoff=int(backoff),
+                                        ),
+                                        parse_mode="HTML",
+                                    )
+                                    w.rate_limit_notified = True
+                                except Exception as send_err:
+                                    logger.warning(
+                                        f"Failed to send rate_limited_alert for {addr}: {send_err}"
+                                    )
+                            # Coerce RateLimited → None so downstream
+                            # diff/error logic treats this as a failed fetch
+                            # without trying to iterate the sentinel.
+                            if isinstance(positions_raw, RateLimited):
+                                positions_raw = None
+                            if isinstance(matches_raw, RateLimited):
+                                matches_raw = None
 
                         # B1 fix: count as failure if EITHER call failed.
                         # Reset only when BOTH succeed.
@@ -5073,6 +5275,28 @@ async def poll_loop(app: Application):
                                     logger.warning(
                                         f"Failed to send api_recovered for {addr}: {send_err}"
                                     )
+
+                            # Clear rate-limit cooldown after a clean poll.
+                            if w.rate_limit_level or w.rate_limit_until:
+                                rl_was_notified = w.rate_limit_notified
+                                w.rate_limit_level = 0
+                                w.rate_limit_until = 0
+                                w.rate_limit_notified = False
+                                if rl_was_notified and not w.muted:
+                                    try:
+                                        await app.bot.send_message(
+                                            chat_id=chat_id,
+                                            text=t(
+                                                chat_id,
+                                                "rate_limit_recovered",
+                                                addr=fmt_addr(w.address),
+                                            ),
+                                            parse_mode="HTML",
+                                        )
+                                    except Exception as send_err:
+                                        logger.warning(
+                                            f"Failed to send rate_limit_recovered for {addr}: {send_err}"
+                                        )
 
                         # Only diff / refresh snapshots for endpoints that
                         # actually returned data. A transient 5xx on one call
@@ -5451,6 +5675,7 @@ def main():
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("import", cmd_import))
     app.add_handler(CommandHandler("raw", cmd_raw))
+    app.add_handler(CommandHandler("apistatus", cmd_apistatus))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("threshold", cmd_threshold))
     app.add_handler(CommandHandler("interval", cmd_interval))
