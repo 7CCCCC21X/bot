@@ -4,9 +4,10 @@ import logging
 import re
 import time
 import json
+import csv
 import sqlite3
 import threading
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -38,6 +39,14 @@ PREDICT_API = "https://api.predict.fun"
 _raw_admin = os.environ.get("ADMIN_CHAT_ID", "").strip()
 ADMIN_CHAT_ID = int(_raw_admin) if _raw_admin.lstrip("-").isdigit() else None
 POLL_INTERVAL = 5
+# Maximum number of wallets polled concurrently within a single cycle. The old
+# loop processed wallets serially with a 1-second gap between each, so a chat
+# watching N wallets saw a cycle of roughly N + POLL_INTERVAL seconds. Polling
+# in parallel keeps end-to-end latency near POLL_INTERVAL regardless of N.
+try:
+    POLL_CONCURRENCY = max(1, int(os.environ.get("POLL_CONCURRENCY", "8") or 8))
+except ValueError:
+    POLL_CONCURRENCY = 8
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
 # Fallback dust floor used when a wallet has no per-wallet `min_fill_usd` set.
 # Set MIN_FILL_USD=0 to disable by default (every fill shows, even $0.04 dust).
@@ -183,6 +192,18 @@ I18N = {
             "❌ That's not a valid wallet address.\n\n"
             "Please reply with a valid Ethereum address starting with <code>0x</code> (42 characters)."
         ),
+        "pos_reply_prompt": (
+            "📊 <b>Reply with a wallet address to view its positions</b>\n"
+            "<i>Paste a 0x… address or the note / alias of a watched wallet. No /pos prefix.</i>"
+        ),
+        "orders_reply_prompt": (
+            "📜 <b>Reply with a wallet address to view recent fills</b>\n"
+            "<i>Paste a 0x… address or the note / alias of a watched wallet. No /orders prefix.</i>"
+        ),
+        "portfolio_reply_prompt": (
+            "📊 <b>Reply with a wallet address for the portfolio card</b>\n"
+            "<i>Paste a 0x… address or the note / alias of a watched wallet. No /portfolio prefix.</i>"
+        ),
         "watch_guide_caption": (
             "📖 <b>How to find your Predict.fun wallet address</b>\n\n"
             "1. Go to Predict.fun and log in\n"
@@ -252,6 +273,8 @@ I18N = {
         "btn_bulk_all": "Select page",
         "btn_bulk_clear": "Clear",
         "btn_bulk_unwatch": "🛑 Unwatch ({n})",
+        "btn_copy_addrs": "📋 Copy addrs",
+        "copy_addrs_caption": "{count} addresses (long-press to copy)",
         "bulk_unwatch_done": "Unwatched {count} wallet(s).",
         "bulk_no_selection": "No wallets selected.",
         "label_fill": "Fill",
@@ -566,8 +589,11 @@ I18N = {
         ),
         "help_cmd_export": (
             "<b>/export</b> — Download your watch list\n\n"
-            "Emits a <code>predict_watches.json</code> file with every watched address, note and muted flag. "
-            "Use /import to restore it later."
+            "Default emits a <code>predict_watches.json</code> file with every watched address, note and muted flag. "
+            "Use /import to restore it later.\n\n"
+            "Pass a format to get a paste-friendly file instead:\n"
+            "• <code>/export txt</code> — one address per line\n"
+            "• <code>/export csv</code> — address,note,muted,positions,last_check"
         ),
         "help_cmd_import": (
             "<b>/import</b> — Bulk-import a watch list\n\n"
@@ -587,6 +613,18 @@ I18N = {
         "watch_reply_invalid": (
             "❌ 这不是一个有效的钱包地址。\n\n"
             "请发送以 <code>0x</code> 开头的有效以太坊地址（42 个字符）。"
+        ),
+        "pos_reply_prompt": (
+            "📊 <b>回复这条消息，发送要查询持仓的钱包地址</b>\n"
+            "<i>0x 地址或已关注钱包的备注 / 别名都行，不用再输入 /pos。</i>"
+        ),
+        "orders_reply_prompt": (
+            "📜 <b>回复这条消息，发送要查询最近成交的钱包地址</b>\n"
+            "<i>0x 地址或已关注钱包的备注 / 别名都行，不用再输入 /orders。</i>"
+        ),
+        "portfolio_reply_prompt": (
+            "📊 <b>回复这条消息，发送要查看资产卡片的钱包地址</b>\n"
+            "<i>0x 地址或已关注钱包的备注 / 别名都行，不用再输入 /portfolio。</i>"
         ),
         "watch_guide_caption": (
             "📖 <b>如何找到你的 Predict.fun 钱包地址</b>\n\n"
@@ -657,6 +695,8 @@ I18N = {
         "btn_bulk_all": "本页全选",
         "btn_bulk_clear": "清空",
         "btn_bulk_unwatch": "🛑 取消选中 ({n})",
+        "btn_copy_addrs": "📋 复制地址",
+        "copy_addrs_caption": "{count} 个地址（长按复制）",
         "bulk_unwatch_done": "已取消监控 {count} 个钱包。",
         "bulk_no_selection": "未选择任何钱包。",
         "label_fill": "本次成交",
@@ -957,7 +997,10 @@ I18N = {
         ),
         "help_cmd_export": (
             "<b>/export</b> — 导出监控列表\n\n"
-            "生成 <code>predict_watches.json</code>，包含每个钱包的地址、备注、静音状态。可以用 /import 恢复。"
+            "默认生成 <code>predict_watches.json</code>，包含每个钱包的地址、备注、静音状态。可以用 /import 恢复。\n\n"
+            "也可以指定格式得到便于复制 / 导入其他工具的文件：\n"
+            "• <code>/export txt</code> — 每行一个地址\n"
+            "• <code>/export csv</code> — address,note,muted,positions,last_check"
         ),
         "help_cmd_import": (
             "<b>/import</b> — 批量导入监控列表\n\n"
@@ -2506,6 +2549,24 @@ async def _prompt_watch_reply(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
     )
 
 
+async def _prompt_addr_reply(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, kind: str
+):
+    """Ask the user to reply with a wallet address for a query command.
+
+    `kind` is one of "pos" / "orders" / "portfolio" — picked up by on_message
+    to route the reply back into the matching cmd_* handler. Mirrors the
+    /watch reply flow so users don't have to retype the slash command.
+    """
+    ctx.user_data["pending_addr_query"] = {"chat_id": chat_id, "kind": kind}
+    await ctx.bot.send_message(
+        chat_id=chat_id,
+        text=t(chat_id, f"{kind}_reply_prompt"),
+        parse_mode="HTML",
+        reply_markup=ForceReply(selective=True),
+    )
+
+
 _NOTE_SEP_CHARS = "-—–:：·｜|,，;；"
 _ADDR_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
@@ -2923,6 +2984,10 @@ def _render_list_page(
                     t(chat_id, "btn_bulk_enter"),
                     callback_data=f"bulk:enter:{page}",
                 ),
+                InlineKeyboardButton(
+                    t(chat_id, "btn_copy_addrs"),
+                    callback_data="listcopy",
+                ),
             ]
         )
 
@@ -2942,7 +3007,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_pos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not ctx.args:
-        await update.message.reply_text(t(chat_id, "usage_pos"))
+        await _prompt_addr_reply(ctx, chat_id, "pos")
         return
 
     addr = resolve_addr(chat_id, ctx.args[0])
@@ -2968,7 +3033,7 @@ async def cmd_pos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not ctx.args:
-        await update.message.reply_text(t(chat_id, "usage_orders"))
+        await _prompt_addr_reply(ctx, chat_id, "orders")
         return
 
     addr = resolve_addr(chat_id, ctx.args[0])
@@ -3121,26 +3186,49 @@ async def cmd_defaults(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     wallets = watched.get(chat_id, {})
-    payload = {
-        "chat_id": chat_id,
-        "lang": get_lang(chat_id),
-        "exported_at": int(time.time()),
-        "watches": [
-            {
-                "address": a,
-                "note": w.note,
-                "muted": w.muted,
-                "positions": len(w.position_snapshot),
-                "last_check": w.last_check,
-            }
-            for a, w in wallets.items()
-        ],
-    }
-    buf = BytesIO(json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"))
+    fmt = (ctx.args[0].lower() if ctx.args else "json").strip()
+    if fmt not in {"json", "txt", "csv"}:
+        fmt = "json"
+
+    if fmt == "txt":
+        # One address per line — paste-friendly for other tools / scripts.
+        body = "\n".join(addr for addr in wallets.keys())
+        filename = "predict_watches.txt"
+    elif fmt == "csv":
+        # Quote notes through csv so commas / newlines in备注 don't break rows.
+        out = StringIO()
+        writer = csv.writer(out)
+        writer.writerow(["address", "note", "muted", "positions", "last_check"])
+        for a, w in wallets.items():
+            writer.writerow(
+                [a, w.note, int(bool(w.muted)), len(w.position_snapshot), int(w.last_check)]
+            )
+        body = out.getvalue()
+        filename = "predict_watches.csv"
+    else:
+        payload = {
+            "chat_id": chat_id,
+            "lang": get_lang(chat_id),
+            "exported_at": int(time.time()),
+            "watches": [
+                {
+                    "address": a,
+                    "note": w.note,
+                    "muted": w.muted,
+                    "positions": len(w.position_snapshot),
+                    "last_check": w.last_check,
+                }
+                for a, w in wallets.items()
+            ],
+        }
+        body = json.dumps(payload, indent=2, ensure_ascii=False)
+        filename = "predict_watches.json"
+
+    buf = BytesIO(body.encode("utf-8"))
     buf.seek(0)
     await ctx.bot.send_document(
         chat_id=chat_id,
-        document=InputFile(buf, filename="predict_watches.json"),
+        document=InputFile(buf, filename=filename),
         caption=t(chat_id, "export_caption", count=len(wallets)),
     )
 
@@ -3863,7 +3951,7 @@ async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Reuse /pos rendering but open with the portfolio card expanded."""
     chat_id = update.effective_chat.id
     if not ctx.args:
-        await update.message.reply_text(t(chat_id, "usage_pos"))
+        await _prompt_addr_reply(ctx, chat_id, "portfolio")
         return
     addr = resolve_addr(chat_id, ctx.args[0])
     if not addr:
@@ -4066,6 +4154,34 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _pop_pending_watch(ctx)
         ctx.args = tokens
         await cmd_watch(update, ctx)
+        return
+
+    # Reply-to-query flow: /pos, /orders, /portfolio without args sends a
+    # ForceReply prompt; the next text reply is routed back into the same
+    # handler with ctx.args populated.
+    pending_query = ctx.user_data.get("pending_addr_query")
+    if pending_query and pending_query.get("chat_id") == chat_id:
+        kind = pending_query.get("kind")
+        token = (update.message.text or "").strip().split(maxsplit=1)
+        first = token[0] if token else ""
+        # Accept either a raw 0x address or a known alias / note from the
+        # watch list — resolve_addr handles both transparently.
+        addr = resolve_addr(chat_id, first) if first else None
+        if not addr:
+            await update.message.reply_text(
+                t(chat_id, "watch_reply_invalid"),
+                parse_mode="HTML",
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        ctx.user_data.pop("pending_addr_query", None)
+        ctx.args = [addr]
+        if kind == "orders":
+            await cmd_orders(update, ctx)
+        elif kind == "portfolio":
+            await cmd_portfolio(update, ctx)
+        else:
+            await cmd_pos(update, ctx)
         return
 
     # Dust-floor custom-amount reply.
@@ -4360,6 +4476,38 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
         except BadRequest:
             pass
+        return
+
+    if data == "listcopy":
+        addrs = list(watched.get(chat_id, {}).keys())
+        if not addrs:
+            try:
+                await query.answer(t(chat_id, "no_watched_wallets"), show_alert=False)
+            except Exception:
+                pass
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        joined = "\n".join(addrs)
+        # <pre> renders as a tap-to-copy block on Telegram clients. Stay clear
+        # of the 4096-char message ceiling (43 chars per address × ~95 fits
+        # comfortably; anything bigger goes out as a .txt attachment).
+        if len(joined) <= 3800:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=f"<pre>{_html_escape(joined)}</pre>",
+                parse_mode="HTML",
+            )
+        else:
+            buf = BytesIO(joined.encode("utf-8"))
+            buf.seek(0)
+            await ctx.bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(buf, filename="predict_addresses.txt"),
+                caption=t(chat_id, "copy_addrs_caption", count=len(addrs)),
+            )
         return
 
     if data.startswith("bulk:"):
@@ -4844,11 +4992,14 @@ def _detect_resolutions(
 async def poll_loop(app: Application):
     await asyncio.sleep(3)
     logger.info("Poll loop started")
+    sem = asyncio.Semaphore(POLL_CONCURRENCY)
 
     async with aiohttp.ClientSession() as session:
         while True:
-            for chat_id, wallets in list(watched.items()):
-                for addr, w in list(wallets.items()):
+            cycle_started = time.monotonic()
+
+            async def _poll_one(chat_id, addr, w):
+                async with sem:
                     try:
                         # The outer iteration uses a list() snapshot, so a
                         # /unwatch (or bulk delete) that lands between two
@@ -4858,14 +5009,14 @@ async def poll_loop(app: Application):
                         # reload the "deleted" wallet on load_state. Bail
                         # immediately if the user already removed it.
                         if addr not in watched.get(chat_id, {}):
-                            continue
+                            return
                         # Per-wallet interval gating: skip wallets whose
                         # personal interval hasn't elapsed. 0 = use global.
                         if (
                             w.poll_interval_s
                             and (time.time() - w.last_check) < w.poll_interval_s
                         ):
-                            continue
+                            return
 
                         positions_raw = await fetch_positions(session, w.address)
                         matches_raw = await fetch_order_matches(session, w.address, first=20)
@@ -4900,8 +5051,7 @@ async def poll_loop(app: Application):
                                     )
                             if all_failed:
                                 # No data at all — can't meaningfully diff.
-                                await asyncio.sleep(1)
-                                continue
+                                return
 
                         # Both succeeded → recover state and notify if needed.
                         if not any_failed:
@@ -5220,9 +5370,16 @@ async def poll_loop(app: Application):
                     except Exception as e:
                         logger.error(f"Poll error {addr}: {e}")
 
-                    await asyncio.sleep(1)
+            tasks = [
+                _poll_one(chat_id, addr, w)
+                for chat_id, wallets in list(watched.items())
+                for addr, w in list(wallets.items())
+            ]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-            await asyncio.sleep(POLL_INTERVAL)
+            elapsed = time.monotonic() - cycle_started
+            await asyncio.sleep(max(0.0, POLL_INTERVAL - elapsed))
 
 # ==================== Main ====================
 
