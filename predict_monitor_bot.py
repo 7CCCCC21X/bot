@@ -192,6 +192,18 @@ I18N = {
             "❌ That's not a valid wallet address.\n\n"
             "Please reply with a valid Ethereum address starting with <code>0x</code> (42 characters)."
         ),
+        "pos_reply_prompt": (
+            "📊 <b>Reply with a wallet address to view its positions</b>\n"
+            "<i>Paste a 0x… address or the note / alias of a watched wallet. No /pos prefix.</i>"
+        ),
+        "orders_reply_prompt": (
+            "📜 <b>Reply with a wallet address to view recent fills</b>\n"
+            "<i>Paste a 0x… address or the note / alias of a watched wallet. No /orders prefix.</i>"
+        ),
+        "portfolio_reply_prompt": (
+            "📊 <b>Reply with a wallet address for the portfolio card</b>\n"
+            "<i>Paste a 0x… address or the note / alias of a watched wallet. No /portfolio prefix.</i>"
+        ),
         "watch_guide_caption": (
             "📖 <b>How to find your Predict.fun wallet address</b>\n\n"
             "1. Go to Predict.fun and log in\n"
@@ -601,6 +613,18 @@ I18N = {
         "watch_reply_invalid": (
             "❌ 这不是一个有效的钱包地址。\n\n"
             "请发送以 <code>0x</code> 开头的有效以太坊地址（42 个字符）。"
+        ),
+        "pos_reply_prompt": (
+            "📊 <b>回复这条消息，发送要查询持仓的钱包地址</b>\n"
+            "<i>0x 地址或已关注钱包的备注 / 别名都行，不用再输入 /pos。</i>"
+        ),
+        "orders_reply_prompt": (
+            "📜 <b>回复这条消息，发送要查询最近成交的钱包地址</b>\n"
+            "<i>0x 地址或已关注钱包的备注 / 别名都行，不用再输入 /orders。</i>"
+        ),
+        "portfolio_reply_prompt": (
+            "📊 <b>回复这条消息，发送要查看资产卡片的钱包地址</b>\n"
+            "<i>0x 地址或已关注钱包的备注 / 别名都行，不用再输入 /portfolio。</i>"
         ),
         "watch_guide_caption": (
             "📖 <b>如何找到你的 Predict.fun 钱包地址</b>\n\n"
@@ -2525,6 +2549,24 @@ async def _prompt_watch_reply(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
     )
 
 
+async def _prompt_addr_reply(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, kind: str
+):
+    """Ask the user to reply with a wallet address for a query command.
+
+    `kind` is one of "pos" / "orders" / "portfolio" — picked up by on_message
+    to route the reply back into the matching cmd_* handler. Mirrors the
+    /watch reply flow so users don't have to retype the slash command.
+    """
+    ctx.user_data["pending_addr_query"] = {"chat_id": chat_id, "kind": kind}
+    await ctx.bot.send_message(
+        chat_id=chat_id,
+        text=t(chat_id, f"{kind}_reply_prompt"),
+        parse_mode="HTML",
+        reply_markup=ForceReply(selective=True),
+    )
+
+
 _NOTE_SEP_CHARS = "-—–:：·｜|,，;；"
 _ADDR_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
@@ -2965,7 +3007,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_pos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not ctx.args:
-        await update.message.reply_text(t(chat_id, "usage_pos"))
+        await _prompt_addr_reply(ctx, chat_id, "pos")
         return
 
     addr = resolve_addr(chat_id, ctx.args[0])
@@ -2991,7 +3033,7 @@ async def cmd_pos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not ctx.args:
-        await update.message.reply_text(t(chat_id, "usage_orders"))
+        await _prompt_addr_reply(ctx, chat_id, "orders")
         return
 
     addr = resolve_addr(chat_id, ctx.args[0])
@@ -3909,7 +3951,7 @@ async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Reuse /pos rendering but open with the portfolio card expanded."""
     chat_id = update.effective_chat.id
     if not ctx.args:
-        await update.message.reply_text(t(chat_id, "usage_pos"))
+        await _prompt_addr_reply(ctx, chat_id, "portfolio")
         return
     addr = resolve_addr(chat_id, ctx.args[0])
     if not addr:
@@ -4112,6 +4154,34 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _pop_pending_watch(ctx)
         ctx.args = tokens
         await cmd_watch(update, ctx)
+        return
+
+    # Reply-to-query flow: /pos, /orders, /portfolio without args sends a
+    # ForceReply prompt; the next text reply is routed back into the same
+    # handler with ctx.args populated.
+    pending_query = ctx.user_data.get("pending_addr_query")
+    if pending_query and pending_query.get("chat_id") == chat_id:
+        kind = pending_query.get("kind")
+        token = (update.message.text or "").strip().split(maxsplit=1)
+        first = token[0] if token else ""
+        # Accept either a raw 0x address or a known alias / note from the
+        # watch list — resolve_addr handles both transparently.
+        addr = resolve_addr(chat_id, first) if first else None
+        if not addr:
+            await update.message.reply_text(
+                t(chat_id, "watch_reply_invalid"),
+                parse_mode="HTML",
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        ctx.user_data.pop("pending_addr_query", None)
+        ctx.args = [addr]
+        if kind == "orders":
+            await cmd_orders(update, ctx)
+        elif kind == "portfolio":
+            await cmd_portfolio(update, ctx)
+        else:
+            await cmd_pos(update, ctx)
         return
 
     # Dust-floor custom-amount reply.
