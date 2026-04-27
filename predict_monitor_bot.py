@@ -17,6 +17,7 @@ import aiohttp
 from telegram import (
     Update,
     BotCommand,
+    BotCommandScopeChat,
     ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -6086,20 +6087,43 @@ async def on_startup(app: Application):
     # Trimmed to a daily-use core. Commands not in this list still work if
     # typed directly (mute/note/portfolio/lang/etc. are also exposed as inline
     # buttons in /list, /pos and /settings).
-    await app.bot.set_my_commands(
-        [
-            BotCommand("start", "开始 / Start"),
-            BotCommand("help", "功能介绍 / Help"),
-            BotCommand("watch", "监控地址 / Watch wallet(s)"),
-            BotCommand("unwatch", "取消监控 / Unwatch wallet"),
-            BotCommand("list", "监控列表 / Watch list"),
-            BotCommand("pos", "查询持仓 / View positions"),
-            BotCommand("orders", "最近成交 / Recent fills"),
-            BotCommand("settings", "偏好设置 / Settings"),
-            BotCommand("defaults", "小额默认 / Micro-fill defaults"),
-            BotCommand("stop", "停止全部监控 / Stop all"),
-        ]
-    )
+    default_commands = [
+        BotCommand("start", "开始 / Start"),
+        BotCommand("help", "功能介绍 / Help"),
+        BotCommand("watch", "监控地址 / Watch wallet(s)"),
+        BotCommand("unwatch", "取消监控 / Unwatch wallet"),
+        BotCommand("list", "监控列表 / Watch list"),
+        BotCommand("pos", "查询持仓 / View positions"),
+        BotCommand("orders", "最近成交 / Recent fills"),
+        BotCommand("settings", "偏好设置 / Settings"),
+        BotCommand("defaults", "小额默认 / Micro-fill defaults"),
+        BotCommand("stop", "停止全部监控 / Stop all"),
+    ]
+    await app.bot.set_my_commands(default_commands)
+    # Admin-only command menu: Telegram lets us register a separate command
+    # list scoped to a single chat (BotCommandScopeChat). The chat-scoped list
+    # fully overrides the default for that chat, so we re-include the regular
+    # commands and append the three /wl_* admin entries. Other users still
+    # see only the default menu.
+    if ADMIN_CHAT_ID is not None:
+        try:
+            await app.bot.set_my_commands(
+                default_commands
+                + [
+                    BotCommand("wl_list", "👑 白名单：列表 / List"),
+                    BotCommand("wl_add", "👑 白名单：开通 / Add chat_id"),
+                    BotCommand("wl_rm", "👑 白名单：移除 / Remove chat_id"),
+                ],
+                scope=BotCommandScopeChat(chat_id=ADMIN_CHAT_ID),
+            )
+        except Exception as e:
+            # Common when the admin hasn't started a private chat with the
+            # bot yet (Telegram refuses to set scope-chat commands for an
+            # unknown chat). Falls back gracefully — admin can still type
+            # /wl_* manually.
+            logger.warning(
+                "Skipping admin scope commands for %s: %s", ADMIN_CHAT_ID, e
+            )
     asyncio.create_task(poll_loop(app))
 
 
