@@ -1742,6 +1742,66 @@ def market_url(market: dict | None) -> str | None:
     return f"{PREDICT_WEB_BASE.rstrip('/')}/{slug}?ref=B00EA"
 
 
+# Short connector words kept lowercase when reconstructing a title from a
+# kebab-case slug (everything else is title-cased). Lossy but readable: the
+# slug "bitcoin-200k-by-june-30-2026" comes back as "Bitcoin 200k by June
+# 30 2026", which is much more informative than the bare "June 30, 2026"
+# leaf the orders API sometimes hands us.
+_SLUG_LOWERCASE_WORDS = {
+    "a", "an", "and", "as", "at", "by", "for", "from", "in", "is", "of",
+    "on", "or", "the", "to", "vs", "with",
+}
+
+
+def _slug_to_title(slug: str | None) -> str:
+    """Turn a URL slug into a human-readable title.
+
+    Returns "" for empty/None/numeric/UUID-ish inputs so callers can use it
+    as an opportunistic fallback without worrying about leaking raw IDs as
+    titles.
+    """
+    if not slug or not isinstance(slug, str):
+        return ""
+    s = slug.strip().strip("/")
+    if not s or "/" in s or s.isdigit() or len(s) < 3:
+        return ""
+    parts = re.split(r"[-_]+", s)
+    out: list[str] = []
+    for i, p in enumerate(parts):
+        if not p:
+            continue
+        if i > 0 and p.lower() in _SLUG_LOWERCASE_WORDS:
+            out.append(p.lower())
+        else:
+            out.append(p[:1].upper() + p[1:])
+    return " ".join(out)
+
+
+def _resolve_title(market: dict | None, api_title: str | None) -> tuple[str, str]:
+    """Return (primary_title, secondary_title) for a market.
+
+    When the URL slug expands into something noticeably longer than the
+    API title (i.e. the API title is a per-trade leaf like "June 30, 2026"
+    and the slug encodes the parent question), promote the slug-derived
+    text to the primary line and keep the API title as the secondary
+    label. Otherwise use the API title as-is and leave the secondary
+    empty so the renderer can suppress the redundant line.
+    """
+    primary = (api_title or "").strip()
+    if not isinstance(market, dict):
+        return primary, ""
+    slug = (
+        market.get("slug")
+        or market.get("marketSlug")
+        or market.get("categorySlug")
+        or market.get("category_slug")
+    )
+    slug_title = _slug_to_title(slug if isinstance(slug, str) else None)
+    if slug_title and len(slug_title) > len(primary) + 4:
+        return slug_title, primary
+    return primary, ""
+
+
 def _relative_time(chat_id: int, ts: float) -> str:
     if not ts:
         return t(chat_id, "relt_never")
@@ -2268,8 +2328,22 @@ def fmt_pos(
             tx_url = f"{TX_EXPLORER_BASE.rstrip('/')}/{tx}"
             tx_line = f'\n🔗 <a href="{tx_url}">{t(chat_id, "view_tx")}</a>'
 
+    # Slug-derived parent title fallback: same logic as fmt_match — when
+    # the API hands us a leaf label like "June 30, 2026", the URL slug
+    # ("bitcoin-200k-by-june-30-2026") is the only place the parent
+    # question survives, so promote it.
+    primary_title, slug_secondary = _resolve_title(link_market, title)
+    sub_line = ""
+    if slug_secondary:
+        sub_norm = slug_secondary.strip()
+        if (
+            sub_norm
+            and sub_norm != (primary_title or "").strip()
+            and sub_norm.lower() != (outcome or "").strip().lower()
+        ):
+            sub_line = f"\n↳ <b>{_html_escape(sub_norm)}</b> — {_html_escape(outcome)}"
     return (
-        f"{emoji} <b>{_title_html(title, link_market)}</b>\n"
+        f"{emoji} <b>{_title_html(primary_title, link_market)}</b>{sub_line}\n"
         f"✅ <b>{outcome}</b>\n"
         f"{size_line}\n"
         f"💰 {t(chat_id, 'label_value')}: <b>{val}</b>"
@@ -2638,19 +2712,24 @@ def fmt_match(
     if isinstance(merged_count, int) and merged_count > 1:
         merged_suffix = t(chat_id, "fills_merged_suffix", count=merged_count)
 
-    title_html = _title_html(title, market)
-    # Per-trade label (e.g. "$700M" under a parent question like "Metamask FDV
-    # above ___ one day after launch?") goes on a secondary line so users see
-    # both the parent context and the specific item, matching the
-    # "<parent>" + "<sub> — <outcome>" pattern. Skip when it duplicates the
-    # main title or just repeats the outcome name.
-    sub_title = market.get("_sub_title") if isinstance(market, dict) else None
+    # Pick the most informative parent title: when the URL slug encodes
+    # a fuller question than the API title (e.g. slug
+    # "bitcoin-200k-by-june-30-2026" vs API title "June 30, 2026"), promote
+    # the slug-derived text and keep the bare API title as the secondary
+    # label. Falls back to the per-trade _sub_title set in
+    # _match_market_view (e.g. "$700M") when the slug isn't longer.
+    primary_title, slug_secondary = _resolve_title(market, title)
+    title_html = _title_html(primary_title, market)
+    sub_candidate = (
+        slug_secondary
+        or (market.get("_sub_title") if isinstance(market, dict) else None)
+    )
     sub_line = ""
-    if sub_title:
-        sub_norm = sub_title.strip()
+    if sub_candidate:
+        sub_norm = sub_candidate.strip()
         if (
             sub_norm
-            and sub_norm != (title or "").strip()
+            and sub_norm != (primary_title or "").strip()
             and sub_norm.lower() != (outcome or "").strip().lower()
         ):
             sub_line = f"\n↳ <b>{_html_escape(sub_norm)}</b> — {_html_escape(outcome)}"
