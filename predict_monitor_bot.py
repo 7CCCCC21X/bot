@@ -2028,7 +2028,6 @@ def fmt_pos(
     match: dict | None = None,
 ) -> str:
     title, outcome, shares, avg = display_fields(pos, market)
-    title = title[:55]
 
     # Use the API's own USD cost when exposed — avoids drift from rounding
     # `avg` to 2dp when the real avg has more precision (e.g. 0.333…¢).
@@ -2136,7 +2135,7 @@ def fmt_resolution(
         else:
             verdict = f"\n{t(chat_id, 'resolve_lose')}"
     return (
-        f"🏁 <b>{_title_html(title[:55], market)}</b>\n"
+        f"🏁 <b>{_title_html(title, market)}</b>\n"
         f"{t(chat_id, 'label_resolve_outcome')}: <b>{_html_escape(winner)}</b>"
         f"{verdict}"
     )
@@ -2299,13 +2298,17 @@ def _match_market_view(match: dict) -> dict:
     """Return the best market dict for a trade record.
 
     The orders API returns two shapes depending on endpoint/version: a nested
-    ``match["market"]`` dict (carrying an id plus sometimes a generic category
-    title like "Match Winner") and/or flat per-trade fields
-    ``market_id`` / ``market_title`` / ``category_slug``. The flat fields are
-    the ones that line up with predict.fun's public URL
-    (``/market/<category_slug>``) and with the specific item the trade was
-    against (e.g. "Chelsea"), so we prefer them for title/slug when set,
-    falling back to the nested dict otherwise. Never mutates input.
+    ``match["market"]`` dict (carrying an id plus sometimes a parent question
+    like "Metamask FDV above ___ one day after launch?") and/or flat per-trade
+    fields ``market_id`` / ``market_title`` / ``category_slug``. The flat
+    ``market_title`` is the specific item the trade was against (e.g. "Chelsea"
+    or "$700M") — useful, but ambiguous on its own when the parent question
+    isn't visible. We keep both: ``title`` carries the nested/parent text and
+    ``_sub_title`` carries the per-trade label so renderers can show full
+    context (matching the "<parent> — <sub>" style users see elsewhere).
+    Falls back to the flat title when nothing nested is available, so
+    rendering still works when /v1/markets/{id} hasn't been merged in yet.
+    Never mutates input.
     """
     nested = match.get("market") if isinstance(match.get("market"), dict) else {}
     out = dict(nested)
@@ -2314,7 +2317,9 @@ def _match_market_view(match: dict) -> dict:
         out["id"] = flat_id
     flat_title = match.get("market_title")
     if flat_title:
-        out["title"] = flat_title
+        out["_sub_title"] = flat_title
+        if not out.get("title"):
+            out["title"] = flat_title
     flat_slug = match.get("category_slug") or match.get("categorySlug")
     if flat_slug:
         out["slug"] = flat_slug
@@ -2457,11 +2462,26 @@ def fmt_match(
     if isinstance(merged_count, int) and merged_count > 1:
         merged_suffix = t(chat_id, "fills_merged_suffix", count=merged_count)
 
-    title_html = _title_html(title[:50], market)
+    title_html = _title_html(title, market)
+    # Per-trade label (e.g. "$700M" under a parent question like "Metamask FDV
+    # above ___ one day after launch?") goes on a secondary line so users see
+    # both the parent context and the specific item, matching the
+    # "<parent>" + "<sub> — <outcome>" pattern. Skip when it duplicates the
+    # main title or just repeats the outcome name.
+    sub_title = market.get("_sub_title") if isinstance(market, dict) else None
+    sub_line = ""
+    if sub_title:
+        sub_norm = sub_title.strip()
+        if (
+            sub_norm
+            and sub_norm != (title or "").strip()
+            and sub_norm.lower() != (outcome or "").strip().lower()
+        ):
+            sub_line = f"\n↳ <b>{_html_escape(sub_norm)}</b> — {_html_escape(outcome)}"
     return (
         f"{side_emoji} {side} {outcome} | "
         f"{t(chat_id, 'label_fill')} {shares_text} @ {price_text}c = {value_text}{merged_suffix}\n"
-        f"{title_html}{total_line}{pnl_line}\n"
+        f"{title_html}{sub_line}{total_line}{pnl_line}\n"
         f"{tx_line}"
     )
 
@@ -2588,7 +2608,11 @@ async def _render_orders(
             mid = view.get("id")
             fresh = await fetch_market(session, mid) if mid else {}
             merged = {**view, **(fresh or {})}
-            if view.get("title"):
+            # Prefer the parent question from /v1/markets/{id}; keep the
+            # per-trade label as _sub_title for the secondary line.
+            if view.get("_sub_title"):
+                merged["_sub_title"] = view["_sub_title"]
+            if not merged.get("title") and view.get("title"):
                 merged["title"] = view["title"]
             if view.get("slug"):
                 merged["slug"] = view["slug"]
@@ -5065,7 +5089,7 @@ async def _evaluate_alerts(
                         chat_id,
                         "alert_fired",
                         addr=fmt_addr(w.address),
-                        title=_title_html(title[:55], pos.get("_market")),
+                        title=_title_html(title, pos.get("_market")),
                         outcome=_html_escape(outcome),
                         op=op,
                         threshold=thr,
@@ -5324,10 +5348,14 @@ async def poll_loop(app: Application):
                             # richest possible dict regardless of which API
                             # shape the upstream returned.
                             merged = {**view, **fresh}
-                            # Don't let the generic category title from
-                            # /v1/markets/{id} overwrite a specific per-trade
-                            # market_title the orders API gave us.
-                            if view.get("title"):
+                            # Prefer the parent question from /v1/markets/{id}
+                            # for the main title (e.g. "Metamask FDV above ___
+                            # one day after launch?") so users see the full
+                            # context. The per-trade label (e.g. "$700M") is
+                            # preserved as _sub_title for the secondary line.
+                            if view.get("_sub_title"):
+                                merged["_sub_title"] = view["_sub_title"]
+                            if not merged.get("title") and view.get("title"):
                                 merged["title"] = view["title"]
                             if view.get("slug"):
                                 merged["slug"] = view["slug"]
