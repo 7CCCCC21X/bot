@@ -331,13 +331,15 @@ I18N = {
         "watching_multi": "Added {added} new, skipped {skipped} already-watching / invalid.",
         "watch_limit_hit": (
             "⛔ You can monitor at most {limit} addresses on the free tier.\n\n"
-            "To monitor more, bind invite code <a href=\"{link}\">{code}</a> "
-            "({link_plain}). Trading volume above 1W? DM {contact} for higher access."
+            "To monitor more, bind invite code {code}\n"
+            "{link}\n"
+            "Trading volume above 1W? DM {contact} for higher access."
         ),
         "watch_limit_partial": (
             "⚠️ Quota reached at {limit} — added {added}, dropped {dropped}.\n"
-            "Bind invite code <a href=\"{link}\">{code}</a> ({link_plain}), "
-            "or DM {contact} for higher access."
+            "Bind invite code {code}\n"
+            "{link}\n"
+            "Or DM {contact} for higher access."
         ),
         "btn_admin_whitelist": "👑 Whitelist management",
         "btn_whale_bot": "🐋 Predict.fun whale alerts",
@@ -789,13 +791,15 @@ I18N = {
         "watching_multi": "新增 {added} 个监控，跳过 {skipped} 个（已存在或格式错误）。",
         "watch_limit_hit": (
             "当前最多可监控 {limit} 个地址。\n\n"
-            "如需监控更多地址，请先绑定邀请码 <a href=\"{link}\">{code}</a>"
-            "（{link_plain}），超过 1W 交易量私信 {contact} 开通更高权限。"
+            "如需监控更多地址，请先绑定邀请码 {code}\n"
+            "{link}\n"
+            "超过 1W 交易量私信 {contact} 开通更高权限。"
         ),
         "watch_limit_partial": (
             "⚠️ 已达上限 {limit}：本次新增 {added} 个，跳过 {dropped} 个。\n"
-            "如需监控更多地址，请先绑定邀请码 <a href=\"{link}\">{code}</a>"
-            "（{link_plain}），超过 1W 交易量私信 {contact} 开通更高权限。"
+            "如需监控更多地址，请先绑定邀请码 {code}\n"
+            "{link}\n"
+            "超过 1W 交易量私信 {contact} 开通更高权限。"
         ),
         "btn_admin_whitelist": "👑 白名单管理",
         "btn_whale_bot": "🐋 Predict.fun 大额交易监控",
@@ -1706,17 +1710,6 @@ def watch_limit_for(chat_id: int) -> int:
     return DEFAULT_WATCH_LIMIT
 
 
-def _invite_link_plain() -> str:
-    """Display-only copy of INVITE_LINK that won't be auto-linked.
-
-    Telegram clients turn any bare URL into a clickable link even inside
-    HTML <code>/parens. We insert a zero-width space (U+200B) right after
-    the scheme so the regex no longer matches a URL while the visible
-    rendering stays identical.
-    """
-    return INVITE_LINK.replace("://", ":​//", 1)
-
-
 def watch_limit_message(chat_id: int) -> str:
     """Localized prompt shown when a chat tries to exceed its quota."""
     return t(
@@ -1726,7 +1719,6 @@ def watch_limit_message(chat_id: int) -> str:
         upgrade_limit=WHITELIST_WATCH_LIMIT,
         code=INVITE_CODE,
         link=INVITE_LINK,
-        link_plain=_invite_link_plain(),
         contact=UPGRADE_CONTACT,
     )
 
@@ -3122,7 +3114,6 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             dropped=quota_dropped,
             code=INVITE_CODE,
             link=INVITE_LINK,
-            link_plain=_invite_link_plain(),
             contact=UPGRADE_CONTACT,
         )
     elif multi_mode:
@@ -4644,7 +4635,6 @@ async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 dropped=quota_dropped,
                 code=INVITE_CODE,
                 link=INVITE_LINK,
-                link_plain=_invite_link_plain(),
                 contact=UPGRADE_CONTACT,
             ),
             parse_mode="HTML",
