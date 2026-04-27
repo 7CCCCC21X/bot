@@ -1563,7 +1563,7 @@ def market_url(market: dict | None) -> str | None:
     )
     if not slug:
         return None
-    return f"{PREDICT_WEB_BASE.rstrip('/')}/{slug}"
+    return f"{PREDICT_WEB_BASE.rstrip('/')}/{slug}?ref=B00EA"
 
 
 def _relative_time(chat_id: int, ts: float) -> str:
