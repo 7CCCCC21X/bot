@@ -327,14 +327,13 @@ I18N = {
         "watching_multi": "Added {added} new, skipped {skipped} already-watching / invalid.",
         "watch_limit_hit": (
             "⛔ You can monitor at most {limit} addresses on the free tier.\n\n"
-            "To monitor more, bind invite code <code>{code}</code> first "
-            "(open the portal: <a href=\"{link}\">{link}</a>) — that lifts "
-            "the cap to {upgrade_limit}.\n"
-            "Trading volume above 1W? DM {contact} for higher access."
+            "To monitor more, bind invite code <a href=\"{link}\">{code}</a> "
+            "({link}). Trading volume above 1W? DM {contact} for higher access."
         ),
         "watch_limit_partial": (
-            "⚠️ Quota reached at {limit} — added {added}, dropped {dropped}. "
-            "Bind invite code <code>{code}</code> ({link}) or DM {contact} for higher access."
+            "⚠️ Quota reached at {limit} — added {added}, dropped {dropped}.\n"
+            "Bind invite code <a href=\"{link}\">{code}</a> ({link}), "
+            "or DM {contact} for higher access."
         ),
         "btn_admin_whitelist": "👑 Whitelist management",
         "admin_only": "⛔ Admin only.",
@@ -785,14 +784,13 @@ I18N = {
         "watching_multi": "新增 {added} 个监控，跳过 {skipped} 个（已存在或格式错误）。",
         "watch_limit_hit": (
             "当前最多可监控 {limit} 个地址。\n\n"
-            "如需监控更多地址，请先绑定邀请码：<code>{code}</code>"
-            "（然后跳转传送门：<a href=\"{link}\">{link}</a>）\n"
-            "大于 1W 以上交易量，私信 {contact} 开通更高权限。"
+            "如需监控更多地址，请先绑定邀请码 <a href=\"{link}\">{code}</a>"
+            "（{link}），超过 1W 交易量私信 {contact} 开通更高权限。"
         ),
         "watch_limit_partial": (
             "⚠️ 已达上限 {limit}：本次新增 {added} 个，跳过 {dropped} 个。\n"
-            "如需监控更多地址，请先绑定邀请码 <code>{code}</code>"
-            "（{link}），或私信 {contact} 开通更高权限。"
+            "如需监控更多地址，请先绑定邀请码 <a href=\"{link}\">{code}</a>"
+            "（{link}），超过 1W 交易量私信 {contact} 开通更高权限。"
         ),
         "btn_admin_whitelist": "👑 白名单管理",
         "admin_only": "⛔ 仅管理员可用。",
