@@ -62,6 +62,10 @@ INVITE_LINK = (
     or f"https://predict.fun?ref={INVITE_CODE}"
 )
 UPGRADE_CONTACT = os.environ.get("UPGRADE_CONTACT", "@xxxXIAOC").strip() or "@xxxXIAOC"
+# Companion whale-watcher bot: surfaced as a one-tap entry on the /start
+# keyboard so users can jump straight into the large-trade feed. Override
+# WHALE_BOT_URL to point at a different t.me handle if needed.
+WHALE_BOT_URL = os.environ.get("WHALE_BOT_URL", "https://t.me/predict_whale_bot").strip() or "https://t.me/predict_whale_bot"
 POLL_INTERVAL = 5
 # Maximum number of wallets polled concurrently within a single cycle. The old
 # loop processed wallets serially with a 1-second gap between each, so a chat
@@ -336,6 +340,7 @@ I18N = {
             "or DM {contact} for higher access."
         ),
         "btn_admin_whitelist": "👑 Whitelist management",
+        "btn_whale_bot": "🐋 Predict.fun whale alerts",
         "admin_only": "⛔ Admin only.",
         "admin_wl_header": (
             "<b>👑 Whitelist ({count})</b>\n"
@@ -793,6 +798,7 @@ I18N = {
             "（{link}），超过 1W 交易量私信 {contact} 开通更高权限。"
         ),
         "btn_admin_whitelist": "👑 白名单管理",
+        "btn_whale_bot": "🐋 Predict.fun 大额交易监控",
         "admin_only": "⛔ 仅管理员可用。",
         "admin_wl_header": (
             "<b>👑 白名单（{count}）</b>\n"
@@ -2662,6 +2668,9 @@ def _start_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(t(chat_id, "btn_watch_wallet"), callback_data="watch_prompt")],
         [InlineKeyboardButton(t(chat_id, "btn_watch_guide"), callback_data="watch_guide")],
+        # Companion bot link — `url=` opens t.me/<handle> in the Telegram
+        # client without leaving a callback in our handler.
+        [InlineKeyboardButton(t(chat_id, "btn_whale_bot"), url=WHALE_BOT_URL)],
         [
             InlineKeyboardButton(
                 t(chat_id, "btn_chatdef_open"), callback_data="cdef:open"
