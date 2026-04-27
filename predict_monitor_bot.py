@@ -17,6 +17,7 @@ import aiohttp
 from telegram import (
     Update,
     BotCommand,
+    BotCommandScopeChat,
     ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -40,6 +41,27 @@ PREDICT_API = "https://api.predict.fun"
 # Optional: admin chat id for /raw debug command. Leave unset to disable.
 _raw_admin = os.environ.get("ADMIN_CHAT_ID", "").strip()
 ADMIN_CHAT_ID = int(_raw_admin) if _raw_admin.lstrip("-").isdigit() else None
+# Watch quotas. Free chats get DEFAULT_WATCH_LIMIT addresses; admin can grant
+# the higher WHITELIST_WATCH_LIMIT cap to specific chats via the whitelist.
+# When a non-admin / non-whitelist chat hits the cap, /watch points them to
+# the invite code + upgrade contact below.
+try:
+    DEFAULT_WATCH_LIMIT = max(1, int(os.environ.get("DEFAULT_WATCH_LIMIT", "10") or 10))
+except ValueError:
+    DEFAULT_WATCH_LIMIT = 10
+try:
+    WHITELIST_WATCH_LIMIT = max(
+        DEFAULT_WATCH_LIMIT,
+        int(os.environ.get("WHITELIST_WATCH_LIMIT", "30") or 30),
+    )
+except ValueError:
+    WHITELIST_WATCH_LIMIT = 30
+INVITE_CODE = os.environ.get("INVITE_CODE", "B00EA").strip() or "B00EA"
+INVITE_LINK = (
+    os.environ.get("INVITE_LINK", "").strip()
+    or f"https://predict.fun?ref={INVITE_CODE}"
+)
+UPGRADE_CONTACT = os.environ.get("UPGRADE_CONTACT", "@xxxXIAOC").strip() or "@xxxXIAOC"
 POLL_INTERVAL = 5
 # Maximum number of wallets polled concurrently within a single cycle. The old
 # loop processed wallets serially with a 1-second gap between each, so a chat
@@ -184,6 +206,9 @@ chat_defaults: dict[int, dict] = {}
 # In-memory bulk-selection state for the watch list. Selecting checkboxes in
 # /list lives here only — never persisted. Keyed by chat_id.
 bulk_selection: dict[int, set[str]] = {}
+# Chats that the admin has granted the higher WHITELIST_WATCH_LIMIT cap to.
+# Persisted in the chat_whitelist table; load_state populates it on startup.
+whitelisted_chats: set[int] = set()
 # Rolling per-endpoint API status log. Each entry is (epoch_s, label) where
 # label ∈ {"ok", "429", "5xx", "timeout", "other"}. Powers /apistatus. Capped
 # at 2000 entries per endpoint (~roughly the last several hours of polling).
@@ -300,6 +325,40 @@ I18N = {
         "label_muted_flag": "🔕 muted",
         "label_watching_flag": "👁 watching",
         "watching_multi": "Added {added} new, skipped {skipped} already-watching / invalid.",
+        "watch_limit_hit": (
+            "⛔ You can monitor at most {limit} addresses on the free tier.\n\n"
+            "To monitor more, bind invite code <code>{code}</code> first "
+            "(open the portal: <a href=\"{link}\">{link}</a>) — that lifts "
+            "the cap to {upgrade_limit}.\n"
+            "Trading volume above 1W? DM {contact} for higher access."
+        ),
+        "watch_limit_partial": (
+            "⚠️ Quota reached at {limit} — added {added}, dropped {dropped}. "
+            "Bind invite code <code>{code}</code> ({link}) or DM {contact} for higher access."
+        ),
+        "btn_admin_whitelist": "👑 Whitelist management",
+        "admin_only": "⛔ Admin only.",
+        "admin_wl_header": (
+            "<b>👑 Whitelist ({count})</b>\n"
+            "Free cap: {free} · Whitelisted cap: {wl}\n\n"
+        ),
+        "admin_wl_empty": "<i>No whitelisted chats yet.</i>",
+        "admin_wl_usage": (
+            "Usage:\n"
+            "<code>/wl_add &lt;chat_id&gt;</code>\n"
+            "<code>/wl_rm &lt;chat_id&gt;</code>\n"
+            "<code>/wl_list</code>"
+        ),
+        "admin_wl_added": "✅ Whitelisted chat <code>{chat_id}</code>.",
+        "admin_wl_already": "ℹ️ Chat <code>{chat_id}</code> is already whitelisted.",
+        "admin_wl_removed": "🗑 Removed chat <code>{chat_id}</code> from whitelist.",
+        "admin_wl_not_found": "Chat <code>{chat_id}</code> is not whitelisted.",
+        "admin_wl_bad_id": "Chat id must be an integer.",
+        "btn_wl_add": "➕ Add chat",
+        "btn_wl_back": "⬅ Back",
+        "wl_add_prompt": (
+            "Reply with the chat id to whitelist (one integer)."
+        ),
         "usage_mute": "Usage: /mute addr|alias",
         "usage_unmute": "Usage: /unmute addr|alias",
         "muted_ok": "🔕 Muted <code>{addr}</code>",
@@ -724,6 +783,38 @@ I18N = {
         "label_muted_flag": "🔕 已静音",
         "label_watching_flag": "👁 监控中",
         "watching_multi": "新增 {added} 个监控，跳过 {skipped} 个（已存在或格式错误）。",
+        "watch_limit_hit": (
+            "当前最多可监控 {limit} 个地址。\n\n"
+            "如需监控更多地址，请先绑定邀请码：<code>{code}</code>"
+            "（然后跳转传送门：<a href=\"{link}\">{link}</a>）\n"
+            "大于 1W 以上交易量，私信 {contact} 开通更高权限。"
+        ),
+        "watch_limit_partial": (
+            "⚠️ 已达上限 {limit}：本次新增 {added} 个，跳过 {dropped} 个。\n"
+            "如需监控更多地址，请先绑定邀请码 <code>{code}</code>"
+            "（{link}），或私信 {contact} 开通更高权限。"
+        ),
+        "btn_admin_whitelist": "👑 白名单管理",
+        "admin_only": "⛔ 仅管理员可用。",
+        "admin_wl_header": (
+            "<b>👑 白名单（{count}）</b>\n"
+            "免费上限：{free} · 白名单上限：{wl}\n\n"
+        ),
+        "admin_wl_empty": "<i>暂无白名单成员。</i>",
+        "admin_wl_usage": (
+            "用法：\n"
+            "<code>/wl_add &lt;chat_id&gt;</code>\n"
+            "<code>/wl_rm &lt;chat_id&gt;</code>\n"
+            "<code>/wl_list</code>"
+        ),
+        "admin_wl_added": "✅ 已开通 <code>{chat_id}</code> 白名单。",
+        "admin_wl_already": "ℹ️ <code>{chat_id}</code> 已在白名单内。",
+        "admin_wl_removed": "🗑 已移除 <code>{chat_id}</code> 白名单。",
+        "admin_wl_not_found": "<code>{chat_id}</code> 不在白名单中。",
+        "admin_wl_bad_id": "chat id 必须是整数。",
+        "btn_wl_add": "➕ 添加",
+        "btn_wl_back": "⬅ 返回",
+        "wl_add_prompt": "回复要开通白名单的 chat id（一个整数）。",
         "usage_mute": "用法：/mute 地址或备注",
         "usage_unmute": "用法：/unmute 地址或备注",
         "muted_ok": "🔕 已静音 <code>{addr}</code>",
@@ -1107,6 +1198,17 @@ def init_db():
             )
             """
         )
+        # Admin-managed whitelist: chats that get the higher
+        # WHITELIST_WATCH_LIMIT instead of DEFAULT_WATCH_LIMIT for /watch.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_whitelist (
+                chat_id INTEGER PRIMARY KEY,
+                granted_at REAL NOT NULL DEFAULT 0,
+                granted_by INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS alerts (
@@ -1227,6 +1329,42 @@ def save_chat_defaults(chat_id: int):
         conn.commit()
 
 
+# --- whitelist persistence -----------------------------------------------
+
+
+def db_add_whitelist(chat_id: int, granted_by: int = 0) -> None:
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO chat_whitelist(chat_id, granted_at, granted_by)
+            VALUES(?,?,?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                granted_at=excluded.granted_at,
+                granted_by=excluded.granted_by
+            """,
+            (int(chat_id), time.time(), int(granted_by or 0)),
+        )
+        conn.commit()
+
+
+def db_remove_whitelist(chat_id: int) -> None:
+    with db_lock, db_conn() as conn:
+        conn.execute("DELETE FROM chat_whitelist WHERE chat_id=?", (int(chat_id),))
+        conn.commit()
+
+
+def db_load_whitelist() -> set[int]:
+    with db_lock, db_conn() as conn:
+        try:
+            return {
+                int(cid)
+                for (cid,) in conn.execute("SELECT chat_id FROM chat_whitelist")
+            }
+        except sqlite3.OperationalError:
+            # Table not yet present (first boot before init_db ran).
+            return set()
+
+
 # --- alerts + events persistence -----------------------------------------
 
 
@@ -1293,6 +1431,8 @@ def delete_alert(chat_id: int, alert_id: int) -> bool:
 
 
 def load_state():
+    whitelisted_chats.clear()
+    whitelisted_chats.update(db_load_whitelist())
     with db_lock, db_conn() as conn:
         for chat_id, lang in conn.execute("SELECT chat_id, lang FROM chat_lang"):
             chat_lang[int(chat_id)] = lang
@@ -1545,6 +1685,34 @@ def resolve_addr(chat_id: int, arg: str) -> str | None:
     if arg.startswith("0x") and len(arg) == 42:
         return arg
     return None
+
+
+def is_admin(chat_id: int) -> bool:
+    return ADMIN_CHAT_ID is not None and int(chat_id) == ADMIN_CHAT_ID
+
+
+def is_whitelisted(chat_id: int) -> bool:
+    return int(chat_id) in whitelisted_chats
+
+
+def watch_limit_for(chat_id: int) -> int:
+    """How many addresses this chat is allowed to monitor."""
+    if is_admin(chat_id) or is_whitelisted(chat_id):
+        return WHITELIST_WATCH_LIMIT
+    return DEFAULT_WATCH_LIMIT
+
+
+def watch_limit_message(chat_id: int) -> str:
+    """Localized prompt shown when a chat tries to exceed its quota."""
+    return t(
+        chat_id,
+        "watch_limit_hit",
+        limit=DEFAULT_WATCH_LIMIT,
+        upgrade_limit=WHITELIST_WATCH_LIMIT,
+        code=INVITE_CODE,
+        link=INVITE_LINK,
+        contact=UPGRADE_CONTACT,
+    )
 
 
 def market_url(market: dict | None) -> str | None:
@@ -2489,22 +2657,29 @@ def fmt_match(
 
 
 def _start_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+    rows = [
         [
-            [
-                InlineKeyboardButton("🇺🇸 English", callback_data="lang_en"),
-                InlineKeyboardButton("🇨🇳 中文", callback_data="lang_zh"),
-            ],
-            [InlineKeyboardButton(t(chat_id, "btn_watch_wallet"), callback_data="watch_prompt")],
-            [InlineKeyboardButton(t(chat_id, "btn_watch_guide"), callback_data="watch_guide")],
+            InlineKeyboardButton("🇺🇸 English", callback_data="lang_en"),
+            InlineKeyboardButton("🇨🇳 中文", callback_data="lang_zh"),
+        ],
+        [InlineKeyboardButton(t(chat_id, "btn_watch_wallet"), callback_data="watch_prompt")],
+        [InlineKeyboardButton(t(chat_id, "btn_watch_guide"), callback_data="watch_guide")],
+        [
+            InlineKeyboardButton(
+                t(chat_id, "btn_chatdef_open"), callback_data="cdef:open"
+            ),
+            InlineKeyboardButton(t(chat_id, "btn_help"), callback_data="help_root"),
+        ],
+    ]
+    if is_admin(chat_id):
+        rows.append(
             [
                 InlineKeyboardButton(
-                    t(chat_id, "btn_chatdef_open"), callback_data="cdef:open"
-                ),
-                InlineKeyboardButton(t(chat_id, "btn_help"), callback_data="help_root"),
-            ],
-        ]
-    )
+                    t(chat_id, "btn_admin_whitelist"), callback_data="admin:wl"
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2842,10 +3017,31 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     watched.setdefault(chat_id, {})
+    limit = watch_limit_for(chat_id)
+    # Refuse early when the chat is already at the cap and the request would
+    # add at least one fresh address — saves a /v1/positions round-trip and
+    # lets the user see the upgrade hint immediately. Pure no-ops (only
+    # duplicates or invalid addresses) fall through to the regular flow.
+    existing_lower = {a.lower() for a in watched[chat_id]}
+    has_new = any(_is_addr(a) and a.lower() not in existing_lower for a, _ in pairs)
+    if (
+        has_new
+        and len(watched[chat_id]) >= limit
+        and not is_admin(chat_id)
+        and not is_whitelisted(chat_id)
+    ):
+        await update.message.reply_text(
+            watch_limit_message(chat_id),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
     status = await update.message.reply_text(t(chat_id, "loading_positions"))
 
     added = 0
     skipped = 0
+    quota_dropped = 0
     last_addr = ""
     last_count = 0
 
@@ -2856,6 +3052,16 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 continue
             if addr.lower() in {a.lower() for a in watched[chat_id]}:
                 skipped += 1
+                continue
+            # Per-add cap check (handles batches that straddle the limit).
+            # Admin/whitelisted chats are exempt; everyone else stops at
+            # `limit` total entries and we report the dropped count below.
+            if (
+                len(watched[chat_id]) >= limit
+                and not is_admin(chat_id)
+                and not is_whitelisted(chat_id)
+            ):
+                quota_dropped += 1
                 continue
 
             positions = await fetch_positions(session, addr)
@@ -2887,7 +3093,19 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             last_addr = addr
             last_count = len(positions)
 
-    if multi_mode:
+    if quota_dropped:
+        # Mid-batch cap hit: report partial progress + upgrade hint.
+        final_text = t(
+            chat_id,
+            "watch_limit_partial",
+            limit=limit,
+            added=added,
+            dropped=quota_dropped,
+            code=INVITE_CODE,
+            link=INVITE_LINK,
+            contact=UPGRADE_CONTACT,
+        )
+    elif multi_mode:
         final_text = t(chat_id, "watching_multi", added=added, skipped=skipped)
     elif added == 1:
         final_text = t(
@@ -3345,6 +3563,111 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_id=chat_id,
         document=InputFile(buf, filename=filename),
         caption=t(chat_id, "export_caption", count=len(wallets)),
+    )
+
+
+def _format_whitelist_panel(chat_id: int) -> str:
+    """Body text for the admin whitelist panel (header + sorted entries)."""
+    entries = sorted(whitelisted_chats)
+    text = t(
+        chat_id,
+        "admin_wl_header",
+        count=len(entries),
+        free=DEFAULT_WATCH_LIMIT,
+        wl=WHITELIST_WATCH_LIMIT,
+    )
+    if not entries:
+        return text + t(chat_id, "admin_wl_empty")
+    lines = [f"• <code>{cid}</code>" for cid in entries]
+    return text + "\n".join(lines)
+
+
+def _whitelist_panel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                t(chat_id, "btn_wl_add"), callback_data="admin:wl:add"
+            )
+        ]
+    ]
+    # One remove button per entry, capped to keep the keyboard compact.
+    for cid in sorted(whitelisted_chats)[:20]:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🗑 {cid}", callback_data=f"admin:wl:rm:{cid}"
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_wl_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text(t(chat_id, "admin_only"))
+        return
+    await update.message.reply_text(
+        _format_whitelist_panel(chat_id),
+        parse_mode="HTML",
+        reply_markup=_whitelist_panel_keyboard(chat_id),
+        disable_web_page_preview=True,
+    )
+
+
+def _parse_chat_id_arg(args: list[str]) -> int | None:
+    if not args:
+        return None
+    raw = args[0].strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+async def cmd_wl_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text(t(chat_id, "admin_only"))
+        return
+    target = _parse_chat_id_arg(ctx.args or [])
+    if target is None:
+        await update.message.reply_text(
+            t(chat_id, "admin_wl_usage"), parse_mode="HTML"
+        )
+        return
+    if target in whitelisted_chats:
+        await update.message.reply_text(
+            t(chat_id, "admin_wl_already", chat_id=target), parse_mode="HTML"
+        )
+        return
+    whitelisted_chats.add(target)
+    db_add_whitelist(target, granted_by=chat_id)
+    await update.message.reply_text(
+        t(chat_id, "admin_wl_added", chat_id=target), parse_mode="HTML"
+    )
+
+
+async def cmd_wl_rm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text(t(chat_id, "admin_only"))
+        return
+    target = _parse_chat_id_arg(ctx.args or [])
+    if target is None:
+        await update.message.reply_text(
+            t(chat_id, "admin_wl_usage"), parse_mode="HTML"
+        )
+        return
+    if target not in whitelisted_chats:
+        await update.message.reply_text(
+            t(chat_id, "admin_wl_not_found", chat_id=target), parse_mode="HTML"
+        )
+        return
+    whitelisted_chats.discard(target)
+    db_remove_whitelist(target)
+    await update.message.reply_text(
+        t(chat_id, "admin_wl_removed", chat_id=target), parse_mode="HTML"
     )
 
 
@@ -4235,7 +4558,9 @@ async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     added = 0
     skipped = 0
+    quota_dropped = 0
     watched.setdefault(chat_id, {})
+    limit = watch_limit_for(chat_id)
     async with aiohttp.ClientSession() as session:
         for rec in records:
             if not isinstance(rec, dict):
@@ -4247,6 +4572,13 @@ async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 continue
             if addr.lower() in {a.lower() for a in watched[chat_id]}:
                 skipped += 1
+                continue
+            if (
+                len(watched[chat_id]) >= limit
+                and not is_admin(chat_id)
+                and not is_whitelisted(chat_id)
+            ):
+                quota_dropped += 1
                 continue
 
             positions = await fetch_positions(session, addr)
@@ -4278,6 +4610,21 @@ async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(
         t(chat_id, "import_done", added=added, skipped=skipped), parse_mode="HTML"
     )
+    if quota_dropped:
+        await msg.reply_text(
+            t(
+                chat_id,
+                "watch_limit_partial",
+                limit=limit,
+                added=added,
+                dropped=quota_dropped,
+                code=INVITE_CODE,
+                link=INVITE_LINK,
+                contact=UPGRADE_CONTACT,
+            ),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
 
 # ---- Inline note editing (reply-based) ----
@@ -4448,6 +4795,41 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _show_chatdef_picker(ctx, chat_id)
         return
 
+    # Admin whitelist add — reply with a chat id after tapping ➕ in the panel.
+    pending_wl = ctx.user_data.get("pending_wl_add")
+    if pending_wl and pending_wl.get("chat_id") == chat_id:
+        if not is_admin(chat_id):
+            ctx.user_data.pop("pending_wl_add", None)
+            return
+        raw = (update.message.text or "").strip().split()
+        token = raw[0] if raw else ""
+        try:
+            target = int(token)
+        except ValueError:
+            await update.message.reply_text(
+                t(chat_id, "admin_wl_bad_id"),
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        ctx.user_data.pop("pending_wl_add", None)
+        if target in whitelisted_chats:
+            await update.message.reply_text(
+                t(chat_id, "admin_wl_already", chat_id=target), parse_mode="HTML"
+            )
+        else:
+            whitelisted_chats.add(target)
+            db_add_whitelist(target, granted_by=chat_id)
+            await update.message.reply_text(
+                t(chat_id, "admin_wl_added", chat_id=target), parse_mode="HTML"
+            )
+        await update.message.reply_text(
+            _format_whitelist_panel(chat_id),
+            parse_mode="HTML",
+            reply_markup=_whitelist_panel_keyboard(chat_id),
+            disable_web_page_preview=True,
+        )
+        return
+
     pending = _pop_pending_note_edit(ctx)
     if not pending or pending.get("chat_id") != chat_id:
         return
@@ -4519,6 +4901,48 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         except BadRequest:
             pass
+        return
+
+    # admin:wl[*] — admin-only whitelist panel (root, add prompt, remove).
+    if data.startswith("admin:wl"):
+        if not is_admin(chat_id):
+            await ctx.bot.send_message(chat_id=chat_id, text=t(chat_id, "admin_only"))
+            return
+        # admin:wl                — open / refresh the panel
+        # admin:wl:add            — set up a ForceReply for a chat id
+        # admin:wl:rm:<chat_id>   — remove a single entry
+        rest = data[len("admin:wl"):]
+        if rest.startswith(":rm:"):
+            try:
+                target = int(rest[4:])
+            except ValueError:
+                target = None
+            if target is not None and target in whitelisted_chats:
+                whitelisted_chats.discard(target)
+                db_remove_whitelist(target)
+        elif rest == ":add":
+            ctx.user_data["pending_wl_add"] = {"chat_id": chat_id}
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=t(chat_id, "wl_add_prompt"),
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        try:
+            await query.edit_message_text(
+                _format_whitelist_panel(chat_id),
+                parse_mode="HTML",
+                reply_markup=_whitelist_panel_keyboard(chat_id),
+                disable_web_page_preview=True,
+            )
+        except BadRequest:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=_format_whitelist_panel(chat_id),
+                parse_mode="HTML",
+                reply_markup=_whitelist_panel_keyboard(chat_id),
+                disable_web_page_preview=True,
+            )
         return
 
     # notify:<split|merged> — toggle the per-chat notification layout.
@@ -5663,20 +6087,43 @@ async def on_startup(app: Application):
     # Trimmed to a daily-use core. Commands not in this list still work if
     # typed directly (mute/note/portfolio/lang/etc. are also exposed as inline
     # buttons in /list, /pos and /settings).
-    await app.bot.set_my_commands(
-        [
-            BotCommand("start", "开始 / Start"),
-            BotCommand("help", "功能介绍 / Help"),
-            BotCommand("watch", "监控地址 / Watch wallet(s)"),
-            BotCommand("unwatch", "取消监控 / Unwatch wallet"),
-            BotCommand("list", "监控列表 / Watch list"),
-            BotCommand("pos", "查询持仓 / View positions"),
-            BotCommand("orders", "最近成交 / Recent fills"),
-            BotCommand("settings", "偏好设置 / Settings"),
-            BotCommand("defaults", "小额默认 / Micro-fill defaults"),
-            BotCommand("stop", "停止全部监控 / Stop all"),
-        ]
-    )
+    default_commands = [
+        BotCommand("start", "开始 / Start"),
+        BotCommand("help", "功能介绍 / Help"),
+        BotCommand("watch", "监控地址 / Watch wallet(s)"),
+        BotCommand("unwatch", "取消监控 / Unwatch wallet"),
+        BotCommand("list", "监控列表 / Watch list"),
+        BotCommand("pos", "查询持仓 / View positions"),
+        BotCommand("orders", "最近成交 / Recent fills"),
+        BotCommand("settings", "偏好设置 / Settings"),
+        BotCommand("defaults", "小额默认 / Micro-fill defaults"),
+        BotCommand("stop", "停止全部监控 / Stop all"),
+    ]
+    await app.bot.set_my_commands(default_commands)
+    # Admin-only command menu: Telegram lets us register a separate command
+    # list scoped to a single chat (BotCommandScopeChat). The chat-scoped list
+    # fully overrides the default for that chat, so we re-include the regular
+    # commands and append the three /wl_* admin entries. Other users still
+    # see only the default menu.
+    if ADMIN_CHAT_ID is not None:
+        try:
+            await app.bot.set_my_commands(
+                default_commands
+                + [
+                    BotCommand("wl_list", "👑 白名单：列表 / List"),
+                    BotCommand("wl_add", "👑 白名单：开通 / Add chat_id"),
+                    BotCommand("wl_rm", "👑 白名单：移除 / Remove chat_id"),
+                ],
+                scope=BotCommandScopeChat(chat_id=ADMIN_CHAT_ID),
+            )
+        except Exception as e:
+            # Common when the admin hasn't started a private chat with the
+            # bot yet (Telegram refuses to set scope-chat commands for an
+            # unknown chat). Falls back gracefully — admin can still type
+            # /wl_* manually.
+            logger.warning(
+                "Skipping admin scope commands for %s: %s", ADMIN_CHAT_ID, e
+            )
     asyncio.create_task(poll_loop(app))
 
 
@@ -5705,6 +6152,9 @@ def main():
     app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_handler(CommandHandler("apistatus", cmd_apistatus))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
+    app.add_handler(CommandHandler("wl_list", cmd_wl_list))
+    app.add_handler(CommandHandler("wl_add", cmd_wl_add))
+    app.add_handler(CommandHandler("wl_rm", cmd_wl_rm))
     app.add_handler(CommandHandler("threshold", cmd_threshold))
     app.add_handler(CommandHandler("interval", cmd_interval))
     app.add_handler(CommandHandler("dustinterval", cmd_dustinterval))
