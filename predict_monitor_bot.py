@@ -6,6 +6,7 @@ import time
 import json
 import csv
 import sqlite3
+import statistics
 import threading
 from collections import deque
 from io import BytesIO, StringIO
@@ -85,6 +86,13 @@ try:
     MIN_FILL_USD = float(os.environ.get("MIN_FILL_USD", "1") or 1)
 except ValueError:
     MIN_FILL_USD = 1.0
+# Address used by /speedtest to probe the matches API. Defaults to a known
+# active wallet so the call returns a realistic, non-empty payload; override
+# via env var if that wallet ever quietens down.
+SPEEDTEST_ADDRESS = os.environ.get(
+    "SPEEDTEST_ADDRESS",
+    "0x4338bcDA5038Eb9efCdF53Be48d74b2aA04Be27A",
+).strip() or "0x4338bcDA5038Eb9efCdF53Be48d74b2aA04Be27A"
 # Fallback dust-summary flush interval (seconds). Defaults to 8 hours so
 # micro-fill summaries batch instead of firing on every poll. Set to 0 to
 # restore the legacy "flush every poll" behavior globally, or override per
@@ -362,6 +370,23 @@ I18N = {
         "admin_wl_removed": "🗑 Removed chat <code>{chat_id}</code> from whitelist.",
         "admin_wl_not_found": "Chat <code>{chat_id}</code> is not whitelisted.",
         "admin_wl_bad_id": "Chat id must be an integer.",
+        "speedtest_running": "🧪 Running API speed test...",
+        "speedtest_report": (
+            "<b>🧪 API speed test</b> (orders/matches)\n"
+            "addr: <code>{address}</code>\n"
+            "{total} requests / {elapsed:.1f}s\n"
+            "<pre>{table}</pre>\n"
+            "Suggested min interval: <b>{recommend}</b>\n"
+            "First 429 at: {first_429}\n"
+            "Current POLL_INTERVAL: {poll_interval}s\n"
+            "Last Retry-After: {retry_after}\n"
+            "<i>{note}</i>"
+        ),
+        "speedtest_note_ip": (
+            "Normal polling kept running during the test; rate limit is "
+            "IP-scoped, so an instant burst can briefly delay other "
+            "wallets. Re-check /apistatus after ~1 min."
+        ),
         "btn_wl_add": "➕ Add chat",
         "btn_wl_back": "⬅ Back",
         "wl_add_prompt": (
@@ -823,6 +848,22 @@ I18N = {
         "admin_wl_removed": "🗑 已移除 <code>{chat_id}</code> 白名单。",
         "admin_wl_not_found": "<code>{chat_id}</code> 不在白名单中。",
         "admin_wl_bad_id": "chat id 必须是整数。",
+        "speedtest_running": "🧪 API 速度测试中...",
+        "speedtest_report": (
+            "<b>🧪 API 速度测试</b> (orders/matches)\n"
+            "地址: <code>{address}</code>\n"
+            "共 {total} 次请求 / 用时 {elapsed:.1f}s\n"
+            "<pre>{table}</pre>\n"
+            "建议最小间隔: <b>{recommend}</b>\n"
+            "首次 429 间隔: {first_429}\n"
+            "当前 POLL_INTERVAL: {poll_interval}s\n"
+            "最近 Retry-After: {retry_after}\n"
+            "<i>{note}</i>"
+        ),
+        "speedtest_note_ip": (
+            "测试期间正常轮询仍在跑；rate-limit 是 IP 级，瞬时打满会"
+            "短暂影响其他钱包查询，建议 1 分钟后再观察 /apistatus。"
+        ),
         "btn_wl_add": "➕ 添加",
         "btn_wl_back": "⬅ 返回",
         "wl_add_prompt": "回复要开通白名单的 chat id（一个整数）。",
@@ -1662,6 +1703,38 @@ async def fetch_order_matches(
         _record_api("matches", "timeout")
         logger.error(f"fetch_order_matches error: {e}")
         return None
+
+
+async def _speedtest_probe(
+    session: aiohttp.ClientSession, address: str
+) -> tuple[str, float, float | None]:
+    """Fire a single /orders/matches call for the speedtest probe.
+
+    Returns ``(label, latency_ms, retry_after_s)`` where label is one of
+    ``"ok"``, ``"429"``, or ``"err"``. Deliberately bypasses ``_record_api``
+    so synthetic load doesn't pollute the regular /apistatus counters.
+    """
+    url = f"{PREDICT_API}/v1/orders/matches"
+    params = {"signerAddress": address, "first": "20"}
+    started = time.monotonic()
+    try:
+        async with session.get(
+            url,
+            params=params,
+            headers=_headers(),
+            timeout=aiohttp.ClientTimeout(total=12),
+        ) as resp:
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            if resp.status == 200:
+                # Drain the body so connection reuse doesn't skew the next probe.
+                await resp.read()
+                return ("ok", elapsed_ms, None)
+            if resp.status == 429:
+                retry = _parse_retry_after(resp.headers.get("Retry-After"))
+                return ("429", elapsed_ms, retry)
+            return ("err", elapsed_ms, None)
+    except (asyncio.TimeoutError, Exception):
+        return ("err", (time.monotonic() - started) * 1000.0, None)
 
 
 def get_lang(chat_id: int) -> str:
@@ -4008,6 +4081,173 @@ async def cmd_apistatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"<pre>{body}</pre>", parse_mode="HTML")
 
 
+# Ramp schedule for /speedtest: each entry is (sleep-after-response-ms,
+# requests-at-this-level). Sequential probes — interval is the sleep
+# *between* responses, so 0ms means "fire next as soon as previous
+# returned" (effective rate then bottlenecks on RTT, which the report
+# surfaces explicitly).
+_SPEEDTEST_LEVELS: tuple[int, ...] = (2000, 1000, 500, 200, 100, 50, 0)
+_SPEEDTEST_PER_LEVEL = 5
+_SPEEDTEST_TOTAL_BUDGET = 30
+# Stop a level early if 3 consecutive 429s come back — keeps total
+# requests within budget when the API is clearly saturated.
+_SPEEDTEST_LEVEL_ABORT = 3
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    """Small-sample-tolerant percentile: returns max() when n < 10 so a
+    5-sample p95 doesn't collapse to the same number as p50 via interpolation
+    artifacts in ``statistics.quantiles``."""
+    if not values:
+        return None
+    if len(values) < 10:
+        if pct >= 0.95:
+            return max(values)
+        if pct <= 0.5:
+            return statistics.median(values)
+        return sorted(values)[max(0, int(len(values) * pct) - 1)]
+    qs = statistics.quantiles(values, n=100)
+    idx = max(0, min(len(qs) - 1, int(pct * 100) - 1))
+    return qs[idx]
+
+
+async def cmd_speedtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin-only adaptive rate-limit probe against /v1/orders/matches.
+
+    Ramps the inter-request interval down across _SPEEDTEST_LEVELS, firing
+    _SPEEDTEST_PER_LEVEL sequential requests at each level (capped to a
+    _SPEEDTEST_TOTAL_BUDGET total). Reports per-level OK/429/err counts and
+    latency, plus the tightest interval that stayed clean and the first
+    interval where 429 appeared.
+
+    Bypasses _record_api so the synthetic load doesn't pollute /apistatus.
+    """
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text(t(chat_id, "admin_only"))
+        return
+
+    progress = await update.message.reply_text(
+        t(chat_id, "speedtest_running"), parse_mode="HTML"
+    )
+
+    test_address = SPEEDTEST_ADDRESS
+    started = time.monotonic()
+    total_sent = 0
+    last_retry_after: float | None = None
+    # Per-level rows: [(interval_ms, ok, n429, n_err, latencies, aborted_early)]
+    rows: list[tuple[int, int, int, int, list[float], bool]] = []
+
+    async with aiohttp.ClientSession() as session:
+        for interval_ms in _SPEEDTEST_LEVELS:
+            ok = 0
+            n429 = 0
+            n_err = 0
+            lats: list[float] = []
+            consec_429 = 0
+            aborted_early = False
+            for i in range(_SPEEDTEST_PER_LEVEL):
+                if total_sent >= _SPEEDTEST_TOTAL_BUDGET:
+                    aborted_early = True
+                    break
+                label, latency_ms, retry_after = await _speedtest_probe(
+                    session, test_address
+                )
+                total_sent += 1
+                if label == "ok":
+                    ok += 1
+                    lats.append(latency_ms)
+                    consec_429 = 0
+                elif label == "429":
+                    n429 += 1
+                    consec_429 += 1
+                    if retry_after is not None:
+                        last_retry_after = retry_after
+                    if consec_429 >= _SPEEDTEST_LEVEL_ABORT:
+                        aborted_early = True
+                        break
+                else:
+                    n_err += 1
+                    consec_429 = 0
+                if i < _SPEEDTEST_PER_LEVEL - 1 and interval_ms > 0:
+                    await asyncio.sleep(interval_ms / 1000.0)
+            rows.append((interval_ms, ok, n429, n_err, lats, aborted_early))
+            # Stop ramping if we already hit budget — the next levels would
+            # produce empty rows.
+            if total_sent >= _SPEEDTEST_TOTAL_BUDGET:
+                break
+
+    elapsed = time.monotonic() - started
+
+    # Build the monospace table. Header columns are ASCII so widths line
+    # up identically in en/zh.
+    header = f"{'interval':>8}  {'ok':>3} {'429':>3} {'err':>3}   latency(ms)"
+    sep = "─" * 44
+    table_lines = [header, sep]
+    first_429_interval: int | None = None
+    last_clean_interval: int | None = None
+    for interval_ms, ok, n429, n_err, lats, aborted_early in rows:
+        p50 = _percentile(lats, 0.5)
+        p95 = _percentile(lats, 0.95)
+        mx = max(lats) if lats else None
+        if lats:
+            lat_text = (
+                f"p50={p50:.0f} p95={p95:.0f} max={mx:.0f}"
+                if p50 is not None and p95 is not None and mx is not None
+                else "—"
+            )
+        else:
+            lat_text = "—"
+        marker = ""
+        if n429 > 0 and first_429_interval is None:
+            first_429_interval = interval_ms
+            marker = "  ← first 429"
+        if aborted_early and n429 >= _SPEEDTEST_LEVEL_ABORT:
+            marker += "  (early stop)"
+        if n429 == 0 and ok > 0:
+            last_clean_interval = interval_ms
+        table_lines.append(
+            f"{interval_ms:>6}ms  {ok:>3} {n429:>3} {n_err:>3}   {lat_text}{marker}"
+        )
+    table = "\n".join(table_lines)
+
+    if last_clean_interval is not None:
+        rps = (1000.0 / last_clean_interval) if last_clean_interval > 0 else None
+        if rps is not None:
+            recommend = f"{last_clean_interval}ms  (≈ {rps:.1f} req/s)"
+        else:
+            recommend = "0ms  (RTT-bound)"
+    else:
+        recommend = "—"
+
+    first_429_text = f"{first_429_interval}ms" if first_429_interval is not None else "—"
+    retry_after_text = (
+        f"{last_retry_after:.1f}s" if last_retry_after is not None else "—"
+    )
+    addr_short = f"{test_address[:6]}…{test_address[-4:]}"
+
+    body = t(
+        chat_id,
+        "speedtest_report",
+        address=addr_short,
+        total=total_sent,
+        elapsed=elapsed,
+        table=table,
+        recommend=recommend,
+        first_429=first_429_text,
+        poll_interval=POLL_INTERVAL,
+        retry_after=retry_after_text,
+        note=t(chat_id, "speedtest_note_ip"),
+    )
+
+    try:
+        await progress.edit_text(body, parse_mode="HTML")
+    except Exception:
+        # Edit can fail if the message is too old or content too long; fall
+        # back to a fresh send so the admin still sees results.
+        await update.message.reply_text(body, parse_mode="HTML")
+
+
 async def cmd_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if len(ctx.args) < 2:
@@ -6344,6 +6584,7 @@ def main():
     app.add_handler(CommandHandler("import", cmd_import))
     app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_handler(CommandHandler("apistatus", cmd_apistatus))
+    app.add_handler(CommandHandler("speedtest", cmd_speedtest))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("wl_list", cmd_wl_list))
     app.add_handler(CommandHandler("wl_add", cmd_wl_add))
