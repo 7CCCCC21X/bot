@@ -68,7 +68,7 @@ UPGRADE_CONTACT = os.environ.get("UPGRADE_CONTACT", "@xxxXIAOC").strip() or "@xx
 # keyboard so users can jump straight into the large-trade feed. Override
 # WHALE_BOT_URL to point at a different t.me handle if needed.
 WHALE_BOT_URL = os.environ.get("WHALE_BOT_URL", "https://t.me/predict_whale_bot").strip() or "https://t.me/predict_whale_bot"
-POLL_INTERVAL = 5
+POLL_INTERVAL = 2
 # Maximum number of wallets polled concurrently within a single cycle. The old
 # loop processed wallets serially with a 1-second gap between each, so a chat
 # watching N wallets saw a cycle of roughly N + POLL_INTERVAL seconds. Polling
@@ -4086,9 +4086,9 @@ async def cmd_apistatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # *between* responses, so 0ms means "fire next as soon as previous
 # returned" (effective rate then bottlenecks on RTT, which the report
 # surfaces explicitly).
-_SPEEDTEST_LEVELS: tuple[int, ...] = (2000, 1000, 500, 200, 100, 50, 0)
+_SPEEDTEST_LEVELS: tuple[int, ...] = (2000, 1000, 500, 200, 100, 50, 20, 0)
 _SPEEDTEST_PER_LEVEL = 5
-_SPEEDTEST_TOTAL_BUDGET = 30
+_SPEEDTEST_TOTAL_BUDGET = 40
 # Stop a level early if 3 consecutive 429s come back — keeps total
 # requests within budget when the API is clearly saturated.
 _SPEEDTEST_LEVEL_ABORT = 3
@@ -6053,8 +6053,15 @@ async def poll_loop(app: Application):
                         if w.rate_limit_until and time.time() < w.rate_limit_until:
                             return
 
-                        positions_raw = await fetch_positions(session, w.address)
-                        matches_raw = await fetch_order_matches(session, w.address, first=20)
+                        # Fan the two endpoints out in parallel — they're
+                        # independent reads keyed on the same wallet, so
+                        # serializing them just doubles the per-wallet RTT.
+                        # Each helper internally swallows exceptions and
+                        # returns None, so no need for return_exceptions.
+                        positions_raw, matches_raw = await asyncio.gather(
+                            fetch_positions(session, w.address),
+                            fetch_order_matches(session, w.address, first=20),
+                        )
 
                         # 429 handling: extract Retry-After (preferring the
                         # larger of the two endpoints' hints), apply
