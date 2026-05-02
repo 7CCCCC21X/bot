@@ -2735,7 +2735,8 @@ def fmt_match(
             sub_line = f"\n↳ <b>{_html_escape(sub_norm)}</b> — {_html_escape(outcome)}"
     return (
         f"{side_emoji} {side} {outcome} | "
-        f"{t(chat_id, 'label_fill')} {shares_text} @ {price_text}c = {value_text}{merged_suffix}\n"
+        f"{t(chat_id, 'label_fill')} <b>{shares_text}</b> {t(chat_id, 'shares_unit')} "
+        f"@ {price_text}c = <b>{value_text}</b>{merged_suffix}\n"
         f"{title_html}{sub_line}{total_line}{pnl_line}\n"
         f"{tx_line}"
     )
