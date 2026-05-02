@@ -11,6 +11,7 @@ from collections import deque
 from io import BytesIO, StringIO
 from pathlib import Path
 from dataclasses import dataclass, field
+from datetime import datetime
 from email.utils import parsedate_to_datetime
 
 import aiohttp
@@ -305,6 +306,7 @@ I18N = {
         "side_bid": "Buy",
         "side_ask": "Sell",
         "view_tx": "View Tx",
+        "label_delay": "delay",
         "label_order_hash": "OrderHash",
         "btn_view_positions": "📊 Pos",
         "btn_view_orders": "📜 Fills",
@@ -765,6 +767,7 @@ I18N = {
         "side_bid": "买入",
         "side_ask": "卖出",
         "view_tx": "查看交易",
+        "label_delay": "延迟",
         "label_order_hash": "订单哈希",
         "btn_view_positions": "📊 持仓",
         "btn_view_orders": "📜 成交",
@@ -1904,12 +1907,16 @@ def market_resolution(market: dict | None) -> tuple[bool, int | None]:
     return resolved, winning_idx
 
 
-def consolidate_fills(matches: list[dict]) -> list[dict]:
+def consolidate_fills(matches: list[dict], address: str | None = None) -> list[dict]:
     """Merge partial fills of the same order into a single synthetic entry.
 
     Predict.fun can report a single user order as several separate matches
     (taker side partial fills). Displaying each as its own notification is
-    noisy, so we collapse them into one entry summed across amounts.
+    noisy, so we collapse them into one entry summed across amounts. When
+    ``address`` is provided we also sum just the user's own side amount —
+    that's the figure the user cares about when they're a maker on a
+    multi-maker fill (where the top-level ``amountFilled`` reflects the
+    taker's full order, not our wallet's portion).
     """
     groups: dict[str, list[dict]] = {}
     order: list[str] = []
@@ -1931,12 +1938,20 @@ def consolidate_fills(matches: list[dict]) -> list[dict]:
     for key in order:
         parts = groups[key]
         if len(parts) == 1:
-            result.append(parts[0])
+            single = parts[0]
+            ts = _executed_ts(single)
+            if ts is not None:
+                single = dict(single)
+                single["_latest_executed_ts"] = ts
+            result.append(single)
             continue
         merged = dict(parts[0])
         shares_sum = 0.0
         taker_sum = 0.0
         maker_sum = 0.0
+        user_sum = 0.0
+        user_seen = False
+        latest_ts: float | None = None
         for p in parts:
             s = _norm_amount_to_shares(p.get("amountFilled"))
             t_ = _norm_amount_to_shares(p.get("takerAmountFilled"))
@@ -1947,11 +1962,24 @@ def consolidate_fills(matches: list[dict]) -> list[dict]:
                 taker_sum += t_
             if ma is not None:
                 maker_sum += ma
+            if address:
+                ours = _pick_user_side(p, address)
+                u = _norm_amount_to_shares(ours.get("amount"))
+                if u is not None:
+                    user_sum += u
+                    user_seen = True
+            ts = _executed_ts(p)
+            if ts is not None and (latest_ts is None or ts > latest_ts):
+                latest_ts = ts
         # Store merged amounts as pre-scaled floats so _norm_amount_to_shares
         # leaves them unchanged downstream.
         merged["amountFilled"] = shares_sum
         merged["takerAmountFilled"] = taker_sum
         merged["makerAmountFilled"] = maker_sum
+        if user_seen:
+            merged["_user_amount_filled"] = user_sum
+        if latest_ts is not None:
+            merged["_latest_executed_ts"] = latest_ts
         merged["_merged_count"] = len(parts)
         result.append(merged)
     return result
@@ -2080,8 +2108,9 @@ def _fmt_shares(v) -> str:
     """Share count with scale-adaptive precision.
 
     Large holdings don't need four decimals — "76,422" reads cleaner than
-    "76421.9982". Fractional stakes keep their precision so a 1.04-share fill
-    is still distinguishable from 1.05.
+    "76421.9982". Mid-range fills cap at 2 decimals so "5.5556" renders as
+    "5.56", and only sub-share dust keeps four decimals so "0.0123" stays
+    distinguishable from "0.0124".
     """
     if v is None:
         return "?"
@@ -2093,7 +2122,62 @@ def _fmt_shares(v) -> str:
         return f"{f:,.0f}"
     if abs(f) >= 100:
         return f"{f:,.1f}".rstrip("0").rstrip(".")
+    if abs(f) >= 1:
+        return _fmt_num(f, digits=2)
     return _fmt_num(f, digits=4)
+
+
+def _executed_ts(match: dict) -> float | None:
+    """Best-effort UTC seconds for when the match cleared on-chain.
+
+    The matches API has used both ISO-8601 strings and unix epochs (seconds
+    or milliseconds) over time, so we sniff the type and rescale ms → s.
+    Falls back to ``None`` when the field is missing or unparseable so
+    callers can hide the latency line instead of showing "?".
+    """
+    raw = (
+        match.get("_latest_executed_ts")
+        or match.get("executedAt")
+        or match.get("executed_at")
+        or match.get("matchedAt")
+        or match.get("createdAt")
+    )
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        v = float(raw)
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        try:
+            v = float(s)
+        except ValueError:
+            try:
+                return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError):
+                return None
+    else:
+        return None
+    # Heuristic: epoch ms vs s. 1e12 ≈ year 33658 in seconds, so anything
+    # above is millisecond-scale.
+    return v / 1000.0 if v > 1e12 else v
+
+
+def _fmt_delay(seconds: float) -> str:
+    """Render a positive duration into a compact unit-suffixed string."""
+    if seconds is None:
+        return "?"
+    s = max(0.0, float(seconds))
+    if s < 60:
+        return f"{s:.0f}s"
+    if s < 3600:
+        return f"{s / 60:.0f}m"
+    if s < 86400:
+        return f"{s / 3600:.1f}h"
+    return f"{s / 86400:.1f}d"
 
 
 def display_fields(pos: dict, market: dict | None = None) -> tuple[str, str, str, str]:
@@ -2620,12 +2704,19 @@ def fmt_match(
     # exposure so it mirrors "new position green"; ask reduces it like "closed
     # red". Falls back to a neutral marker for unknown quoteTypes.
     side_emoji = "🟢" if quote_type == "bid" else ("🔴" if quote_type == "ask" else "⚪")
-    # Prefer the top-level amountFilled so merged fills (consolidate_fills sets
-    # amountFilled to the summed shares) display the total, not just the first
-    # partial. For non-merged matches, amountFilled equals our_side.amount.
-    shares = _norm_amount_to_shares(match.get("amountFilled"))
+    # Prefer the user's own filled amount: ``_user_amount_filled`` is the
+    # summed maker-side amount across consolidated parts (set by
+    # consolidate_fills when address is known); ``our_side.amount`` is this
+    # match's user portion. Both ignore the unrelated counterparties that
+    # share the same multi-maker fill, so we don't overcount when the wallet
+    # is one of N makers. ``match.amountFilled`` is the taker's full order
+    # total — kept only as a last-resort fallback when neither side carries
+    # an amount.
+    shares = _norm_amount_to_shares(match.get("_user_amount_filled"))
     if shares is None:
         shares = _norm_amount_to_shares(our_side.get("amount"))
+    if shares is None:
+        shares = _norm_amount_to_shares(match.get("amountFilled"))
     shares_text = _fmt_shares(shares)
 
     # Price/value come directly from the user's own side entry. ``price`` is
@@ -2652,6 +2743,13 @@ def fmt_match(
     else:
         tx_short = f"{tx[:10]}...{tx[-6:]}" if isinstance(tx, str) and len(tx) > 20 else str(tx)
         tx_line = f"🔗 <code>{tx_short}</code>"
+    # End-to-end latency: time between on-chain executedAt and the moment
+    # this card is rendered. Surfaces poll-cycle + Telegram send delay so
+    # users can see how stale the alert is.
+    exec_ts = _executed_ts(match)
+    if exec_ts is not None:
+        delay_s = max(0.0, time.time() - exec_ts)
+        tx_line += f" · {t(chat_id, 'label_delay')} {_fmt_delay(delay_s)}"
 
     # If we have the wallet's current positions, surface the total holding for
     # this market+outcome so the user can distinguish "this fill" from "what
@@ -2891,7 +2989,7 @@ async def _render_orders(
     if not matches:
         return f"<code>{addr}</code>\n\n{t(chat_id, 'no_orders')}", None
 
-    matches = consolidate_fills(matches)
+    matches = consolidate_fills(matches, address=addr)
     total_pages = max(1, (len(matches) + ORDERS_PAGE_SIZE - 1) // ORDERS_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     start = page * ORDERS_PAGE_SIZE
@@ -6062,7 +6160,7 @@ async def poll_loop(app: Application):
                                 w.last_dust_flush = 0
 
                         if new_fills or dust_to_emit:
-                            merged_fills = consolidate_fills(new_fills) if new_fills else []
+                            merged_fills = consolidate_fills(new_fills, address=w.address) if new_fills else []
                             fill_lines = [
                                 fmt_match(m, chat_id, positions_by_key, address=w.address)
                                 for m in merged_fills[:5]
