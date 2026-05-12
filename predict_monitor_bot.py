@@ -103,6 +103,19 @@ except ValueError:
     DUST_INTERVAL = 28800
 if DUST_INTERVAL < 0:
     DUST_INTERVAL = 0
+# Maximum age (seconds) of the most recent on-chain fill for a position to
+# still count as "freshly opened/changed". When a position appears in the
+# positions API but has no matching fill within this window, we treat it as
+# a stale entry (likely caused by a snapshot wipe, missed initial fetch, or
+# a re-appearing closed position) and suppress the 新开仓 / 持仓变化 card so
+# users don't get pinged about trades that happened yesterday. Set to 0 to
+# disable the freshness gate and restore the legacy behavior.
+try:
+    STALE_TRADE_S = int(os.environ.get("STALE_TRADE_S", "3600") or 3600)
+except ValueError:
+    STALE_TRADE_S = 3600
+if STALE_TRADE_S < 0:
+    STALE_TRADE_S = 0
 PREDICT_WEB_BASE = os.environ.get("PREDICT_WEB_BASE", "https://predict.fun/market/")
 GUIDE_IMAGE_PATH = os.environ.get("GUIDE_IMAGE_PATH", os.path.join(os.path.dirname(__file__), "images", "guide_deposit_address.png"))
 
@@ -6319,6 +6332,36 @@ async def poll_loop(app: Application):
                             k = _fill_market_outcome_key(m)
                             if k and k not in matches_by_key:
                                 matches_by_key[k] = m
+
+                        # Freshness gate: a position can show up in
+                        # ``added``/``changed`` without a corresponding fresh
+                        # fill when the snapshot drifts (e.g. a missed initial
+                        # fetch, a transient empty positions response, or a
+                        # previously-closed position re-appearing). Those
+                        # phantom entries were causing 新开仓 cards for trades
+                        # that actually happened a day or more ago. If
+                        # STALE_TRADE_S is enabled and the most recent on-chain
+                        # fill for this market+outcome is older than that
+                        # window (or absent entirely from the matches feed),
+                        # suppress the card — the snapshot still gets refreshed
+                        # below so we won't keep alerting on the same ghost.
+                        if STALE_TRADE_S > 0 and matches_ok:
+                            _now_ts = time.time()
+
+                            def _is_fresh(p: dict) -> bool:
+                                m = matches_by_key.get(pos_key(p))
+                                if not m:
+                                    return False
+                                ts = _executed_ts(m)
+                                if ts is None:
+                                    return False
+                                return (_now_ts - ts) <= STALE_TRADE_S
+
+                            added_visible = [p for p in added_visible if _is_fresh(p)]
+                            changed_visible = [
+                                (p, prev) for (p, prev) in changed_visible
+                                if _is_fresh(p)
+                            ]
 
                         if added_visible or changed_visible or closed:
                             parts = []
