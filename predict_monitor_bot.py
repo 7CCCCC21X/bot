@@ -1815,16 +1815,16 @@ def watch_limit_message(chat_id: int) -> str:
 def market_url(market: dict | None) -> str | None:
     if not isinstance(market, dict):
         return None
-    # predict.fun's public URL is /market/<category_slug> (e.g.
-    # english-premier-league-winner). The plain ``id`` fallback produces
-    # /market/1565 which hits a placeholder page, so only fall back to it
-    # when no slug-like field is available.
+    # predict.fun's public URL is /market/<slug>. The bare ``id`` field
+    # (numeric or UUID) does NOT resolve to a market page — /market/1565
+    # and /market/<uuid> both hit a placeholder/404 — so we omit the link
+    # entirely when no slug-like field is available instead of producing a
+    # link that 404s when the user taps it.
     slug = (
         market.get("slug")
         or market.get("marketSlug")
         or market.get("categorySlug")
         or market.get("category_slug")
-        or market.get("id")
     )
     if not slug:
         return None
@@ -2604,10 +2604,17 @@ def fmt_summary(
     lines = []
 
     for p in ordered[:20]:
-        title, outcome, shares, price = display_fields(p, p.get("_market"))
+        # Merge the position's nested market (returned by /v1/positions)
+        # with the cached /v1/markets/{id} payload so the title link still
+        # finds a slug when the markets call failed or returned a stub. The
+        # cached payload wins on conflict — it's the canonical record.
+        nested_market = p.get("market") if isinstance(p.get("market"), dict) else {}
+        fetched_market = p.get("_market") if isinstance(p.get("_market"), dict) else {}
+        link_market = {**nested_market, **fetched_market}
+        title, outcome, shares, price = display_fields(p, link_market)
         title = title[:40]
-        title_html = _title_html(title, p.get("_market"))
-        pnl_usd, pnl_pct, _ = pnl_of(p, p.get("_market"))
+        title_html = _title_html(title, link_market)
+        pnl_usd, pnl_pct, _ = pnl_of(p, link_market)
 
         try:
             # price is in cents, convert to USD.
