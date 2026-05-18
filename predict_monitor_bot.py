@@ -63,7 +63,7 @@ INVITE_LINK = (
     os.environ.get("INVITE_LINK", "").strip()
     or f"https://predict.fun?ref={INVITE_CODE}"
 )
-UPGRADE_CONTACT = os.environ.get("UPGRADE_CONTACT", "@xxxXIAOC").strip() or "@xxxXIAOC"
+UPGRADE_CONTACT = os.environ.get("UPGRADE_CONTACT", "@xiaoc888").strip() or "@xiaoc888"
 # Companion whale-watcher bot: surfaced as a one-tap entry on the /start
 # keyboard so users can jump straight into the large-trade feed. Override
 # WHALE_BOT_URL to point at a different t.me handle if needed.
@@ -2942,10 +2942,6 @@ def _start_keyboard(chat_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🇨🇳 中文", callback_data="lang_zh"),
         ],
         [InlineKeyboardButton(t(chat_id, "btn_watch_wallet"), callback_data="watch_prompt")],
-        [InlineKeyboardButton(t(chat_id, "btn_watch_guide"), callback_data="watch_guide")],
-        # Companion bot link — `url=` opens t.me/<handle> in the Telegram
-        # client without leaving a callback in our handler.
-        [InlineKeyboardButton(t(chat_id, "btn_whale_bot"), url=WHALE_BOT_URL)],
         [
             InlineKeyboardButton(
                 t(chat_id, "btn_chatdef_open"), callback_data="cdef:open"
