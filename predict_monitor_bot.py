@@ -63,7 +63,7 @@ INVITE_LINK = (
     os.environ.get("INVITE_LINK", "").strip()
     or f"https://predict.fun?ref={INVITE_CODE}"
 )
-UPGRADE_CONTACT = os.environ.get("UPGRADE_CONTACT", "@xxxXIAOC").strip() or "@xxxXIAOC"
+UPGRADE_CONTACT = os.environ.get("UPGRADE_CONTACT", "@xiaoc888").strip() or "@xiaoc888"
 # Companion whale-watcher bot: surfaced as a one-tap entry on the /start
 # keyboard so users can jump straight into the large-trade feed. Override
 # WHALE_BOT_URL to point at a different t.me handle if needed.
@@ -2942,10 +2942,6 @@ def _start_keyboard(chat_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🇨🇳 中文", callback_data="lang_zh"),
         ],
         [InlineKeyboardButton(t(chat_id, "btn_watch_wallet"), callback_data="watch_prompt")],
-        [InlineKeyboardButton(t(chat_id, "btn_watch_guide"), callback_data="watch_guide")],
-        # Companion bot link — `url=` opens t.me/<handle> in the Telegram
-        # client without leaving a callback in our handler.
-        [InlineKeyboardButton(t(chat_id, "btn_whale_bot"), url=WHALE_BOT_URL)],
         [
             InlineKeyboardButton(
                 t(chat_id, "btn_chatdef_open"), callback_data="cdef:open"
@@ -6341,22 +6337,27 @@ async def poll_loop(app: Application):
                                 matches_by_key[k] = m
 
                         # Freshness gate: a position can show up in
-                        # ``added``/``changed`` without a corresponding fresh
-                        # fill when the snapshot drifts (e.g. a missed initial
-                        # fetch, a transient empty positions response, or a
-                        # previously-closed position re-appearing). Those
-                        # phantom entries were causing 新开仓 cards for trades
-                        # that actually happened a day or more ago. If
-                        # STALE_TRADE_S is enabled and the most recent on-chain
-                        # fill for this market+outcome is older than that
-                        # window (or absent entirely from the matches feed),
-                        # suppress the card — the snapshot still gets refreshed
-                        # below so we won't keep alerting on the same ghost.
+                        # ``added``/``changed``/``closed`` without a
+                        # corresponding fresh fill when the snapshot drifts
+                        # (e.g. a missed initial fetch, a transient empty
+                        # positions response, or a previously-closed
+                        # position re-appearing). Those phantom entries
+                        # were causing 新开仓 / 已平仓 cards for trades
+                        # that actually happened a day or more ago — or in
+                        # the close case, for positions that never
+                        # actually closed but momentarily vanished from
+                        # /v1/positions. If STALE_TRADE_S is enabled and
+                        # the most recent on-chain fill for this
+                        # market+outcome is older than that window (or
+                        # absent entirely from the matches feed),
+                        # suppress the card — the snapshot still gets
+                        # refreshed below so we won't keep alerting on
+                        # the same ghost.
                         if STALE_TRADE_S > 0 and matches_ok:
                             _now_ts = time.time()
 
-                            def _is_fresh(p: dict) -> bool:
-                                m = matches_by_key.get(pos_key(p))
+                            def _is_fresh_key(k: str) -> bool:
+                                m = matches_by_key.get(k)
                                 if not m:
                                     return False
                                 ts = _executed_ts(m)
@@ -6364,11 +6365,15 @@ async def poll_loop(app: Application):
                                     return False
                                 return (_now_ts - ts) <= STALE_TRADE_S
 
+                            def _is_fresh(p: dict) -> bool:
+                                return _is_fresh_key(pos_key(p))
+
                             added_visible = [p for p in added_visible if _is_fresh(p)]
                             changed_visible = [
                                 (p, prev) for (p, prev) in changed_visible
                                 if _is_fresh(p)
                             ]
+                            closed = [k for k in closed if _is_fresh_key(k)]
 
                         if added_visible or changed_visible or closed:
                             parts = []
