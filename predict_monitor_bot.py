@@ -2942,6 +2942,9 @@ def _start_keyboard(chat_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🇨🇳 中文", callback_data="lang_zh"),
         ],
         [InlineKeyboardButton(t(chat_id, "btn_watch_wallet"), callback_data="watch_prompt")],
+        # Companion bot link — `url=` opens t.me/<handle> in the Telegram
+        # client without leaving a callback in our handler.
+        [InlineKeyboardButton(t(chat_id, "btn_whale_bot"), url=WHALE_BOT_URL)],
         [
             InlineKeyboardButton(
                 t(chat_id, "btn_chatdef_open"), callback_data="cdef:open"
