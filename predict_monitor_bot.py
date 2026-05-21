@@ -116,6 +116,36 @@ except ValueError:
     STALE_TRADE_S = 3600
 if STALE_TRADE_S < 0:
     STALE_TRADE_S = 0
+# predict.fun's positions endpoint paginates Relay-style (first/after with a
+# top-level ``cursor``) and caps each page well below a large wallet's full
+# holdings. We page through with a generous ``first`` and follow the cursor so
+# both the /pos view and the poll-loop diff see every position — otherwise
+# holdings past the first page render as missing and get mis-flagged as
+# 已平仓 every cycle. POSITIONS_MAX_PAGES bounds the loop so a misbehaving
+# cursor can't spin forever.
+try:
+    POSITIONS_FETCH_LIMIT = int(os.environ.get("POSITIONS_FETCH_LIMIT", "100") or 100)
+except ValueError:
+    POSITIONS_FETCH_LIMIT = 100
+if POSITIONS_FETCH_LIMIT < 1:
+    POSITIONS_FETCH_LIMIT = 100
+try:
+    POSITIONS_MAX_PAGES = int(os.environ.get("POSITIONS_MAX_PAGES", "20") or 20)
+except ValueError:
+    POSITIONS_MAX_PAGES = 20
+if POSITIONS_MAX_PAGES < 1:
+    POSITIONS_MAX_PAGES = 20
+# /pos display: rows per page and the minimum notional (USD) a position must
+# be worth to show up. Dust below this floor is hidden from the count, total
+# and list so the summary only surfaces meaningful holdings. Set to 0 to show
+# every position regardless of size.
+POS_PAGE_SIZE = 20
+try:
+    POS_MIN_VALUE_USD = float(os.environ.get("POS_MIN_VALUE_USD", "1") or 1)
+except ValueError:
+    POS_MIN_VALUE_USD = 1.0
+if POS_MIN_VALUE_USD < 0:
+    POS_MIN_VALUE_USD = 0.0
 PREDICT_WEB_BASE = os.environ.get("PREDICT_WEB_BASE", "https://predict.fun/market/")
 GUIDE_IMAGE_PATH = os.environ.get("GUIDE_IMAGE_PATH", os.path.join(os.path.dirname(__file__), "images", "guide_deposit_address.png"))
 
@@ -1618,41 +1648,80 @@ def _parse_retry_after(value: str | None) -> float | None:
 async def fetch_positions(
     session: aiohttp.ClientSession, address: str
 ) -> list[dict] | RateLimited | None:
-    """Return positions list, ``RateLimited`` on 429, or ``None`` on other errors.
+    """Return the wallet's full positions list, ``RateLimited`` on 429, or
+    ``None`` on other errors.
 
     An empty list means the wallet genuinely has no positions; ``None`` lets
     callers track consecutive failures for alerting; a ``RateLimited`` instance
     signals the caller should back off polling for this wallet.
+
+    predict.fun caps each positions page, so we follow its Relay-style
+    ``cursor`` (passing it back as ``after``) until the wallet is fully
+    drained. Positions are de-duplicated by ``pos_key`` and the loop is
+    bounded by ``POSITIONS_MAX_PAGES`` with a cursor-progress check, so an
+    endpoint that ignores ``after`` (and replays page one) terminates after a
+    single extra request instead of spinning. A failure mid-pagination returns
+    whatever was collected so far rather than discarding a good first page.
     """
-    url = f"{PREDICT_API}/v1/positions/{address}"
+    base_url = f"{PREDICT_API}/v1/positions/{address}"
+    collected: list[dict] = []
+    seen_keys: set[str] = set()
+    cursor: str | None = None
+    prev_cursor: str | None = None
     try:
-        async with session.get(
-            url,
-            headers=_headers(),
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            if resp.status == 200:
-                _record_api("positions", "ok")
-                data = await resp.json()
-                return data.get("data", []) if data.get("success") else []
+        for _ in range(POSITIONS_MAX_PAGES):
+            params = {"first": str(POSITIONS_FETCH_LIMIT)}
+            if cursor:
+                params["after"] = cursor
+            async with session.get(
+                base_url,
+                params=params,
+                headers=_headers(),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    _record_api("positions", "ok")
+                    data = await resp.json()
+                    if not data.get("success"):
+                        break
+                    batch = data.get("data") or []
+                    added = 0
+                    for p in batch:
+                        k = pos_key(p)
+                        if k in seen_keys:
+                            continue
+                        seen_keys.add(k)
+                        collected.append(p)
+                        added += 1
+                    cursor = data.get("cursor")
+                    # Stop when the page was empty, contributed nothing new
+                    # (endpoint replaying page one), or the cursor is gone /
+                    # not advancing — all signal there's nothing left to page.
+                    if not batch or added == 0 or not cursor or cursor == prev_cursor:
+                        break
+                    prev_cursor = cursor
+                    continue
 
-            if resp.status == 429:
-                _record_api("positions", "429")
-                logger.warning(f"Positions API 429 (rate limited) for {address}")
-                return RateLimited(_parse_retry_after(resp.headers.get("Retry-After")))
+                if resp.status == 429:
+                    _record_api("positions", "429")
+                    logger.warning(f"Positions API 429 (rate limited) for {address}")
+                    if collected:
+                        return collected
+                    return RateLimited(_parse_retry_after(resp.headers.get("Retry-After")))
 
-            label = "5xx" if resp.status >= 500 else "other"
-            _record_api("positions", label)
-            logger.warning(f"Positions API {resp.status} for {address}")
-            return None
+                label = "5xx" if resp.status >= 500 else "other"
+                _record_api("positions", label)
+                logger.warning(f"Positions API {resp.status} for {address}")
+                return collected if collected else None
+        return collected
     except asyncio.TimeoutError:
         _record_api("positions", "timeout")
         logger.error(f"fetch_positions timeout for {address}")
-        return None
+        return collected if collected else None
     except Exception as e:
         _record_api("positions", "timeout")
         logger.error(f"fetch_positions error: {e}")
-        return None
+        return collected if collected else None
 
 
 async def fetch_market(session: aiohttp.ClientSession, market_id: str) -> dict:
@@ -2561,14 +2630,33 @@ def fmt_resolution(
     )
 
 
-def _sort_positions(positions: list[dict], sort_key: str) -> list[dict]:
-    def _value(p):
-        _, _, shares, price = display_fields(p, p.get("_market"))
-        try:
-            return float(shares) * float(price) / 100
-        except (ValueError, TypeError):
-            return 0.0
+def _position_value_usd(p: dict) -> float:
+    """Notional USD value of a position (shares × price), 0.0 when unknown.
 
+    Uses the same nested+fetched market merge as the row renderer so the
+    grand total matches the sum of the displayed rows.
+    """
+    nested = p.get("market") if isinstance(p.get("market"), dict) else {}
+    fetched = p.get("_market") if isinstance(p.get("_market"), dict) else {}
+    _, _, shares, price = display_fields(p, {**nested, **fetched})
+    try:
+        return float(shares) * float(price) / 100
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _visible_positions(positions: list[dict]) -> list[dict]:
+    """Drop dust positions worth less than POS_MIN_VALUE_USD.
+
+    Keeps the /pos count, total and list focused on meaningful holdings.
+    A floor of 0 keeps everything.
+    """
+    if POS_MIN_VALUE_USD <= 0:
+        return list(positions)
+    return [p for p in positions if _position_value_usd(p) >= POS_MIN_VALUE_USD]
+
+
+def _sort_positions(positions: list[dict], sort_key: str) -> list[dict]:
     def _size(p):
         s = pos_size(p)
         return s if s is not None else 0.0
@@ -2582,7 +2670,7 @@ def _sort_positions(positions: list[dict], sort_key: str) -> list[dict]:
     if sort_key == "alpha":
         return sorted(positions, key=_title)
     # Default: sort by notional value descending.
-    return sorted(positions, key=_value, reverse=True)
+    return sorted(positions, key=_position_value_usd, reverse=True)
 
 
 def fmt_summary(
@@ -2590,20 +2678,45 @@ def fmt_summary(
     chat_id: int,
     sort_key: str = "value",
     include_portfolio: bool = False,
+    page: int = 0,
 ) -> str:
+    """Render the positions summary for one page.
+
+    ``positions`` is expected to already be filtered to the holdings worth
+    showing (see ``_visible_positions``). The header count, grand total and
+    P&L are computed across the full filtered set; only the per-row list is
+    sliced to ``page`` (``POS_PAGE_SIZE`` rows each).
+    """
     if not positions:
         return t(chat_id, "fmt_no_positions")
 
     ordered = _sort_positions(positions, sort_key)
 
+    # Grand totals span every (filtered) position, not just the current page,
+    # so the header stays accurate as the user flips through pages.
     total = 0.0
     total_pnl = 0.0
     total_pnl_known = False
     largest_val = 0.0
     largest_title = ""
-    lines = []
+    for p in ordered:
+        v = _position_value_usd(p)
+        total += v
+        if v > largest_val:
+            largest_val = v
+            title, _, _, _ = display_fields(p, p.get("_market"))
+            largest_title = (title or "")[:40]
+        pnl_usd, _, _ = pnl_of(p, p.get("_market"))
+        if pnl_usd is not None:
+            total_pnl += pnl_usd
+            total_pnl_known = True
 
-    for p in ordered[:20]:
+    total_pages = max(1, (len(ordered) + POS_PAGE_SIZE - 1) // POS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = ordered[page * POS_PAGE_SIZE : (page + 1) * POS_PAGE_SIZE]
+
+    lines = []
+    for p in chunk:
         # Merge the position's nested market (returned by /v1/positions)
         # with the cached /v1/markets/{id} payload so the title link still
         # finds a slug when the markets call failed or returned a stub. The
@@ -2619,22 +2732,16 @@ def fmt_summary(
         try:
             # price is in cents, convert to USD.
             v = float(shares) * float(price) / 100
-            total += v
-            if v > largest_val:
-                largest_val = v
-                largest_title = title
             pnl_tail = ""
             if pnl_usd is not None and pnl_pct is not None:
                 sign = "+" if pnl_usd >= 0 else "−"
                 arrow = "🟢" if pnl_usd > 0 else ("🔴" if pnl_usd < 0 else "⚪")
                 pnl_tail = f"  {arrow} {sign}${abs(pnl_usd):,.2f} ({sign}{abs(pnl_pct):.2f}%)"
-                total_pnl += pnl_usd
-                total_pnl_known = True
             lines.append(f"• {outcome} | {shares} @ {price}c = ${v:,.2f}{pnl_tail}\n  {title_html}")
         except (ValueError, TypeError):
             lines.append(f"• {outcome} | {shares} @ {price}c\n  {title_html}")
 
-    header = t(chat_id, "fmt_positions_header", count=len(positions), total=total)
+    header = t(chat_id, "fmt_positions_header", count=len(ordered), total=total)
     if total_pnl_known:
         sign = "+" if total_pnl >= 0 else "−"
         arrow = "🟢" if total_pnl > 0 else ("🔴" if total_pnl < 0 else "⚪")
@@ -2647,7 +2754,10 @@ def fmt_summary(
         )
 
     sort_label = t(chat_id, f"sort_{sort_key}")
-    header += f"<i>{t(chat_id, 'label_sorted_by')}: {sort_label}</i>\n\n"
+    header += f"<i>{t(chat_id, 'label_sorted_by')}: {sort_label}</i>"
+    if total_pages > 1:
+        header += f"  ·  {t(chat_id, 'list_page_indicator', page=page + 1, total=total_pages)}"
+    header += "\n\n"
 
     return header + "\n\n".join(lines)
 
@@ -3007,42 +3117,68 @@ async def _render_positions(
     addr: str,
     sort_key: str = "value",
     portfolio: bool = False,
+    page: int = 0,
 ) -> tuple[str, InlineKeyboardMarkup]:
     async with aiohttp.ClientSession() as session:
         positions, _ = await _fetch_positions_with_markets(session, addr)
+    total_pages = 1
     if positions is None:
         text = t(chat_id, "fetch_error_msg")
+        page = 0
     else:
+        visible = _visible_positions(positions)
+        total_pages = max(1, (len(visible) + POS_PAGE_SIZE - 1) // POS_PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
         text = (
             f"<code>{addr}</code>\n\n"
-            f"{fmt_summary(positions, chat_id, sort_key=sort_key, include_portfolio=portfolio)}"
+            f"{fmt_summary(visible, chat_id, sort_key=sort_key, include_portfolio=portfolio, page=page)}"
         )
     sort_label = t(chat_id, f"sort_{_next_sort(sort_key)}")
     portfolio_btn_key = "btn_hide_portfolio" if portfolio else "btn_portfolio"
-    markup = InlineKeyboardMarkup(
+    portfolio_flag = 1 if portfolio else 0
+    rows = [
         [
-            [
+            InlineKeyboardButton(
+                t(chat_id, "btn_refresh"),
+                callback_data=f"refresh_pos:{addr}:{sort_key}:{portfolio_flag}",
+            ),
+            InlineKeyboardButton(
+                t(chat_id, "btn_view_orders"), callback_data=f"orders:{addr}:0"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                t(chat_id, "btn_sort", label=sort_label),
+                callback_data=f"sortpos:{addr}:{_next_sort(sort_key)}:{portfolio_flag}",
+            ),
+            InlineKeyboardButton(
+                t(chat_id, portfolio_btn_key),
+                callback_data=f"sortpos:{addr}:{sort_key}:{0 if portfolio else 1}",
+            ),
+        ],
+    ]
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(
                 InlineKeyboardButton(
-                    t(chat_id, "btn_refresh"),
-                    callback_data=f"refresh_pos:{addr}:{sort_key}:{1 if portfolio else 0}",
-                ),
+                    "⬅", callback_data=f"posp:{addr}:{sort_key}:{portfolio_flag}:{page - 1}"
+                )
+            )
+        nav.append(
+            InlineKeyboardButton(
+                t(chat_id, "list_page_indicator", page=page + 1, total=total_pages),
+                callback_data="noop",
+            )
+        )
+        if page < total_pages - 1:
+            nav.append(
                 InlineKeyboardButton(
-                    t(chat_id, "btn_view_orders"), callback_data=f"orders:{addr}:0"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    t(chat_id, "btn_sort", label=sort_label),
-                    callback_data=f"sortpos:{addr}:{_next_sort(sort_key)}:{1 if portfolio else 0}",
-                ),
-                InlineKeyboardButton(
-                    t(chat_id, portfolio_btn_key),
-                    callback_data=f"sortpos:{addr}:{sort_key}:{0 if portfolio else 1}",
-                ),
-            ],
-        ]
-    )
-    return text, markup
+                    "➡", callback_data=f"posp:{addr}:{sort_key}:{portfolio_flag}:{page + 1}"
+                )
+            )
+        rows.append(nav)
+    return text, InlineKeyboardMarkup(rows)
 
 
 async def _render_orders(
@@ -5308,9 +5444,10 @@ async def _show_positions_via_callback(
     edit: bool,
     sort_key: str = "value",
     portfolio: bool = False,
+    page: int = 0,
 ):
     text, markup = await _render_positions(
-        chat_id, addr, sort_key=sort_key, portfolio=portfolio
+        chat_id, addr, sort_key=sort_key, portfolio=portfolio, page=page
     )
     if edit:
         try:
@@ -5415,19 +5552,30 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # pos:<addr> | refresh_pos:<addr>[:sort[:portfolio]] | sortpos:<addr>:<sort>:<portfolio>
-    if data.startswith("pos:") or data.startswith("refresh_pos:") or data.startswith("sortpos:"):
+    # | posp:<addr>:<sort>:<portfolio>:<page>  (page navigation)
+    if (
+        data.startswith("pos:")
+        or data.startswith("refresh_pos:")
+        or data.startswith("sortpos:")
+        or data.startswith("posp:")
+    ):
         parts = data.split(":")
         addr = parts[1].strip() if len(parts) > 1 else ""
         sort_key = parts[2] if len(parts) > 2 else "value"
         portfolio = bool(int(parts[3])) if len(parts) > 3 and parts[3].isdigit() else False
+        page = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
         if sort_key not in SORT_CYCLE:
             sort_key = "value"
         if not addr.startswith("0x") or len(addr) != 42:
             await ctx.bot.send_message(chat_id=chat_id, text=t(chat_id, "invalid_address"))
             return
-        edit = data.startswith("refresh_pos:") or data.startswith("sortpos:")
+        edit = (
+            data.startswith("refresh_pos:")
+            or data.startswith("sortpos:")
+            or data.startswith("posp:")
+        )
         await _show_positions_via_callback(
-            query, ctx, chat_id, addr, edit=edit, sort_key=sort_key, portfolio=portfolio
+            query, ctx, chat_id, addr, edit=edit, sort_key=sort_key, portfolio=portfolio, page=page
         )
         return
 
