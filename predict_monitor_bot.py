@@ -248,6 +248,52 @@ class WatchedWallet:
     last_dust_flush: float = 0
 
 
+@dataclass
+class DigestEntry:
+    """One market+outcome aggregate inside a chat's pending digest.
+
+    Multiple buy/sell fills, plus added/closed/resolved lifecycle events,
+    on the same wallet+market+outcome collapse into a single entry so the
+    summary stays compact even when a wallet hammers one market.
+    """
+    wallet_addr: str
+    wallet_note: str = ""
+    market_id: str = ""
+    outcome_index: int | None = None
+    title: str = ""
+    outcome: str = ""
+    slug: str | None = None
+    # Aggregated fills over the window.
+    net_shares: float = 0.0  # buy +, sell -
+    gross_volume_usd: float = 0.0  # sum of |usd value| across all fills
+    fill_count: int = 0
+    first_ts: float = 0.0
+    last_ts: float = 0.0
+    # Lifecycle flags during the window.
+    opened: bool = False
+    closed: bool = False
+    resolved: bool = False
+    resolved_winner: int | None = None
+    held_idx: int | None = None
+    # Most recent snapshot of the live position (latest poll seen).
+    latest_shares: float | None = None
+    latest_value_usd: float | None = None
+
+
+@dataclass
+class DigestState:
+    """Per-chat digest config + buffered entries.
+
+    ``interval_s`` of 0 disables the digest. ``last_sent_ts`` anchors when
+    the next digest is due (set on enable and after each flush). ``entries``
+    is in-memory only — on restart we lose the in-flight window, which is
+    fine because the live notifications already covered the same events.
+    """
+    interval_s: int = 0
+    last_sent_ts: float = 0.0
+    entries: dict[str, DigestEntry] = field(default_factory=dict)
+
+
 watched: dict[int, dict[str, WatchedWallet]] = {}
 market_cache: dict[str, dict] = {}
 chat_lang: dict[int, str] = {}
@@ -259,6 +305,9 @@ chat_notify: dict[int, str] = {}
 # "min_fill_usd" (0 = inherit env MIN_FILL_USD) and "dust_interval_s"
 # (0 = inherit env DUST_INTERVAL, -1 = every poll, >0 = that many seconds).
 chat_defaults: dict[int, dict] = {}
+# Per-chat activity-digest state. interval_s=0 (or absent) means no digest;
+# otherwise the digest_loop flushes entries to Telegram every interval_s.
+chat_digests: dict[int, DigestState] = {}
 # In-memory bulk-selection state for the watch list. Selecting checkboxes in
 # /list lives here only — never persisted. Keyed by chat_id.
 bulk_selection: dict[int, set[str]] = {}
@@ -521,6 +570,32 @@ I18N = {
         "minfill_bad_amount": "Amount must be ≥ 0.",
         "minfill_bad_number": "Reply must be a non-negative number (e.g. 1.5).",
         "dust_summary": "💨 {count} dust fills folded (${usd:,.2f} total)",
+        # --- Activity digest ---
+        "usage_digest": "Usage: /digest &lt;minutes&gt; (1–1440) · /digest off · /digest to view",
+        "digest_status_off": "📋 <b>Digest</b>: off\n\nUse <code>/digest 60</code> to get a deduped summary every hour, or any minute count between 1 and 1440.",
+        "digest_status_on": (
+            "📋 <b>Digest</b>: every {interval}\n"
+            "Buffered events: <b>{entries}</b>\n"
+            "Next flush in ~{remaining}\n\n"
+            "<code>/digest off</code> to disable."
+        ),
+        "digest_invalid": "Pass a minute count between 1 and 1440, or <code>off</code>.",
+        "digest_set": "📋 Digest enabled: a deduped summary every {interval}.",
+        "digest_off_ok": "📋 Digest disabled.",
+        "digest_header": (
+            "📋 <b>Activity digest · last {window}</b>\n"
+            "<i>{markets} markets · {fills} fills · {wallets} wallets</i>\n\n"
+        ),
+        "digest_entry_addr": "<code>{addr}</code>{note}",
+        "digest_entry_note": " · {note}",
+        "digest_entry_flow_buy": "🟢 net buy {shares} · {fills} fills · ${gross:,.2f} flow",
+        "digest_entry_flow_sell": "🔴 net sell {shares} · {fills} fills · ${gross:,.2f} flow",
+        "digest_entry_flow_flat": "⚪ {fills} fills · ${gross:,.2f} flow (flat)",
+        "digest_entry_holding": "📦 holding {shares} = ${value:,.2f}",
+        "digest_entry_opened": "🆕 opened",
+        "digest_entry_closed": "🔴 closed",
+        "digest_entry_resolved": "🏁 resolved · winner #{winner}",
+        "digest_entry_more": "\n\n…and {count} more markets",
         "minfill_picker_title": "💨 <b>Micro-fill settings</b> · <code>{addr}</code>",
         "minfill_picker_floor": "💰 <b>Floor:</b> ${usd:.2f}{fallback} — fills below this fold into a summary",
         "minfill_picker_interval": "⏱ <b>Summary every:</b> {interval}{fallback}",
@@ -989,6 +1064,32 @@ I18N = {
         "minfill_bad_amount": "金额必须 ≥ 0。",
         "minfill_bad_number": "回复必须是非负数字（例如 1.5）。",
         "dust_summary": "💨 今次有 {count} 笔小额，共 ${usd:,.2f}",
+        # --- 摘要汇总 ---
+        "usage_digest": "用法：/digest &lt;分钟&gt;（1–1440）· /digest off 关闭 · /digest 查看当前",
+        "digest_status_off": "📋 <b>摘要</b>：未开启\n\n用 <code>/digest 60</code> 让 Bot 每 1 小时汇总一次（按市场去重），分钟数 1–1440 自选。",
+        "digest_status_on": (
+            "📋 <b>摘要</b>：每 {interval} 一次\n"
+            "本轮待发条目：<b>{entries}</b>\n"
+            "下次约 {remaining} 后发送\n\n"
+            "<code>/digest off</code> 关闭。"
+        ),
+        "digest_invalid": "请填 1–1440 的分钟数，或 <code>off</code>。",
+        "digest_set": "📋 摘要已开启：每 {interval} 汇总一次（按市场去重）。",
+        "digest_off_ok": "📋 摘要已关闭。",
+        "digest_header": (
+            "📋 <b>活动摘要 · 最近 {window}</b>\n"
+            "<i>{markets} 个市场 · {fills} 笔成交 · {wallets} 个钱包</i>\n\n"
+        ),
+        "digest_entry_addr": "<code>{addr}</code>{note}",
+        "digest_entry_note": " · {note}",
+        "digest_entry_flow_buy": "🟢 净买入 {shares} 份 · {fills} 笔 · ${gross:,.2f} 流水",
+        "digest_entry_flow_sell": "🔴 净卖出 {shares} 份 · {fills} 笔 · ${gross:,.2f} 流水",
+        "digest_entry_flow_flat": "⚪ {fills} 笔 · ${gross:,.2f} 流水（净额为零）",
+        "digest_entry_holding": "📦 当前持仓 {shares} 份 = ${value:,.2f}",
+        "digest_entry_opened": "🆕 新开仓",
+        "digest_entry_closed": "🔴 已平仓",
+        "digest_entry_resolved": "🏁 已结算 · 获胜结果 #{winner}",
+        "digest_entry_more": "\n\n…还有 {count} 个市场",
         "minfill_picker_title": "💨 <b>小额提醒设置</b> · <code>{addr}</code>",
         "minfill_picker_floor": "💰 <b>成交额小于多少美元不单独提醒：</b>${usd:.2f}{fallback}",
         "minfill_picker_interval": "⏱ <b>这些小额多久合并提醒一次：</b>{interval}{fallback}",
@@ -1293,6 +1394,18 @@ def init_db():
             )
             """
         )
+        # Periodic activity-digest config per chat. interval_s of 0 = disabled.
+        # last_sent_ts anchors the next-due moment so the in-memory buffer
+        # only flushes once per interval, independent of bot restarts.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_digests (
+                chat_id INTEGER PRIMARY KEY,
+                interval_s INTEGER NOT NULL DEFAULT 0,
+                last_sent_ts REAL NOT NULL DEFAULT 0
+            )
+            """
+        )
         # Admin-managed whitelist: chats that get the higher
         # WHITELIST_WATCH_LIMIT instead of DEFAULT_WATCH_LIMIT for /watch.
         conn.execute(
@@ -1424,6 +1537,25 @@ def save_chat_defaults(chat_id: int):
         conn.commit()
 
 
+def save_chat_digest(chat_id: int) -> None:
+    """Persist the in-memory chat_digests entry (interval + anchor) for this chat."""
+    state = chat_digests.get(chat_id)
+    interval_s = int(state.interval_s) if state else 0
+    last_sent_ts = float(state.last_sent_ts) if state else 0.0
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO chat_digests(chat_id, interval_s, last_sent_ts)
+            VALUES(?,?,?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                interval_s=excluded.interval_s,
+                last_sent_ts=excluded.last_sent_ts
+            """,
+            (chat_id, interval_s, last_sent_ts),
+        )
+        conn.commit()
+
+
 # --- whitelist persistence -----------------------------------------------
 
 
@@ -1549,6 +1681,20 @@ def load_state():
                     "min_fill_usd": float(min_fill or 0),
                     "dust_interval_s": int(dust_int or 0),
                 }
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            for cid, interval_s, last_sent in conn.execute(
+                "SELECT chat_id, interval_s, last_sent_ts FROM chat_digests"
+            ):
+                interval_int = int(interval_s or 0)
+                if interval_int <= 0:
+                    continue
+                chat_digests[int(cid)] = DigestState(
+                    interval_s=interval_int,
+                    last_sent_ts=float(last_sent or 0),
+                )
         except sqlite3.OperationalError:
             pass
 
@@ -4453,6 +4599,70 @@ async def cmd_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Configure the periodic activity digest for this chat.
+
+    /digest             — show current state
+    /digest off | 0     — disable
+    /digest <minutes>   — enable with that cadence (1–1440)
+    """
+    chat_id = update.effective_chat.id
+    state = chat_digests.get(chat_id)
+    if not ctx.args:
+        if not state or state.interval_s <= 0:
+            await update.message.reply_text(
+                t(chat_id, "digest_status_off"),
+                parse_mode="HTML",
+            )
+            return
+        now = time.time()
+        elapsed = max(0.0, now - state.last_sent_ts) if state.last_sent_ts > 0 else 0
+        remaining = max(0.0, state.interval_s - elapsed)
+        await update.message.reply_text(
+            t(
+                chat_id,
+                "digest_status_on",
+                interval=_fmt_delay(state.interval_s),
+                entries=len(state.entries),
+                remaining=_fmt_delay(remaining),
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    arg = ctx.args[0].strip().lower()
+    if arg in ("off", "关闭", "停", "0"):
+        if chat_id in chat_digests:
+            del chat_digests[chat_id]
+        save_chat_digest(chat_id)
+        await update.message.reply_text(t(chat_id, "digest_off_ok"), parse_mode="HTML")
+        return
+
+    try:
+        minutes = int(arg)
+    except ValueError:
+        await update.message.reply_text(t(chat_id, "digest_invalid"), parse_mode="HTML")
+        return
+    if not (1 <= minutes <= 1440):
+        await update.message.reply_text(t(chat_id, "digest_invalid"), parse_mode="HTML")
+        return
+
+    interval_s = minutes * 60
+    if state is None:
+        state = DigestState(interval_s=interval_s, last_sent_ts=time.time())
+        chat_digests[chat_id] = state
+    else:
+        state.interval_s = interval_s
+        # Re-anchor so the new cadence starts now rather than firing
+        # immediately if the previous window already elapsed.
+        state.last_sent_ts = time.time()
+    save_chat_digest(chat_id)
+    await update.message.reply_text(
+        t(chat_id, "digest_set", interval=_fmt_delay(interval_s)),
+        parse_mode="HTML",
+    )
+
+
 async def cmd_dustinterval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Set per-wallet dust-summary flush interval.
 
@@ -6184,6 +6394,356 @@ def _detect_resolutions(
     return newly
 
 
+# ==================== Activity digest ====================
+
+DIGEST_DISPLAY_CAP = 25
+DIGEST_SWEEP_INTERVAL_S = 30
+
+
+def _digest_key(addr: str, market_id: str, outcome_index) -> str:
+    oi = outcome_index if outcome_index is not None else ""
+    return f"{(addr or '').lower()}_{market_id}_{oi}"
+
+
+def _digest_entry_for(
+    state: DigestState,
+    addr: str,
+    note: str,
+    market_id: str,
+    outcome_index,
+    title: str,
+    outcome: str,
+    slug: str | None,
+) -> DigestEntry:
+    k = _digest_key(addr, market_id, outcome_index)
+    e = state.entries.get(k)
+    if e is None:
+        oi_int = outcome_index if isinstance(outcome_index, int) else None
+        e = DigestEntry(
+            wallet_addr=addr,
+            wallet_note=note,
+            market_id=str(market_id),
+            outcome_index=oi_int,
+            title=title or "",
+            outcome=outcome or "",
+            slug=slug,
+        )
+        state.entries[k] = e
+        return e
+    # Refresh display data — later events may carry richer titles/slugs.
+    if title and not e.title:
+        e.title = title
+    if outcome and not e.outcome:
+        e.outcome = outcome
+    if slug and not e.slug:
+        e.slug = slug
+    if note and not e.wallet_note:
+        e.wallet_note = note
+    return e
+
+
+def _digest_feed(
+    chat_id: int,
+    w: WatchedWallet,
+    added: list[dict],
+    changed: list[tuple[dict, float | None]],
+    closed: list[str],
+    new_fills: list[dict],
+    dust_fills: list[dict],
+    resolutions: list,
+    markets: dict,
+    merged_titles: dict,
+) -> None:
+    """Aggregate this poll's events into the chat's pending digest buffer.
+
+    No-op when the chat hasn't enabled a digest. Same wallet+market+outcome
+    fills are collapsed into one ``DigestEntry`` so the eventual message
+    shows one row per market regardless of how many times the wallet
+    re-fired against it.
+    """
+    state = chat_digests.get(chat_id)
+    if not state or state.interval_s <= 0:
+        return
+
+    addr = w.address
+    note = w.note or ""
+
+    for m in list(new_fills or []) + list(dust_fills or []):
+        market = _match_market_view(m)
+        market_id = market.get("id") or ""
+        if not market_id:
+            continue
+        our_side = _pick_user_side(m, addr)
+        outcome_obj = our_side.get("outcome") if isinstance(our_side.get("outcome"), dict) else {}
+        outcome_index = outcome_obj.get("index")
+        if outcome_index is None:
+            taker = m.get("taker") if isinstance(m.get("taker"), dict) else {}
+            t_out = taker.get("outcome") if isinstance(taker, dict) else None
+            if isinstance(t_out, dict):
+                outcome_index = t_out.get("index")
+        try:
+            outcome_index_int = int(outcome_index) if outcome_index is not None else None
+        except (TypeError, ValueError):
+            outcome_index_int = None
+        outcome_name = outcome_obj.get("name") or outcome_obj.get("title") or ""
+        fresh = markets.get(market_id) if isinstance(markets, dict) else None
+        link_market = {**market, **(fresh or {})}
+        title = link_market.get("title") or link_market.get("question") or market.get("_sub_title") or ""
+        slug = (
+            link_market.get("slug")
+            or link_market.get("marketSlug")
+            or link_market.get("categorySlug")
+            or link_market.get("category_slug")
+        )
+
+        shares = _norm_amount_to_shares(m.get("amountFilled"))
+        if shares is None:
+            shares = _norm_amount_to_shares(our_side.get("amount"))
+        price_c = _norm_price_to_cents(our_side.get("price"))
+        if price_c is None:
+            price_c = _norm_price_to_cents(m.get("priceExecuted"))
+        if shares is None or price_c is None:
+            continue
+        usd = shares * price_c / 100.0
+        side = (our_side.get("quoteType") or "").lower()
+        if side == "bid":
+            signed = shares
+        elif side == "ask":
+            signed = -shares
+        else:
+            signed = 0.0
+
+        e = _digest_entry_for(
+            state, addr, note, market_id, outcome_index_int,
+            title, outcome_name, slug,
+        )
+        e.net_shares += signed
+        e.gross_volume_usd += abs(usd)
+        e.fill_count += 1
+        ts = _executed_ts(m) or time.time()
+        if e.first_ts == 0 or ts < e.first_ts:
+            e.first_ts = ts
+        if ts > e.last_ts:
+            e.last_ts = ts
+
+    def _feed_position(p: dict, flag_opened: bool) -> None:
+        market_id = p.get("marketId") or (p.get("market") or {}).get("id") or ""
+        if not market_id:
+            return
+        outcome_index = p.get("outcomeIndex")
+        if outcome_index is None:
+            outcome_index = (p.get("outcome") or {}).get("index")
+        try:
+            outcome_index_int = int(outcome_index) if outcome_index is not None else None
+        except (TypeError, ValueError):
+            outcome_index_int = None
+        nested = p.get("market") if isinstance(p.get("market"), dict) else {}
+        fetched = p.get("_market") if isinstance(p.get("_market"), dict) else {}
+        link_market = {**nested, **fetched}
+        title, outcome_name, _, _ = display_fields(p, link_market)
+        slug = (
+            link_market.get("slug")
+            or link_market.get("marketSlug")
+            or link_market.get("categorySlug")
+            or link_market.get("category_slug")
+        )
+        e = _digest_entry_for(
+            state, addr, note, market_id, outcome_index_int,
+            title, outcome_name, slug,
+        )
+        if flag_opened:
+            e.opened = True
+        s = pos_size(p)
+        if s is not None:
+            e.latest_shares = s
+            e.latest_value_usd = _position_value_usd(p)
+
+    for p in added or []:
+        _feed_position(p, flag_opened=True)
+    for p, _prev in changed or []:
+        _feed_position(p, flag_opened=False)
+
+    for k in closed or []:
+        entry_cache = merged_titles.get(k) if isinstance(merged_titles, dict) else None
+        market_id, _, outcome_index_str = k.partition("_")
+        try:
+            outcome_index_int = int(outcome_index_str) if outcome_index_str else None
+        except ValueError:
+            outcome_index_int = None
+        if isinstance(entry_cache, dict):
+            title = entry_cache.get("title") or ""
+            outcome_name = entry_cache.get("outcome") or ""
+            slug = entry_cache.get("slug")
+        else:
+            title = entry_cache if isinstance(entry_cache, str) else ""
+            outcome_name = ""
+            slug = None
+        e = _digest_entry_for(
+            state, addr, note, market_id, outcome_index_int,
+            title, outcome_name, slug,
+        )
+        e.closed = True
+        e.latest_shares = 0.0
+        e.latest_value_usd = 0.0
+
+    for market, winning_idx, held_idx, _title in resolutions or []:
+        mid = str(market.get("id") or "")
+        if not mid:
+            continue
+        for e in state.entries.values():
+            if e.wallet_addr.lower() == addr.lower() and e.market_id == mid:
+                e.resolved = True
+                if winning_idx is not None:
+                    e.resolved_winner = winning_idx
+                if held_idx is not None:
+                    e.held_idx = held_idx
+
+    # Anchor the digest window on first activity if it hasn't been set yet,
+    # so the very first flush still respects the configured interval rather
+    # than firing on the next sweep.
+    if state.last_sent_ts <= 0:
+        state.last_sent_ts = time.time()
+        save_chat_digest(chat_id)
+
+
+def _render_digest(chat_id: int, state: DigestState, window_s: float) -> str:
+    entries = sorted(
+        state.entries.values(),
+        key=lambda e: (
+            -e.gross_volume_usd,
+            -e.fill_count,
+            0 if e.closed else 1,
+            0 if e.opened else 1,
+        ),
+    )
+    total_fills = sum(e.fill_count for e in entries)
+    wallets = {e.wallet_addr.lower() for e in entries}
+    header = t(
+        chat_id, "digest_header",
+        window=_fmt_delay(window_s),
+        markets=len(entries),
+        fills=total_fills,
+        wallets=len(wallets),
+    )
+
+    lines: list[str] = []
+    for e in entries[:DIGEST_DISPLAY_CAP]:
+        title_html = _title_html(
+            (e.title or "?")[:60],
+            {"slug": e.slug} if e.slug else None,
+        )
+        outcome_html = _html_escape(e.outcome or "?")
+        addr_short = fmt_addr(e.wallet_addr)
+        note_part = (
+            t(chat_id, "digest_entry_note", note=_html_escape(e.wallet_note))
+            if e.wallet_note
+            else ""
+        )
+        addr_line = t(chat_id, "digest_entry_addr", addr=addr_short, note=note_part)
+
+        flow_line = ""
+        if e.fill_count > 0:
+            shares_abs = abs(e.net_shares)
+            shares_text = _fmt_num(shares_abs, digits=4) if shares_abs else "0"
+            if e.net_shares > 1e-9:
+                flow_line = t(
+                    chat_id, "digest_entry_flow_buy",
+                    shares=shares_text, fills=e.fill_count, gross=e.gross_volume_usd,
+                )
+            elif e.net_shares < -1e-9:
+                flow_line = t(
+                    chat_id, "digest_entry_flow_sell",
+                    shares=shares_text, fills=e.fill_count, gross=e.gross_volume_usd,
+                )
+            else:
+                flow_line = t(
+                    chat_id, "digest_entry_flow_flat",
+                    fills=e.fill_count, gross=e.gross_volume_usd,
+                )
+
+        holding_line = ""
+        if (
+            not e.closed
+            and e.latest_shares is not None
+            and e.latest_value_usd is not None
+            and e.latest_shares > 0
+        ):
+            holding_line = t(
+                chat_id, "digest_entry_holding",
+                shares=_fmt_num(e.latest_shares, digits=4),
+                value=e.latest_value_usd,
+            )
+
+        tags: list[str] = []
+        if e.opened:
+            tags.append(t(chat_id, "digest_entry_opened"))
+        if e.closed:
+            tags.append(t(chat_id, "digest_entry_closed"))
+        if e.resolved:
+            winner = e.resolved_winner if e.resolved_winner is not None else "?"
+            tags.append(t(chat_id, "digest_entry_resolved", winner=winner))
+
+        parts = [f"• {outcome_html} — {title_html}", addr_line]
+        if flow_line:
+            parts.append(flow_line)
+        if holding_line:
+            parts.append(holding_line)
+        if tags:
+            parts.append("  ".join(tags))
+        lines.append("\n".join(parts))
+
+    body = "\n\n".join(lines)
+    if len(entries) > DIGEST_DISPLAY_CAP:
+        body += t(chat_id, "digest_entry_more", count=len(entries) - DIGEST_DISPLAY_CAP)
+    return header + body
+
+
+async def digest_loop(app: Application):
+    """Sweep every DIGEST_SWEEP_INTERVAL_S and flush any chat whose
+    configured digest interval has elapsed since the last flush.
+
+    Empty windows are skipped (no spammy "nothing happened" messages) but
+    the anchor still advances so the next non-empty digest fires on the
+    same cadence rather than dumping a backlog.
+    """
+    await asyncio.sleep(5)
+    logger.info("Digest loop started")
+    while True:
+        try:
+            now = time.time()
+            for chat_id, state in list(chat_digests.items()):
+                if state.interval_s <= 0:
+                    continue
+                if state.last_sent_ts > 0 and (now - state.last_sent_ts) < state.interval_s:
+                    continue
+                if not state.entries:
+                    if state.last_sent_ts <= 0:
+                        state.last_sent_ts = now
+                        save_chat_digest(chat_id)
+                    continue
+                window_s = (
+                    now - state.last_sent_ts
+                    if state.last_sent_ts > 0
+                    else state.interval_s
+                )
+                text = _render_digest(chat_id, state, window_s)
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception as send_err:
+                    logger.warning(f"Failed to send digest for chat {chat_id}: {send_err}")
+                state.entries = {}
+                state.last_sent_ts = now
+                save_chat_digest(chat_id)
+        except Exception as e:
+            logger.exception(f"digest_loop iteration error: {e}")
+        await asyncio.sleep(DIGEST_SWEEP_INTERVAL_S)
+
+
 async def poll_loop(app: Application):
     await asyncio.sleep(3)
     logger.info("Poll loop started")
@@ -6648,6 +7208,28 @@ async def poll_loop(app: Application):
                                 + "\n\n".join(lines)
                             )
 
+                        # Tee the same events into the chat's digest buffer
+                        # before sending. Independent of mute (digest is its
+                        # own opt-in channel) and runs even when blocks is
+                        # empty so an active digest window keeps anchoring.
+                        try:
+                            _digest_feed(
+                                chat_id,
+                                w,
+                                added_visible,
+                                changed_visible,
+                                closed,
+                                new_fills,
+                                dust_to_emit,
+                                resolutions,
+                                markets,
+                                merged_titles,
+                            )
+                        except Exception as feed_err:
+                            logger.warning(
+                                f"digest feed error for {w.address} in chat {chat_id}: {feed_err}"
+                            )
+
                         # Honor the chat's notification mode:
                         #   "split"  (default) — one Telegram message per
                         #            block (position changes / fills /
@@ -6771,6 +7353,7 @@ async def on_startup(app: Application):
                 "Skipping admin scope commands for %s: %s", ADMIN_CHAT_ID, e
             )
     asyncio.create_task(poll_loop(app))
+    asyncio.create_task(digest_loop(app))
 
 
 def main():
@@ -6805,6 +7388,7 @@ def main():
     app.add_handler(CommandHandler("threshold", cmd_threshold))
     app.add_handler(CommandHandler("interval", cmd_interval))
     app.add_handler(CommandHandler("dustinterval", cmd_dustinterval))
+    app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("minfill", cmd_minfill))
     app.add_handler(CommandHandler("alert", cmd_alert))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
