@@ -580,6 +580,19 @@ I18N = {
             "Next flush in ~{remaining}\n\n"
             "<code>/digest off</code> to disable."
         ),
+        "digest_picker_off": (
+            "📋 <b>Digest</b>: off\n\n"
+            "Tap a preset to start getting a per-market deduped activity "
+            "summary, or ✏️ to pick a custom interval (1–1440 min)."
+        ),
+        "digest_picker_on": (
+            "📋 <b>Digest</b>: every {interval}\n"
+            "Buffered: <b>{entries}</b> · next flush in ~{remaining}\n\n"
+            "Tap to change cadence, or 🚫 to turn off."
+        ),
+        "digest_btn_off": "🚫 Off",
+        "digest_btn_custom": "✏️ Custom",
+        "digest_custom_prompt": "Reply with a minute count between 1 and 1440 (e.g. <code>90</code>).",
         "digest_invalid": "Pass a minute count between 1 and 1440, or <code>off</code>.",
         "digest_set": "📋 Digest enabled: a deduped summary every {interval}.",
         "digest_off_ok": "📋 Digest disabled.",
@@ -1090,6 +1103,19 @@ I18N = {
             "下次约 {remaining} 后发送\n\n"
             "<code>/digest off</code> 关闭。"
         ),
+        "digest_picker_off": (
+            "📋 <b>摘要</b>：未开启\n\n"
+            "点下方按钮开启「按市场去重」的活动汇总，每隔一段时间发一次。"
+            "✏️ 可填 1–1440 分钟自定义。"
+        ),
+        "digest_picker_on": (
+            "📋 <b>摘要</b>：每 {interval} 一次\n"
+            "待发：<b>{entries}</b> · 下次约 {remaining} 后\n\n"
+            "点按钮换间隔，🚫 关闭。"
+        ),
+        "digest_btn_off": "🚫 关闭",
+        "digest_btn_custom": "✏️ 自定义",
+        "digest_custom_prompt": "回复一个 1–1440 的分钟数（例如 <code>90</code>）。",
         "digest_invalid": "请填 1–1440 的分钟数，或 <code>off</code>。",
         "digest_set": "📋 摘要已开启：每 {interval} 汇总一次（按市场去重）。",
         "digest_off_ok": "📋 摘要已关闭。",
@@ -4628,42 +4654,112 @@ async def cmd_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+DIGEST_PRESET_MINUTES: tuple[int, ...] = (15, 30, 60, 120, 240, 720)
+
+
+def _digest_card(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the picker card text + inline keyboard for /digest.
+
+    Off → an explanatory blurb plus the preset row.
+    On  → cadence / pending / next-flush summary plus the preset row with
+          the active interval marked ✅.
+    """
+    state = chat_digests.get(chat_id)
+    active_min = (
+        state.interval_s // 60 if state and state.interval_s > 0 else 0
+    )
+    if active_min > 0:
+        now = time.time()
+        elapsed = max(0.0, now - state.last_sent_ts) if state.last_sent_ts > 0 else 0
+        remaining = max(0.0, state.interval_s - elapsed)
+        text = t(
+            chat_id,
+            "digest_picker_on",
+            interval=_fmt_delay(state.interval_s),
+            entries=len(state.entries),
+            remaining=_fmt_delay(remaining),
+        )
+    else:
+        text = t(chat_id, "digest_picker_off")
+
+    # Preset rows — keep at most 3 buttons per row so labels stay readable.
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for minutes in DIGEST_PRESET_MINUTES:
+        if minutes % 60 == 0:
+            label = f"{minutes // 60}h"
+        else:
+            label = f"{minutes}m"
+        if minutes == active_min:
+            label = f"✅ {label}"
+        row.append(
+            InlineKeyboardButton(label, callback_data=f"dgst:set:{minutes}")
+        )
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    # Off + custom row.
+    off_label = t(chat_id, "digest_btn_off")
+    if active_min == 0:
+        off_label = f"✅ {off_label}"
+    rows.append([
+        InlineKeyboardButton(off_label, callback_data="dgst:set:0"),
+        InlineKeyboardButton(
+            t(chat_id, "digest_btn_custom"), callback_data="dgst:custom"
+        ),
+    ])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _digest_apply(chat_id: int, minutes: int) -> None:
+    """Enable (minutes > 0) or disable (minutes == 0) the digest for this chat
+    and persist the new config."""
+    if minutes <= 0:
+        if chat_id in chat_digests:
+            del chat_digests[chat_id]
+        save_chat_digest(chat_id)
+        return
+    interval_s = minutes * 60
+    state = chat_digests.get(chat_id)
+    if state is None:
+        state = DigestState(interval_s=interval_s, last_sent_ts=time.time())
+        chat_digests[chat_id] = state
+    else:
+        state.interval_s = interval_s
+        # Re-anchor so the new cadence starts now rather than firing
+        # immediately if the previous window already elapsed.
+        state.last_sent_ts = time.time()
+    save_chat_digest(chat_id)
+
+
+def _set_pending_digest(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    ctx.user_data["pending_digest"] = {"chat_id": chat_id}
+
+
+def _pop_pending_digest(ctx: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    return ctx.user_data.pop("pending_digest", None)
+
+
 async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Configure the periodic activity digest for this chat.
 
-    /digest             — show current state
+    /digest             — open the tap-to-pick card
     /digest off | 0     — disable
     /digest <minutes>   — enable with that cadence (1–1440)
     """
     chat_id = update.effective_chat.id
-    state = chat_digests.get(chat_id)
     if not ctx.args:
-        if not state or state.interval_s <= 0:
-            await update.message.reply_text(
-                t(chat_id, "digest_status_off"),
-                parse_mode="HTML",
-            )
-            return
-        now = time.time()
-        elapsed = max(0.0, now - state.last_sent_ts) if state.last_sent_ts > 0 else 0
-        remaining = max(0.0, state.interval_s - elapsed)
+        text, markup = _digest_card(chat_id)
         await update.message.reply_text(
-            t(
-                chat_id,
-                "digest_status_on",
-                interval=_fmt_delay(state.interval_s),
-                entries=len(state.entries),
-                remaining=_fmt_delay(remaining),
-            ),
-            parse_mode="HTML",
+            text, parse_mode="HTML", reply_markup=markup
         )
         return
 
     arg = ctx.args[0].strip().lower()
     if arg in ("off", "关闭", "停", "0"):
-        if chat_id in chat_digests:
-            del chat_digests[chat_id]
-        save_chat_digest(chat_id)
+        _digest_apply(chat_id, 0)
         await update.message.reply_text(t(chat_id, "digest_off_ok"), parse_mode="HTML")
         return
 
@@ -4676,18 +4772,9 @@ async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t(chat_id, "digest_invalid"), parse_mode="HTML")
         return
 
-    interval_s = minutes * 60
-    if state is None:
-        state = DigestState(interval_s=interval_s, last_sent_ts=time.time())
-        chat_digests[chat_id] = state
-    else:
-        state.interval_s = interval_s
-        # Re-anchor so the new cadence starts now rather than firing
-        # immediately if the previous window already elapsed.
-        state.last_sent_ts = time.time()
-    save_chat_digest(chat_id)
+    _digest_apply(chat_id, minutes)
     await update.message.reply_text(
-        t(chat_id, "digest_set", interval=_fmt_delay(interval_s)),
+        t(chat_id, "digest_set", interval=_fmt_delay(minutes * 60)),
         parse_mode="HTML",
     )
 
@@ -5561,6 +5648,34 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Digest custom-cadence reply (from the picker's ✏️ button).
+    pending_digest = ctx.user_data.get("pending_digest")
+    if pending_digest and pending_digest.get("chat_id") == chat_id:
+        raw = (update.message.text or "").strip()
+        try:
+            minutes = int(raw)
+        except ValueError:
+            await update.message.reply_text(
+                t(chat_id, "digest_invalid"),
+                parse_mode="HTML",
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        if not (1 <= minutes <= 1440):
+            await update.message.reply_text(
+                t(chat_id, "digest_invalid"),
+                parse_mode="HTML",
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        _pop_pending_digest(ctx)
+        _digest_apply(chat_id, minutes)
+        text, markup = _digest_card(chat_id)
+        await update.message.reply_text(
+            text, parse_mode="HTML", reply_markup=markup
+        )
+        return
+
     # Dust-interval custom reply (from the picker's ✏️ button).
     pending_dust = ctx.user_data.get("pending_dustinterval")
     if pending_dust and pending_dust.get("chat_id") == chat_id:
@@ -6101,6 +6216,42 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Dust picker: minfill:{open|set|custom|close|dset|dcustom|ddefault}:{addr}[:{value}]
     # (the prefix is "minfill" for legacy reasons; the picker now covers both
     # the dust floor and the dust-summary interval)
+    # dgst:set:<minutes>  (0 = off) | dgst:custom (prompts for free input)
+    if data.startswith("dgst:"):
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "custom":
+            _set_pending_digest(ctx, chat_id)
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=t(chat_id, "digest_custom_prompt"),
+                parse_mode="HTML",
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        if action == "set" and len(parts) >= 3:
+            try:
+                minutes = int(parts[2])
+            except ValueError:
+                return
+            if minutes < 0 or minutes > 1440:
+                return
+            _digest_apply(chat_id, minutes)
+            text, markup = _digest_card(chat_id)
+            try:
+                await query.edit_message_text(
+                    text, parse_mode="HTML", reply_markup=markup
+                )
+            except BadRequest:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+            return
+        return
+
     if data.startswith("minfill:"):
         parts = data.split(":", 3)
         action = parts[1] if len(parts) > 1 else ""
