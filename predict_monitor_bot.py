@@ -605,18 +605,18 @@ I18N = {
         "digest_entry_addr": "<code>{addr}</code>{note}",
         "digest_entry_note": " · {note}",
         "digest_wallet_header": (
-            "👤 <code>{addr}</code>{note}\n"
-            "<i>{markets} markets · {fills} fills · ${gross:,.2f} flow</i>"
+            "👤 <code>{addr}</code>{note} — "
+            "{markets} markets · {fills} fills · ${gross:,.2f} flow"
         ),
-        "digest_divider": "─────",
-        "digest_entry_flow_buy": "🟢 net buy {shares} · {fills} fills · ${gross:,.2f} flow",
-        "digest_entry_flow_sell": "🔴 net sell {shares} · {fills} fills · ${gross:,.2f} flow",
-        "digest_entry_flow_flat": "⚪ {fills} fills · ${gross:,.2f} flow (flat)",
-        "digest_entry_holding": "📦 holding {shares} = ${value:,.2f}",
-        "digest_entry_opened": "🆕 opened",
-        "digest_entry_closed": "🔴 closed",
-        "digest_entry_resolved": "🏁 resolved · winner #{winner}",
-        "digest_entry_more": "\n\n…and {count} more markets",
+        "digest_market_header": "📁 {title}",
+        "digest_outcome_buy": "  🟢 {outcome} · net buy {shares} · {fills} fills · ${gross:,.2f}",
+        "digest_outcome_sell": "  🔴 {outcome} · net sell {shares} · {fills} fills · ${gross:,.2f}",
+        "digest_outcome_flat": "  ⚪ {outcome} · {fills} fills · ${gross:,.2f} (flat)",
+        "digest_outcome_holding": "  📦 holding {shares} = ${value:,.2f}",
+        "digest_outcome_opened": "  🆕 opened",
+        "digest_outcome_closed": "  🔴 closed",
+        "digest_outcome_resolved": "  🏁 resolved · winner #{winner}",
+        "digest_page_footer": "<i>page {page}/{total}</i>",
         "minfill_picker_title": "💨 <b>Micro-fill settings</b> · <code>{addr}</code>",
         "minfill_picker_floor": "💰 <b>Floor:</b> ${usd:.2f}{fallback} — fills below this fold into a summary",
         "minfill_picker_interval": "⏱ <b>Summary every:</b> {interval}{fallback}",
@@ -1135,18 +1135,18 @@ I18N = {
         "digest_entry_addr": "<code>{addr}</code>{note}",
         "digest_entry_note": " · {note}",
         "digest_wallet_header": (
-            "👤 <code>{addr}</code>{note}\n"
-            "<i>{markets} 个市场 · {fills} 笔 · ${gross:,.2f} 流水</i>"
+            "👤 <code>{addr}</code>{note} — "
+            "{markets} 个市场 · {fills} 笔 · ${gross:,.2f} 流水"
         ),
-        "digest_divider": "─────",
-        "digest_entry_flow_buy": "🟢 净买入 {shares} 份 · {fills} 笔 · ${gross:,.2f} 流水",
-        "digest_entry_flow_sell": "🔴 净卖出 {shares} 份 · {fills} 笔 · ${gross:,.2f} 流水",
-        "digest_entry_flow_flat": "⚪ {fills} 笔 · ${gross:,.2f} 流水（净额为零）",
-        "digest_entry_holding": "📦 当前持仓 {shares} 份 = ${value:,.2f}",
-        "digest_entry_opened": "🆕 新开仓",
-        "digest_entry_closed": "🔴 已平仓",
-        "digest_entry_resolved": "🏁 已结算 · 获胜结果 #{winner}",
-        "digest_entry_more": "\n\n…还有 {count} 个市场",
+        "digest_market_header": "📁 {title}",
+        "digest_outcome_buy": "  🟢 {outcome} · 净买入 {shares} 份 · {fills} 笔 · ${gross:,.2f}",
+        "digest_outcome_sell": "  🔴 {outcome} · 净卖出 {shares} 份 · {fills} 笔 · ${gross:,.2f}",
+        "digest_outcome_flat": "  ⚪ {outcome} · {fills} 笔 · ${gross:,.2f}（净额为零）",
+        "digest_outcome_holding": "  📦 持仓 {shares} 份 = ${value:,.2f}",
+        "digest_outcome_opened": "  🆕 新开仓",
+        "digest_outcome_closed": "  🔴 已平仓",
+        "digest_outcome_resolved": "  🏁 已结算 · 获胜结果 #{winner}",
+        "digest_page_footer": "<i>第 {page}/{total} 条</i>",
         "minfill_picker_title": "💨 <b>小额提醒设置</b> · <code>{addr}</code>",
         "minfill_picker_floor": "💰 <b>成交额小于多少美元不单独提醒：</b>${usd:.2f}{fallback}",
         "minfill_picker_interval": "⏱ <b>这些小额多久合并提醒一次：</b>{interval}{fallback}",
@@ -6626,8 +6626,10 @@ def _detect_resolutions(
 
 # ==================== Activity digest ====================
 
-DIGEST_DISPLAY_CAP = 25
 DIGEST_SWEEP_INTERVAL_S = 30
+# Soft per-message budget for the digest. Telegram's hard limit is 4096
+# chars; we leave headroom for the trailing page footer + HTML overhead.
+DIGEST_MESSAGE_CHAR_BUDGET = 3500
 
 
 def _digest_key(addr: str, market_id: str, outcome_index) -> str:
@@ -6836,16 +6838,75 @@ def _digest_feed(
         save_chat_digest(chat_id)
 
 
-def _render_digest(chat_id: int, state: DigestState, window_s: float) -> str:
-    """Render the digest grouped by wallet.
+def _render_digest_entry(chat_id: int, e: DigestEntry) -> str:
+    """One market block: 📁 title header + indented outcome lines.
 
-    Wallet groups are sorted by total gross USD volume (busiest first) and
-    each wallet's markets are sorted the same way internally. A
-    DIGEST_DISPLAY_CAP across all entries keeps the message under
-    Telegram's 4096-char limit even when many wallets are active; markets
-    that don't fit fold into a "…and N more" footer.
+    Mirrors the screenshot format the user shared — title on its own line
+    with a 📁, then the outcome data nested underneath with leading spaces.
     """
-    # Bucket entries by wallet so the user can scan one wallet at a time.
+    title_html = _title_html(
+        (e.title or "?")[:80],
+        {"slug": e.slug} if e.slug else None,
+    )
+    outcome_html = _html_escape(e.outcome or "?")
+    lines = [t(chat_id, "digest_market_header", title=title_html)]
+
+    if e.fill_count > 0:
+        shares_abs = abs(e.net_shares)
+        shares_text = _fmt_num(shares_abs, digits=4) if shares_abs else "0"
+        if e.net_shares > 1e-9:
+            lines.append(t(
+                chat_id, "digest_outcome_buy",
+                outcome=outcome_html, shares=shares_text,
+                fills=e.fill_count, gross=e.gross_volume_usd,
+            ))
+        elif e.net_shares < -1e-9:
+            lines.append(t(
+                chat_id, "digest_outcome_sell",
+                outcome=outcome_html, shares=shares_text,
+                fills=e.fill_count, gross=e.gross_volume_usd,
+            ))
+        else:
+            lines.append(t(
+                chat_id, "digest_outcome_flat",
+                outcome=outcome_html, fills=e.fill_count, gross=e.gross_volume_usd,
+            ))
+
+    if (
+        not e.closed
+        and e.latest_shares is not None
+        and e.latest_value_usd is not None
+        and e.latest_shares > 0
+    ):
+        lines.append(t(
+            chat_id, "digest_outcome_holding",
+            shares=_fmt_num(e.latest_shares, digits=4),
+            value=e.latest_value_usd,
+        ))
+
+    if e.opened:
+        lines.append(t(chat_id, "digest_outcome_opened"))
+    if e.closed:
+        lines.append(t(chat_id, "digest_outcome_closed"))
+    if e.resolved:
+        winner = e.resolved_winner if e.resolved_winner is not None else "?"
+        lines.append(t(chat_id, "digest_outcome_resolved", winner=winner))
+
+    return "\n".join(lines)
+
+
+def _render_digest_messages(
+    chat_id: int, state: DigestState, window_s: float
+) -> list[str]:
+    """Render the digest into one or more Telegram-sized messages.
+
+    Wallet blocks are bin-packed so a message holds as many full wallets
+    as fit under DIGEST_MESSAGE_CHAR_BUDGET. A single wallet whose own
+    block exceeds the budget is split at market boundaries, with each
+    continuation message re-stating the wallet header so the reader
+    always has the addr+note in view. Messages get a "page x/y" footer
+    when there's more than one.
+    """
     grouped: dict[str, list[DigestEntry]] = {}
     for e in state.entries.values():
         grouped.setdefault(e.wallet_addr.lower(), []).append(e)
@@ -6876,107 +6937,97 @@ def _render_digest(chat_id: int, state: DigestState, window_s: float) -> str:
         markets=total_markets,
         fills=total_fills,
         wallets=len(wallet_blocks),
-    )
+    ).rstrip()
 
-    sections: list[str] = [header.rstrip()]
-    rendered = 0
-    truncated = 0
-    divider = t(chat_id, "digest_divider")
-
-    for addr, note, gross, fills, markets, entries in wallet_blocks:
-        if rendered >= DIGEST_DISPLAY_CAP:
-            truncated += markets
-            continue
+    def _wallet_header_text(addr, note, gross, fills, markets) -> str:
         note_part = (
             t(chat_id, "digest_entry_note", note=_html_escape(note)) if note else ""
         )
-        block_parts: list[str] = [
-            divider,
-            t(
-                chat_id, "digest_wallet_header",
-                addr=fmt_addr(addr),
-                note=note_part,
-                markets=markets,
-                fills=fills,
-                gross=gross,
-            ),
-        ]
-        for e in entries:
-            if rendered >= DIGEST_DISPLAY_CAP:
-                truncated += 1
-                continue
-            title_html = _title_html(
-                (e.title or "?")[:60],
-                {"slug": e.slug} if e.slug else None,
+        return t(
+            chat_id, "digest_wallet_header",
+            addr=fmt_addr(addr),
+            note=note_part,
+            markets=markets,
+            fills=fills,
+            gross=gross,
+        )
+
+    # Pre-render each wallet's pieces so we can pack them by character cost.
+    rendered_blocks: list[tuple[str, list[str]]] = []  # (wallet_header, [entry_strings])
+    for addr, note, gross, fills, markets, entries in wallet_blocks:
+        wh = _wallet_header_text(addr, note, gross, fills, markets)
+        entry_strs = [_render_digest_entry(chat_id, e) for e in entries]
+        rendered_blocks.append((wh, entry_strs))
+
+    SEP = "\n\n"
+    BUDGET = DIGEST_MESSAGE_CHAR_BUDGET
+    messages: list[str] = []
+    current = header  # first message starts with the global header
+
+    def _flush():
+        nonlocal current
+        if current:
+            messages.append(current)
+        current = ""
+
+    def _append(piece: str) -> None:
+        """Glue piece onto the current message, flushing first if it won't fit."""
+        nonlocal current
+        if not current:
+            current = piece
+            return
+        if len(current) + len(SEP) + len(piece) > BUDGET:
+            _flush()
+            current = piece
+            return
+        current = current + SEP + piece
+
+    def _split_wallet(wh: str, entry_strs: list[str]):
+        """Yield wallet sub-pieces ≤ BUDGET, restating ``wh`` on each one."""
+        idx = 0
+        while idx < len(entry_strs):
+            parts = [wh]
+            parts_len = len(wh)
+            while idx < len(entry_strs):
+                e = entry_strs[idx]
+                added = len(SEP) + len(e)
+                if parts_len + added > BUDGET and len(parts) > 1:
+                    break
+                parts.append(e)
+                parts_len += added
+                idx += 1
+            yield SEP.join(parts)
+
+    for wh, entry_strs in rendered_blocks:
+        full = SEP.join([wh] + entry_strs)
+        if len(full) <= BUDGET:
+            # Whole wallet fits in one piece — let _append decide whether
+            # to merge with current or start a fresh message.
+            _append(full)
+        else:
+            # Wallet alone exceeds the budget; split at entry boundaries
+            # with the header restated on each continuation piece.
+            for piece in _split_wallet(wh, entry_strs):
+                _append(piece)
+
+    _flush()
+
+    if len(messages) > 1:
+        for i, m in enumerate(messages):
+            messages[i] = (
+                m + SEP + t(chat_id, "digest_page_footer", page=i + 1, total=len(messages))
             )
-            outcome_html = _html_escape(e.outcome or "?")
-
-            flow_line = ""
-            if e.fill_count > 0:
-                shares_abs = abs(e.net_shares)
-                shares_text = _fmt_num(shares_abs, digits=4) if shares_abs else "0"
-                if e.net_shares > 1e-9:
-                    flow_line = t(
-                        chat_id, "digest_entry_flow_buy",
-                        shares=shares_text, fills=e.fill_count, gross=e.gross_volume_usd,
-                    )
-                elif e.net_shares < -1e-9:
-                    flow_line = t(
-                        chat_id, "digest_entry_flow_sell",
-                        shares=shares_text, fills=e.fill_count, gross=e.gross_volume_usd,
-                    )
-                else:
-                    flow_line = t(
-                        chat_id, "digest_entry_flow_flat",
-                        fills=e.fill_count, gross=e.gross_volume_usd,
-                    )
-
-            holding_line = ""
-            if (
-                not e.closed
-                and e.latest_shares is not None
-                and e.latest_value_usd is not None
-                and e.latest_shares > 0
-            ):
-                holding_line = t(
-                    chat_id, "digest_entry_holding",
-                    shares=_fmt_num(e.latest_shares, digits=4),
-                    value=e.latest_value_usd,
-                )
-
-            tags: list[str] = []
-            if e.opened:
-                tags.append(t(chat_id, "digest_entry_opened"))
-            if e.closed:
-                tags.append(t(chat_id, "digest_entry_closed"))
-            if e.resolved:
-                winner = e.resolved_winner if e.resolved_winner is not None else "?"
-                tags.append(t(chat_id, "digest_entry_resolved", winner=winner))
-
-            entry_lines = [f"• {outcome_html} — {title_html}"]
-            if flow_line:
-                entry_lines.append(flow_line)
-            if holding_line:
-                entry_lines.append(holding_line)
-            if tags:
-                entry_lines.append("  ".join(tags))
-            block_parts.append("\n".join(entry_lines))
-            rendered += 1
-        sections.append("\n\n".join(block_parts))
-
-    body = "\n\n".join(sections)
-    if truncated:
-        body += t(chat_id, "digest_entry_more", count=truncated)
-    return body
+    return messages
 
 
 async def _flush_digest(chat_id: int, bot) -> bool:
     """Render and send the chat's pending digest right now.
 
-    Returns True iff a message was sent. Empty buffers are a no-op (the
-    caller decides whether to fall back to a confirmation card). On
-    success the buffer is cleared and last_sent_ts is re-anchored to now
-    so the next periodic flush is +interval from this moment.
+    Returns True iff at least one message was sent. The digest is split
+    into multiple Telegram messages when needed so all markets land —
+    no 25-row cap. On success the buffer is cleared and last_sent_ts is
+    re-anchored to now so the next periodic flush is +interval from this
+    moment. Empty buffers are a no-op.
     """
     state = chat_digests.get(chat_id)
     if not state or state.interval_s <= 0 or not state.entries:
@@ -6985,21 +7036,28 @@ async def _flush_digest(chat_id: int, bot) -> bool:
     window_s = (
         max(0.0, now - state.last_sent_ts) if state.last_sent_ts > 0 else state.interval_s
     )
-    text = _render_digest(chat_id, state, window_s)
-    try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except Exception as send_err:
-        logger.warning(f"Failed to send digest for chat {chat_id}: {send_err}")
+    messages = _render_digest_messages(chat_id, state, window_s)
+    if not messages:
         return False
-    state.entries = {}
-    state.last_sent_ts = now
-    save_chat_digest(chat_id)
-    return True
+    sent_any = False
+    for msg in messages:
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=msg,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            sent_any = True
+        except Exception as send_err:
+            logger.warning(f"Failed to send digest for chat {chat_id}: {send_err}")
+            # Keep going — better to deliver as much as we can than to
+            # abandon the whole flush on a single failed message.
+    if sent_any:
+        state.entries = {}
+        state.last_sent_ts = now
+        save_chat_digest(chat_id)
+    return sent_any
 
 
 async def digest_loop(app: Application):
