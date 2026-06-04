@@ -592,6 +592,8 @@ I18N = {
         ),
         "digest_btn_off": "🚫 Off",
         "digest_btn_custom": "✏️ Custom",
+        "digest_btn_flush": "🚀 Send now",
+        "digest_flush_empty": "📋 Nothing to digest yet — buffer is empty.",
         "digest_custom_prompt": "Reply with a minute count between 1 and 1440 (e.g. <code>90</code>).",
         "digest_invalid": "Pass a minute count between 1 and 1440, or <code>off</code>.",
         "digest_set": "📋 Digest enabled: a deduped summary every {interval}.",
@@ -1115,6 +1117,8 @@ I18N = {
         ),
         "digest_btn_off": "🚫 关闭",
         "digest_btn_custom": "✏️ 自定义",
+        "digest_btn_flush": "🚀 立即发送",
+        "digest_flush_empty": "📋 暂无可汇总的活动 — 缓冲区是空的。",
         "digest_custom_prompt": "回复一个 1–1440 的分钟数（例如 <code>90</code>）。",
         "digest_invalid": "请填 1–1440 的分钟数，或 <code>off</code>。",
         "digest_set": "📋 摘要已开启：每 {interval} 汇总一次（按市场去重）。",
@@ -4700,6 +4704,13 @@ def _digest_card(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
             row = []
     if row:
         rows.append(row)
+    # 🚀 立即发送 — only useful while a digest is active.
+    if active_min > 0:
+        rows.append([
+            InlineKeyboardButton(
+                t(chat_id, "digest_btn_flush"), callback_data="dgst:flush"
+            ),
+        ])
     # Off + custom row.
     off_label = t(chat_id, "digest_btn_off")
     if active_min == 0:
@@ -4772,6 +4783,8 @@ async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t(chat_id, "digest_invalid"), parse_mode="HTML")
         return
 
+    # Same flush-on-pick behavior as the inline picker.
+    await _flush_digest(chat_id, ctx.bot)
     _digest_apply(chat_id, minutes)
     await update.message.reply_text(
         t(chat_id, "digest_set", interval=_fmt_delay(minutes * 60)),
@@ -5669,6 +5682,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         _pop_pending_digest(ctx)
+        # Match the inline-picker behavior: send any pending digest before
+        # re-anchoring so accumulated activity isn't lost.
+        await _flush_digest(chat_id, ctx.bot)
         _digest_apply(chat_id, minutes)
         text, markup = _digest_card(chat_id)
         await update.message.reply_text(
@@ -6217,6 +6233,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # (the prefix is "minfill" for legacy reasons; the picker now covers both
     # the dust floor and the dust-summary interval)
     # dgst:set:<minutes>  (0 = off) | dgst:custom (prompts for free input)
+    # | dgst:flush (force-send the current buffer now)
     if data.startswith("dgst:"):
         parts = data.split(":")
         action = parts[1] if len(parts) > 1 else ""
@@ -6229,6 +6246,22 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=ForceReply(selective=True),
             )
             return
+        if action == "flush":
+            sent = await _flush_digest(chat_id, ctx.bot)
+            text, markup = _digest_card(chat_id)
+            try:
+                await query.edit_message_text(
+                    text, parse_mode="HTML", reply_markup=markup
+                )
+            except BadRequest:
+                pass
+            if not sent:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=t(chat_id, "digest_flush_empty"),
+                    parse_mode="HTML",
+                )
+            return
         if action == "set" and len(parts) >= 3:
             try:
                 minutes = int(parts[2])
@@ -6236,6 +6269,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             if minutes < 0 or minutes > 1440:
                 return
+            # When the user picks a cadence (incl. switching between two
+            # active intervals), flush any buffered activity right now so
+            # they get an immediate digest of what's already accumulated
+            # instead of having to wait for the next window. Turning the
+            # digest off skips the flush — disable should be quiet.
+            if minutes > 0:
+                await _flush_digest(chat_id, ctx.bot)
             _digest_apply(chat_id, minutes)
             text, markup = _digest_card(chat_id)
             try:
@@ -6878,6 +6918,38 @@ def _render_digest(chat_id: int, state: DigestState, window_s: float) -> str:
     return header + body
 
 
+async def _flush_digest(chat_id: int, bot) -> bool:
+    """Render and send the chat's pending digest right now.
+
+    Returns True iff a message was sent. Empty buffers are a no-op (the
+    caller decides whether to fall back to a confirmation card). On
+    success the buffer is cleared and last_sent_ts is re-anchored to now
+    so the next periodic flush is +interval from this moment.
+    """
+    state = chat_digests.get(chat_id)
+    if not state or state.interval_s <= 0 or not state.entries:
+        return False
+    now = time.time()
+    window_s = (
+        max(0.0, now - state.last_sent_ts) if state.last_sent_ts > 0 else state.interval_s
+    )
+    text = _render_digest(chat_id, state, window_s)
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as send_err:
+        logger.warning(f"Failed to send digest for chat {chat_id}: {send_err}")
+        return False
+    state.entries = {}
+    state.last_sent_ts = now
+    save_chat_digest(chat_id)
+    return True
+
+
 async def digest_loop(app: Application):
     """Sweep every DIGEST_SWEEP_INTERVAL_S and flush any chat whose
     configured digest interval has elapsed since the last flush.
@@ -6894,31 +6966,19 @@ async def digest_loop(app: Application):
             for chat_id, state in list(chat_digests.items()):
                 if state.interval_s <= 0:
                     continue
-                if state.last_sent_ts > 0 and (now - state.last_sent_ts) < state.interval_s:
+                if state.last_sent_ts == 0:
+                    state.last_sent_ts = now
+                    save_chat_digest(chat_id)
                     continue
-                if not state.entries:
-                    if state.last_sent_ts <= 0:
-                        state.last_sent_ts = now
-                        save_chat_digest(chat_id)
+                if (now - state.last_sent_ts) < state.interval_s:
                     continue
-                window_s = (
-                    now - state.last_sent_ts
-                    if state.last_sent_ts > 0
-                    else state.interval_s
-                )
-                text = _render_digest(chat_id, state, window_s)
-                try:
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
-                except Exception as send_err:
-                    logger.warning(f"Failed to send digest for chat {chat_id}: {send_err}")
-                state.entries = {}
-                state.last_sent_ts = now
-                save_chat_digest(chat_id)
+                if state.entries:
+                    await _flush_digest(chat_id, app.bot)
+                else:
+                    # Empty window: advance the anchor so we don't re-check
+                    # every sweep until activity arrives.
+                    state.last_sent_ts = now
+                    save_chat_digest(chat_id)
         except Exception as e:
             logger.exception(f"digest_loop iteration error: {e}")
         await asyncio.sleep(DIGEST_SWEEP_INTERVAL_S)
