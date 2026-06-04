@@ -604,6 +604,11 @@ I18N = {
         ),
         "digest_entry_addr": "<code>{addr}</code>{note}",
         "digest_entry_note": " · {note}",
+        "digest_wallet_header": (
+            "👤 <code>{addr}</code>{note}\n"
+            "<i>{markets} markets · {fills} fills · ${gross:,.2f} flow</i>"
+        ),
+        "digest_divider": "─────",
         "digest_entry_flow_buy": "🟢 net buy {shares} · {fills} fills · ${gross:,.2f} flow",
         "digest_entry_flow_sell": "🔴 net sell {shares} · {fills} fills · ${gross:,.2f} flow",
         "digest_entry_flow_flat": "⚪ {fills} fills · ${gross:,.2f} flow (flat)",
@@ -1129,6 +1134,11 @@ I18N = {
         ),
         "digest_entry_addr": "<code>{addr}</code>{note}",
         "digest_entry_note": " · {note}",
+        "digest_wallet_header": (
+            "👤 <code>{addr}</code>{note}\n"
+            "<i>{markets} 个市场 · {fills} 笔 · ${gross:,.2f} 流水</i>"
+        ),
+        "digest_divider": "─────",
         "digest_entry_flow_buy": "🟢 净买入 {shares} 份 · {fills} 笔 · ${gross:,.2f} 流水",
         "digest_entry_flow_sell": "🔴 净卖出 {shares} 份 · {fills} 笔 · ${gross:,.2f} 流水",
         "digest_entry_flow_flat": "⚪ {fills} 笔 · ${gross:,.2f} 流水（净额为零）",
@@ -6827,95 +6837,137 @@ def _digest_feed(
 
 
 def _render_digest(chat_id: int, state: DigestState, window_s: float) -> str:
-    entries = sorted(
-        state.entries.values(),
-        key=lambda e: (
-            -e.gross_volume_usd,
-            -e.fill_count,
-            0 if e.closed else 1,
-            0 if e.opened else 1,
-        ),
-    )
-    total_fills = sum(e.fill_count for e in entries)
-    wallets = {e.wallet_addr.lower() for e in entries}
+    """Render the digest grouped by wallet.
+
+    Wallet groups are sorted by total gross USD volume (busiest first) and
+    each wallet's markets are sorted the same way internally. A
+    DIGEST_DISPLAY_CAP across all entries keeps the message under
+    Telegram's 4096-char limit even when many wallets are active; markets
+    that don't fit fold into a "…and N more" footer.
+    """
+    # Bucket entries by wallet so the user can scan one wallet at a time.
+    grouped: dict[str, list[DigestEntry]] = {}
+    for e in state.entries.values():
+        grouped.setdefault(e.wallet_addr.lower(), []).append(e)
+
+    wallet_blocks: list[tuple[str, str, float, int, int, list[DigestEntry]]] = []
+    for entries_for_wallet in grouped.values():
+        gross = sum(e.gross_volume_usd for e in entries_for_wallet)
+        fills = sum(e.fill_count for e in entries_for_wallet)
+        markets = len(entries_for_wallet)
+        addr = entries_for_wallet[0].wallet_addr
+        note = next((e.wallet_note for e in entries_for_wallet if e.wallet_note), "")
+        entries_for_wallet.sort(
+            key=lambda e: (
+                -e.gross_volume_usd,
+                -e.fill_count,
+                0 if e.closed else 1,
+                0 if e.opened else 1,
+            ),
+        )
+        wallet_blocks.append((addr, note, gross, fills, markets, entries_for_wallet))
+    wallet_blocks.sort(key=lambda g: (-g[2], -g[3], -g[4]))
+
+    total_markets = sum(g[4] for g in wallet_blocks)
+    total_fills = sum(g[3] for g in wallet_blocks)
     header = t(
         chat_id, "digest_header",
         window=_fmt_delay(window_s),
-        markets=len(entries),
+        markets=total_markets,
         fills=total_fills,
-        wallets=len(wallets),
+        wallets=len(wallet_blocks),
     )
 
-    lines: list[str] = []
-    for e in entries[:DIGEST_DISPLAY_CAP]:
-        title_html = _title_html(
-            (e.title or "?")[:60],
-            {"slug": e.slug} if e.slug else None,
-        )
-        outcome_html = _html_escape(e.outcome or "?")
-        addr_short = fmt_addr(e.wallet_addr)
+    sections: list[str] = [header.rstrip()]
+    rendered = 0
+    truncated = 0
+    divider = t(chat_id, "digest_divider")
+
+    for addr, note, gross, fills, markets, entries in wallet_blocks:
+        if rendered >= DIGEST_DISPLAY_CAP:
+            truncated += markets
+            continue
         note_part = (
-            t(chat_id, "digest_entry_note", note=_html_escape(e.wallet_note))
-            if e.wallet_note
-            else ""
+            t(chat_id, "digest_entry_note", note=_html_escape(note)) if note else ""
         )
-        addr_line = t(chat_id, "digest_entry_addr", addr=addr_short, note=note_part)
-
-        flow_line = ""
-        if e.fill_count > 0:
-            shares_abs = abs(e.net_shares)
-            shares_text = _fmt_num(shares_abs, digits=4) if shares_abs else "0"
-            if e.net_shares > 1e-9:
-                flow_line = t(
-                    chat_id, "digest_entry_flow_buy",
-                    shares=shares_text, fills=e.fill_count, gross=e.gross_volume_usd,
-                )
-            elif e.net_shares < -1e-9:
-                flow_line = t(
-                    chat_id, "digest_entry_flow_sell",
-                    shares=shares_text, fills=e.fill_count, gross=e.gross_volume_usd,
-                )
-            else:
-                flow_line = t(
-                    chat_id, "digest_entry_flow_flat",
-                    fills=e.fill_count, gross=e.gross_volume_usd,
-                )
-
-        holding_line = ""
-        if (
-            not e.closed
-            and e.latest_shares is not None
-            and e.latest_value_usd is not None
-            and e.latest_shares > 0
-        ):
-            holding_line = t(
-                chat_id, "digest_entry_holding",
-                shares=_fmt_num(e.latest_shares, digits=4),
-                value=e.latest_value_usd,
+        block_parts: list[str] = [
+            divider,
+            t(
+                chat_id, "digest_wallet_header",
+                addr=fmt_addr(addr),
+                note=note_part,
+                markets=markets,
+                fills=fills,
+                gross=gross,
+            ),
+        ]
+        for e in entries:
+            if rendered >= DIGEST_DISPLAY_CAP:
+                truncated += 1
+                continue
+            title_html = _title_html(
+                (e.title or "?")[:60],
+                {"slug": e.slug} if e.slug else None,
             )
+            outcome_html = _html_escape(e.outcome or "?")
 
-        tags: list[str] = []
-        if e.opened:
-            tags.append(t(chat_id, "digest_entry_opened"))
-        if e.closed:
-            tags.append(t(chat_id, "digest_entry_closed"))
-        if e.resolved:
-            winner = e.resolved_winner if e.resolved_winner is not None else "?"
-            tags.append(t(chat_id, "digest_entry_resolved", winner=winner))
+            flow_line = ""
+            if e.fill_count > 0:
+                shares_abs = abs(e.net_shares)
+                shares_text = _fmt_num(shares_abs, digits=4) if shares_abs else "0"
+                if e.net_shares > 1e-9:
+                    flow_line = t(
+                        chat_id, "digest_entry_flow_buy",
+                        shares=shares_text, fills=e.fill_count, gross=e.gross_volume_usd,
+                    )
+                elif e.net_shares < -1e-9:
+                    flow_line = t(
+                        chat_id, "digest_entry_flow_sell",
+                        shares=shares_text, fills=e.fill_count, gross=e.gross_volume_usd,
+                    )
+                else:
+                    flow_line = t(
+                        chat_id, "digest_entry_flow_flat",
+                        fills=e.fill_count, gross=e.gross_volume_usd,
+                    )
 
-        parts = [f"• {outcome_html} — {title_html}", addr_line]
-        if flow_line:
-            parts.append(flow_line)
-        if holding_line:
-            parts.append(holding_line)
-        if tags:
-            parts.append("  ".join(tags))
-        lines.append("\n".join(parts))
+            holding_line = ""
+            if (
+                not e.closed
+                and e.latest_shares is not None
+                and e.latest_value_usd is not None
+                and e.latest_shares > 0
+            ):
+                holding_line = t(
+                    chat_id, "digest_entry_holding",
+                    shares=_fmt_num(e.latest_shares, digits=4),
+                    value=e.latest_value_usd,
+                )
 
-    body = "\n\n".join(lines)
-    if len(entries) > DIGEST_DISPLAY_CAP:
-        body += t(chat_id, "digest_entry_more", count=len(entries) - DIGEST_DISPLAY_CAP)
-    return header + body
+            tags: list[str] = []
+            if e.opened:
+                tags.append(t(chat_id, "digest_entry_opened"))
+            if e.closed:
+                tags.append(t(chat_id, "digest_entry_closed"))
+            if e.resolved:
+                winner = e.resolved_winner if e.resolved_winner is not None else "?"
+                tags.append(t(chat_id, "digest_entry_resolved", winner=winner))
+
+            entry_lines = [f"• {outcome_html} — {title_html}"]
+            if flow_line:
+                entry_lines.append(flow_line)
+            if holding_line:
+                entry_lines.append(holding_line)
+            if tags:
+                entry_lines.append("  ".join(tags))
+            block_parts.append("\n".join(entry_lines))
+            rendered += 1
+        sections.append("\n\n".join(block_parts))
+
+    body = "\n\n".join(sections)
+    if truncated:
+        body += t(chat_id, "digest_entry_more", count=truncated)
+    return body
 
 
 async def _flush_digest(chat_id: int, bot) -> bool:
