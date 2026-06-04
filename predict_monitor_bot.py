@@ -162,7 +162,7 @@ LIST_PAGE_SIZE = 8
 HELP_CATEGORIES: list[tuple[str, list[str]]] = [
     ("watch", ["watch", "unwatch", "list", "stop"]),
     ("query", ["pos", "orders"]),
-    ("other", ["settings", "defaults", "start"]),
+    ("other", ["settings", "defaults", "digest", "start"]),
 ]
 
 
@@ -521,6 +521,7 @@ I18N = {
             "/pos <code>addr|alias</code> - view positions\n"
             "/orders <code>addr|alias</code> - recent fills\n"
             "/settings - preferences\n"
+            "/digest <code>minutes</code> - periodic deduped activity digest\n"
             "/stop - stop all"
         ),
         # --- PnL, sorting, portfolio ---
@@ -808,6 +809,21 @@ I18N = {
             "wallet in this chat that hasn't been customized via the 💨 button on its "
             "watch card. Wallet-level overrides always win."
         ),
+        "help_cmd_digest": (
+            "<b>/digest</b> — Periodic activity digest\n\n"
+            "Collapses every fill, position change and market resolution from the last "
+            "window into a single deduped summary so you don't miss anything when the "
+            "live stream is too busy. Same wallet+market+outcome events fold into one "
+            "row showing the net share delta, fill count, gross USD flow, current "
+            "holding and any 🆕 / 🔴 / 🏁 lifecycle tag. Independent of the live "
+            "notifications — both can run side by side, or you can /mute wallets and "
+            "rely on the digest alone.\n\n"
+            "<b>Usage</b>\n"
+            "• <code>/digest 60</code> — every 60 minutes\n"
+            "• <code>/digest 5</code> — every 5 minutes (range 1–1440)\n"
+            "• <code>/digest off</code> — disable\n"
+            "• <code>/digest</code> — show cadence, pending entries, time to next flush"
+        ),
         "help_cmd_lang": (
             "<b>/lang</b> — Switch bot language\n\n"
             "<b>Usage</b>\n"
@@ -1022,6 +1038,7 @@ I18N = {
             "/pos <code>地址或备注</code> - 查看持仓\n"
             "/orders <code>地址或备注</code> - 查看最近成交\n"
             "/settings - 偏好设置\n"
+            "/digest <code>分钟</code> - 摘要汇总（按市场去重，防遗漏）\n"
             "/stop - 清空全部监控"
         ),
         "label_pnl": "浮动盈亏",
@@ -1294,6 +1311,18 @@ I18N = {
             "• <b>多久合并一次</b>（例：8 小时 = 攒 8 小时发一条汇总）\n\n"
             "设好后，本聊天所有没单独调过的钱包都跟这个默认。"
             "想给某个钱包单独调，去 /list 点它的 💨 按钮。"
+        ),
+        "help_cmd_digest": (
+            "<b>/digest</b> — 摘要汇总（防遗漏）\n\n"
+            "把一段时间内的成交、持仓变化、市场结算 <b>按市场去重</b> 合并成一条总结。"
+            "同一钱包在同一市场+同一结果上反复操作只占 <b>一行</b>，显示净持仓变动、"
+            "笔数、流水总额、当前持仓，以及 🆕 新开仓 / 🔴 已平仓 / 🏁 已结算 标签。\n\n"
+            "和实时通知 <b>并行</b>，不会替代。想清静的话可以 /mute 某些钱包只看摘要。\n\n"
+            "<b>用法</b>\n"
+            "• <code>/digest 60</code> — 每 60 分钟发一次\n"
+            "• <code>/digest 5</code> — 每 5 分钟（可填 1–1440）\n"
+            "• <code>/digest off</code> — 关闭\n"
+            "• <code>/digest</code> — 查看当前间隔、已缓冲条数、距下次还多久"
         ),
         "help_cmd_lang": (
             "<b>/lang</b> — 切换机器人语言\n\n"
@@ -7325,6 +7354,7 @@ async def on_startup(app: Application):
         BotCommand("orders", "最近成交 / Recent fills"),
         BotCommand("settings", "偏好设置 / Settings"),
         BotCommand("defaults", "小额默认 / Micro-fill defaults"),
+        BotCommand("digest", "摘要汇总 / Activity digest"),
         BotCommand("stop", "停止全部监控 / Stop all"),
     ]
     await app.bot.set_my_commands(default_commands)
