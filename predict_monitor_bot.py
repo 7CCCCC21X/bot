@@ -16,6 +16,7 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 
 import aiohttp
+from aiohttp import web
 from telegram import (
     Update,
     BotCommand,
@@ -37,6 +38,37 @@ from telegram.ext import (
 
 # ==================== Config ====================
 
+def _env_int(key: str, default: int, *, minimum: int | None = None,
+             maximum: int | None = None) -> int:
+    """Read an int env var, falling back to ``default`` on missing/invalid,
+    then clamping to ``[minimum, maximum]`` when provided.
+
+    Replaces the ~10 copies of the ``try: int(os.environ.get(... or N))
+    except ValueError`` boilerplate that used to litter the config block.
+    """
+    raw = os.environ.get(key)
+    try:
+        val = int(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        val = default
+    if minimum is not None:
+        val = max(minimum, val)
+    if maximum is not None:
+        val = min(maximum, val)
+    return val
+
+
+def _env_float(key: str, default: float, *, minimum: float | None = None) -> float:
+    raw = os.environ.get(key)
+    try:
+        val = float(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        val = default
+    if minimum is not None:
+        val = max(minimum, val)
+    return val
+
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 PREDICT_API_KEY = os.environ.get("PREDICT_API_KEY", "")
 PREDICT_API = "https://api.predict.fun"
@@ -47,17 +79,10 @@ ADMIN_CHAT_ID = int(_raw_admin) if _raw_admin.lstrip("-").isdigit() else None
 # the higher WHITELIST_WATCH_LIMIT cap to specific chats via the whitelist.
 # When a non-admin / non-whitelist chat hits the cap, /watch points them to
 # the invite code + upgrade contact below.
-try:
-    DEFAULT_WATCH_LIMIT = max(1, int(os.environ.get("DEFAULT_WATCH_LIMIT", "10") or 10))
-except ValueError:
-    DEFAULT_WATCH_LIMIT = 10
-try:
-    WHITELIST_WATCH_LIMIT = max(
-        DEFAULT_WATCH_LIMIT,
-        int(os.environ.get("WHITELIST_WATCH_LIMIT", "30") or 30),
-    )
-except ValueError:
-    WHITELIST_WATCH_LIMIT = 30
+DEFAULT_WATCH_LIMIT = _env_int("DEFAULT_WATCH_LIMIT", 10, minimum=1)
+WHITELIST_WATCH_LIMIT = _env_int(
+    "WHITELIST_WATCH_LIMIT", 30, minimum=DEFAULT_WATCH_LIMIT
+)
 INVITE_CODE = os.environ.get("INVITE_CODE", "B00EA").strip() or "B00EA"
 INVITE_LINK = (
     os.environ.get("INVITE_LINK", "").strip()
@@ -73,19 +98,13 @@ POLL_INTERVAL = 2
 # loop processed wallets serially with a 1-second gap between each, so a chat
 # watching N wallets saw a cycle of roughly N + POLL_INTERVAL seconds. Polling
 # in parallel keeps end-to-end latency near POLL_INTERVAL regardless of N.
-try:
-    POLL_CONCURRENCY = max(1, int(os.environ.get("POLL_CONCURRENCY", "8") or 8))
-except ValueError:
-    POLL_CONCURRENCY = 8
+POLL_CONCURRENCY = _env_int("POLL_CONCURRENCY", 8, minimum=1)
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
 # Fallback dust floor used when a wallet has no per-wallet `min_fill_usd` set.
 # Set MIN_FILL_USD=0 to disable by default (every fill shows, even $0.04 dust).
 # Sub-threshold fills are folded into a "💨 N 笔小额共 $X" summary line at the
 # end of the 订单成交 block rather than dropped.
-try:
-    MIN_FILL_USD = float(os.environ.get("MIN_FILL_USD", "1") or 1)
-except ValueError:
-    MIN_FILL_USD = 1.0
+MIN_FILL_USD = _env_float("MIN_FILL_USD", 1.0)
 # Address used by /speedtest to probe the matches API. Defaults to a known
 # active wallet so the call returns a realistic, non-empty payload; override
 # via env var if that wallet ever quietens down.
@@ -97,12 +116,7 @@ SPEEDTEST_ADDRESS = os.environ.get(
 # micro-fill summaries batch instead of firing on every poll. Set to 0 to
 # restore the legacy "flush every poll" behavior globally, or override per
 # wallet via /dustinterval.
-try:
-    DUST_INTERVAL = int(os.environ.get("DUST_INTERVAL", "28800") or 28800)
-except ValueError:
-    DUST_INTERVAL = 28800
-if DUST_INTERVAL < 0:
-    DUST_INTERVAL = 0
+DUST_INTERVAL = _env_int("DUST_INTERVAL", 28800, minimum=0)
 # Maximum age (seconds) of the most recent on-chain fill for a position to
 # still count as "freshly opened/changed". When a position appears in the
 # positions API but has no matching fill within this window, we treat it as
@@ -110,12 +124,7 @@ if DUST_INTERVAL < 0:
 # a re-appearing closed position) and suppress the 新开仓 / 持仓变化 card so
 # users don't get pinged about trades that happened yesterday. Set to 0 to
 # disable the freshness gate and restore the legacy behavior.
-try:
-    STALE_TRADE_S = int(os.environ.get("STALE_TRADE_S", "3600") or 3600)
-except ValueError:
-    STALE_TRADE_S = 3600
-if STALE_TRADE_S < 0:
-    STALE_TRADE_S = 0
+STALE_TRADE_S = _env_int("STALE_TRADE_S", 3600, minimum=0)
 # predict.fun's positions endpoint paginates Relay-style (first/after with a
 # top-level ``cursor``) and caps each page well below a large wallet's full
 # holdings. We page through with a generous ``first`` and follow the cursor so
@@ -123,16 +132,12 @@ if STALE_TRADE_S < 0:
 # holdings past the first page render as missing and get mis-flagged as
 # 已平仓 every cycle. POSITIONS_MAX_PAGES bounds the loop so a misbehaving
 # cursor can't spin forever.
-try:
-    POSITIONS_FETCH_LIMIT = int(os.environ.get("POSITIONS_FETCH_LIMIT", "100") or 100)
-except ValueError:
-    POSITIONS_FETCH_LIMIT = 100
+# Out-of-range values reset to the default (not clamped to 1) — a misconfigured
+# "0" should behave like "unset", not like a 1-row page / single page.
+POSITIONS_FETCH_LIMIT = _env_int("POSITIONS_FETCH_LIMIT", 100)
 if POSITIONS_FETCH_LIMIT < 1:
     POSITIONS_FETCH_LIMIT = 100
-try:
-    POSITIONS_MAX_PAGES = int(os.environ.get("POSITIONS_MAX_PAGES", "20") or 20)
-except ValueError:
-    POSITIONS_MAX_PAGES = 20
+POSITIONS_MAX_PAGES = _env_int("POSITIONS_MAX_PAGES", 20)
 if POSITIONS_MAX_PAGES < 1:
     POSITIONS_MAX_PAGES = 20
 # /pos display: rows per page and the minimum notional (USD) a position must
@@ -140,12 +145,7 @@ if POSITIONS_MAX_PAGES < 1:
 # and list so the summary only surfaces meaningful holdings. Set to 0 to show
 # every position regardless of size.
 POS_PAGE_SIZE = 20
-try:
-    POS_MIN_VALUE_USD = float(os.environ.get("POS_MIN_VALUE_USD", "1") or 1)
-except ValueError:
-    POS_MIN_VALUE_USD = 1.0
-if POS_MIN_VALUE_USD < 0:
-    POS_MIN_VALUE_USD = 0.0
+POS_MIN_VALUE_USD = _env_float("POS_MIN_VALUE_USD", 1.0, minimum=0.0)
 PREDICT_WEB_BASE = os.environ.get("PREDICT_WEB_BASE", "https://predict.fun/market/")
 GUIDE_IMAGE_PATH = os.environ.get("GUIDE_IMAGE_PATH", os.path.join(os.path.dirname(__file__), "images", "guide_deposit_address.png"))
 
@@ -153,6 +153,25 @@ GUIDE_IMAGE_PATH = os.environ.get("GUIDE_IMAGE_PATH", os.path.join(os.path.dirna
 # per error burst — the counter resets when a request succeeds.
 ERROR_ALERT_THRESHOLD = 5
 LIST_PAGE_SIZE = 8
+
+# Market-metadata cache freshness. Unresolved markets are re-fetched once this
+# many seconds have elapsed so a resolution transition is actually observed;
+# already-resolved markets are cached indefinitely (they never change again).
+# MARKET_CACHE_MAX caps the dict so a bot watching thousands of markets can't
+# grow the cache without bound.
+MARKET_CACHE_TTL_S = _env_int("MARKET_CACHE_TTL_S", 300, minimum=0)
+MARKET_CACHE_MAX = _env_int("MARKET_CACHE_MAX", 5000, minimum=100)
+
+# Transient-failure retry policy for the matches endpoint. One extra attempt
+# on a 5xx / timeout smooths over blips without turning a real outage into a
+# retry storm.
+API_MAX_RETRIES = _env_int("API_MAX_RETRIES", 1, minimum=0)
+API_RETRY_BACKOFF_S = _env_float("API_RETRY_BACKOFF_S", 0.5, minimum=0.0)
+
+# Lightweight HTTP health endpoint (liveness probe for the deploy platform).
+# Set HEALTH_PORT=0 to disable. Falls back to Railway's $PORT, then 8080.
+_health_default = _env_int("PORT", 8080, minimum=0)
+HEALTH_PORT = _env_int("HEALTH_PORT", _health_default, minimum=0)
 
 # Categories for the /help browser. Keys are i18n-less identifiers; labels and
 # command help strings live in I18N under `help_cat_<id>` and `help_cmd_<name>`.
@@ -295,7 +314,15 @@ class DigestState:
 
 
 watched: dict[int, dict[str, WatchedWallet]] = {}
+# Market metadata cache. Entries used to live forever, which (a) grew the dict
+# without bound on a long-running process and (b) meant a market first seen
+# while still trading was *never* refreshed — so its `resolved`/`status`
+# transition was invisible and the 市场已结算 alert never fired. We now stamp
+# each entry's fetch time (``_market_cache_ts``) and treat already-resolved
+# markets as permanently cacheable while re-fetching unresolved ones once the
+# TTL lapses. ``MARKET_CACHE_MAX`` bounds the dict.
 market_cache: dict[str, dict] = {}
+_market_cache_ts: dict[str, float] = {}
 chat_lang: dict[int, str] = {}
 # Per-chat notification mode: "split" (default — one message per block) or
 # "merged" (legacy T13 — position changes + fills + resolution joined by
@@ -1374,11 +1401,35 @@ I18N = {
 # ==================== API ====================
 
 
+_db_singleton: sqlite3.Connection | None = None
+
+
 def db_conn():
-    db_path = Path(SQLITE_PATH)
-    if db_path.parent and str(db_path.parent) not in ("", "."):
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(SQLITE_PATH)
+    """Return a process-wide SQLite connection.
+
+    The old implementation opened a fresh ``sqlite3.connect`` on every call.
+    Because ``with sqlite3.connect(...) as conn`` only commits/rolls back the
+    transaction (it never *closes* the connection), every ``with db_lock,
+    db_conn() as conn:`` block leaked a connection — an unbounded file-handle
+    / memory leak over a long-running process. We now reuse a single
+    connection guarded by ``db_lock`` (all callers already hold it), and
+    enable WAL so the polling loop and command handlers can read/write
+    without tripping "database is locked".
+    """
+    global _db_singleton
+    if _db_singleton is None:
+        db_path = Path(SQLITE_PATH)
+        if db_path.parent and str(db_path.parent) not in ("", "."):
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+        except sqlite3.OperationalError as e:
+            logger.warning("Could not apply SQLite PRAGMAs: %s", e)
+        _db_singleton = conn
+    return _db_singleton
 
 
 def init_db():
@@ -1925,8 +1976,40 @@ async def fetch_positions(
         return collected if collected else None
 
 
+def _market_cache_fresh(market_id: str) -> bool:
+    """Whether a cached market entry can be served without re-fetching.
+
+    Resolved markets are immutable, so they stay fresh forever. Everything
+    else expires after ``MARKET_CACHE_TTL_S`` so a market that resolves after
+    we first cached it eventually gets re-read and the resolution alert fires.
+    """
+    cached = market_cache.get(market_id)
+    if cached is None:
+        return False
+    resolved, _ = market_resolution(cached)
+    if resolved:
+        return True
+    if MARKET_CACHE_TTL_S <= 0:
+        return False
+    return (time.time() - _market_cache_ts.get(market_id, 0)) < MARKET_CACHE_TTL_S
+
+
+def _store_market(market_id: str, data: dict) -> None:
+    market_cache[market_id] = data
+    _market_cache_ts[market_id] = time.time()
+    # Bound the cache. When over capacity, drop the oldest entries by fetch
+    # time. Resolved markets are cheap to re-fetch if evicted, so we don't
+    # special-case them here.
+    if len(market_cache) > MARKET_CACHE_MAX:
+        for stale_id in sorted(_market_cache_ts, key=_market_cache_ts.get)[
+            : len(market_cache) - MARKET_CACHE_MAX
+        ]:
+            market_cache.pop(stale_id, None)
+            _market_cache_ts.pop(stale_id, None)
+
+
 async def fetch_market(session: aiohttp.ClientSession, market_id: str) -> dict:
-    if market_id in market_cache:
+    if _market_cache_fresh(market_id):
         return market_cache[market_id]
 
     url = f"{PREDICT_API}/v1/markets/{market_id}"
@@ -1939,12 +2022,14 @@ async def fetch_market(session: aiohttp.ClientSession, market_id: str) -> dict:
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("success"):
-                    market_cache[market_id] = data.get("data", {})
+                    _store_market(market_id, data.get("data", {}))
                     return market_cache[market_id]
     except Exception:
         pass
 
-    return {}
+    # On a failed refresh, fall back to a stale cached copy rather than {} so
+    # downstream formatting keeps its title/slug.
+    return market_cache.get(market_id, {})
 
 
 async def fetch_order_matches(
@@ -1957,35 +2042,51 @@ async def fetch_order_matches(
         "signerAddress": address,
         "first": str(first),
     }
-    try:
-        async with session.get(
-            url,
-            params=params,
-            headers=_headers(),
-            timeout=aiohttp.ClientTimeout(total=12),
-        ) as resp:
-            if resp.status == 200:
-                _record_api("matches", "ok")
-                data = await resp.json()
-                return data.get("data", []) if data.get("success") else []
+    # Transient 5xx / timeouts get one quick retry before we give up and let
+    # the caller count it as a failure. 429s and 4xx are returned immediately
+    # (retrying a rate-limit would only dig the hole deeper).
+    last_label = "timeout"
+    for attempt in range(API_MAX_RETRIES + 1):
+        try:
+            async with session.get(
+                url,
+                params=params,
+                headers=_headers(),
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status == 200:
+                    _record_api("matches", "ok")
+                    data = await resp.json()
+                    return data.get("data", []) if data.get("success") else []
 
-            if resp.status == 429:
-                _record_api("matches", "429")
-                logger.warning(f"Orders matches API 429 (rate limited) for {address}")
-                return RateLimited(_parse_retry_after(resp.headers.get("Retry-After")))
+                if resp.status == 429:
+                    _record_api("matches", "429")
+                    logger.warning(f"Orders matches API 429 (rate limited) for {address}")
+                    return RateLimited(_parse_retry_after(resp.headers.get("Retry-After")))
 
-            label = "5xx" if resp.status >= 500 else "other"
-            _record_api("matches", label)
-            logger.warning(f"Orders matches API {resp.status} for {address}")
-            return None
-    except asyncio.TimeoutError:
-        _record_api("matches", "timeout")
-        logger.error(f"fetch_order_matches timeout for {address}")
-        return None
-    except Exception as e:
-        _record_api("matches", "timeout")
-        logger.error(f"fetch_order_matches error: {e}")
-        return None
+                if resp.status >= 500:
+                    last_label = "5xx"
+                    logger.warning(f"Orders matches API {resp.status} for {address}")
+                    if attempt < API_MAX_RETRIES:
+                        await asyncio.sleep(API_RETRY_BACKOFF_S)
+                        continue
+                    _record_api("matches", "5xx")
+                    return None
+
+                # 4xx (other than 429) — not retryable.
+                _record_api("matches", "other")
+                logger.warning(f"Orders matches API {resp.status} for {address}")
+                return None
+        except asyncio.TimeoutError:
+            last_label = "timeout"
+            logger.error(f"fetch_order_matches timeout for {address}")
+        except Exception as e:
+            last_label = "timeout"
+            logger.error(f"fetch_order_matches error: {e}")
+        if attempt < API_MAX_RETRIES:
+            await asyncio.sleep(API_RETRY_BACKOFF_S)
+    _record_api("matches", last_label)
+    return None
 
 
 async def _speedtest_probe(
@@ -3292,8 +3393,11 @@ async def _fetch_positions_with_markets(session, addr):
     positions = await fetch_positions(session, addr)
     if positions is None or isinstance(positions, RateLimited):
         return None, {}
-    market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
-    markets = {mid: await fetch_market(session, mid) for mid in market_ids}
+    market_ids = list({p.get("marketId") for p in positions if p.get("marketId")})
+    market_results = await asyncio.gather(
+        *(fetch_market(session, mid) for mid in market_ids)
+    )
+    markets = dict(zip(market_ids, market_results))
     for p in positions:
         p["_market"] = markets.get(p.get("marketId"), {})
     return positions, {pos_key(p): p for p in positions}
@@ -6929,7 +7033,12 @@ async def poll_loop(app: Application):
     logger.info("Poll loop started")
     sem = asyncio.Semaphore(POLL_CONCURRENCY)
 
-    async with aiohttp.ClientSession() as session:
+    # Bound the connection pool so a burst of concurrent wallet polls can't
+    # open an unbounded number of sockets to predict.fun. We keep the cap a
+    # little above POLL_CONCURRENCY because each wallet fans out to two
+    # endpoints (positions + matches) plus market lookups.
+    connector = aiohttp.TCPConnector(limit=max(POLL_CONCURRENCY * 2, 20))
+    async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             cycle_started = time.monotonic()
 
@@ -7107,7 +7216,14 @@ async def poll_loop(app: Application):
                             mid = _match_market_view(m).get("id")
                             if mid:
                                 market_ids.add(mid)
-                        markets = {mid: await fetch_market(session, mid) for mid in market_ids}
+                        # Fetch the market details concurrently instead of
+                        # awaiting one per ``market_id`` — cache hits resolve
+                        # instantly and cache misses overlap their RTTs.
+                        market_id_list = list(market_ids)
+                        market_results = await asyncio.gather(
+                            *(fetch_market(session, mid) for mid in market_id_list)
+                        )
+                        markets = dict(zip(market_id_list, market_results))
                         for p in positions:
                             p["_market"] = markets.get(p.get("marketId"), {})
                         for m in matches:
@@ -7190,6 +7306,16 @@ async def poll_loop(app: Application):
                             for p in positions
                         }
                         old_titles = dict(w.position_titles)
+                        # Snapshot the persisted fields *before* this poll
+                        # mutates them so we can skip the DB write entirely
+                        # when nothing meaningful changed. The old loop wrote
+                        # the full row (JSON-serialising both snapshots) on
+                        # every wallet every 2s even on a no-op poll.
+                        _prev_snapshot = dict(w.position_snapshot)
+                        _prev_titles = dict(w.position_titles)
+                        _prev_resolved = dict(w.resolved_markets)
+                        _prev_matches = set(w.order_match_snapshot)
+                        _prev_activity = w.last_activity
                         # Preserve titles for keys that have disappeared this
                         # poll so we can still render their resolution notice.
                         merged_titles = {**old_titles, **new_titles}
@@ -7450,7 +7576,21 @@ async def poll_loop(app: Application):
                         # arrived while we were talking to predict.fun
                         # must not be overwritten by this snapshot.
                         if addr in watched.get(chat_id, {}):
-                            save_watch(w)
+                            # Only persist when a tracked field actually moved.
+                            # ``last_check`` alone changing every cycle is not
+                            # worth a full-row JSON rewrite; the per-wallet
+                            # interval gate tolerates a slightly stale value
+                            # after a restart. Run the write off-thread so the
+                            # synchronous sqlite call never blocks the loop.
+                            dirty = (
+                                w.position_snapshot != _prev_snapshot
+                                or w.position_titles != _prev_titles
+                                or w.resolved_markets != _prev_resolved
+                                or w.order_match_snapshot != _prev_matches
+                                or w.last_activity != _prev_activity
+                            )
+                            if dirty:
+                                await asyncio.to_thread(save_watch, w)
                     except Exception as e:
                         logger.error(f"Poll error {addr}: {e}")
 
@@ -7466,6 +7606,54 @@ async def poll_loop(app: Application):
             await asyncio.sleep(max(0.0, POLL_INTERVAL - elapsed))
 
 # ==================== Main ====================
+
+_process_started_at = time.time()
+
+
+async def start_health_server():
+    """Start a tiny HTTP server exposing ``/health`` for liveness probes.
+
+    Returns the ``AppRunner`` so it can be cleaned up on shutdown, or ``None``
+    when disabled (HEALTH_PORT=0) or when binding fails (e.g. port in use).
+    """
+    if HEALTH_PORT <= 0:
+        logger.info("Health server disabled (HEALTH_PORT=0)")
+        return None
+
+    async def _health(_request):
+        try:
+            chats, watches_count = await asyncio.to_thread(db_counts)
+        except Exception:
+            chats, watches_count = -1, -1
+        return web.json_response(
+            {
+                "status": "ok",
+                "uptime_s": int(time.time() - _process_started_at),
+                "chats": chats,
+                "watches": watches_count,
+                "watched_chats_in_memory": len(watched),
+                "market_cache": len(market_cache),
+            }
+        )
+
+    health_app = web.Application()
+    health_app.router.add_get("/health", _health)
+    health_app.router.add_get("/", _health)
+    runner = web.AppRunner(health_app)
+    try:
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
+        await site.start()
+        logger.info("Health server listening on :%s/health", HEALTH_PORT)
+        return runner
+    except Exception as e:
+        logger.warning("Could not start health server on :%s: %s", HEALTH_PORT, e)
+        try:
+            await runner.cleanup()
+        except Exception:
+            pass
+        return None
+
 
 async def on_startup(app: Application):
     init_db()
@@ -7495,20 +7683,29 @@ async def on_startup(app: Application):
     # Trimmed to a daily-use core. Commands not in this list still work if
     # typed directly (mute/note/portfolio/lang/etc. are also exposed as inline
     # buttons in /list, /pos and /settings).
-    default_commands = [
-        BotCommand("start", "开始 / Start"),
-        BotCommand("help", "功能介绍 / Help"),
-        BotCommand("watch", "监控地址 / Watch wallet(s)"),
-        BotCommand("unwatch", "取消监控 / Unwatch wallet"),
-        BotCommand("list", "监控列表 / Watch list"),
-        BotCommand("pos", "查询持仓 / View positions"),
-        BotCommand("orders", "最近成交 / Recent fills"),
-        BotCommand("settings", "偏好设置 / Settings"),
-        BotCommand("defaults", "小额默认 / Micro-fill defaults"),
-        BotCommand("digest", "摘要汇总 / Activity digest"),
-        BotCommand("stop", "停止全部监控 / Stop all"),
+    # Per-language command menus. Telegram serves the menu matching the
+    # client's language_code, falling back to the unscoped default. Splitting
+    # EN/ZH avoids the cramped "开始 / Start" bilingual labels.
+    cmd_specs = [
+        ("start", "Start", "开始"),
+        ("help", "Help", "功能介绍"),
+        ("watch", "Watch wallet(s)", "监控地址"),
+        ("unwatch", "Unwatch wallet", "取消监控"),
+        ("list", "Watch list", "监控列表"),
+        ("pos", "View positions", "查询持仓"),
+        ("orders", "Recent fills", "最近成交"),
+        ("settings", "Settings", "偏好设置"),
+        ("defaults", "Micro-fill defaults", "小额默认"),
+        ("digest", "Activity digest", "摘要汇总"),
+        ("stop", "Stop all", "停止全部监控"),
     ]
+    default_commands = [BotCommand(c, en) for c, en, _zh in cmd_specs]
+    zh_commands = [BotCommand(c, zh) for c, _en, zh in cmd_specs]
     await app.bot.set_my_commands(default_commands)
+    try:
+        await app.bot.set_my_commands(zh_commands, language_code="zh")
+    except Exception as e:
+        logger.warning("Could not set zh command menu: %s", e)
     # Admin-only command menu: Telegram lets us register a separate command
     # list scoped to a single chat (BotCommandScopeChat). The chat-scoped list
     # fully overrides the default for that chat, so we re-include the regular
@@ -7533,8 +7730,43 @@ async def on_startup(app: Application):
             logger.warning(
                 "Skipping admin scope commands for %s: %s", ADMIN_CHAT_ID, e
             )
-    asyncio.create_task(poll_loop(app))
-    asyncio.create_task(digest_loop(app))
+    # Keep handles so post_shutdown can cancel them cleanly, and start the
+    # lightweight health server (liveness probe for the deploy platform).
+    app.bot_data["_poll_task"] = asyncio.create_task(poll_loop(app))
+    app.bot_data["_digest_task"] = asyncio.create_task(digest_loop(app))
+    app.bot_data["_health_runner"] = await start_health_server()
+
+
+async def on_shutdown(app: Application):
+    """Cancel the background loops and close the DB / health server cleanly.
+
+    Without this the loops were just abandoned on exit; in-flight tasks were
+    cancelled abruptly by the interpreter teardown and the SQLite connection
+    was never closed (so a WAL checkpoint could be skipped).
+    """
+    for key in ("_poll_task", "_digest_task"):
+        task = app.bot_data.get(key)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    runner = app.bot_data.get("_health_runner")
+    if runner is not None:
+        try:
+            await runner.cleanup()
+        except Exception as e:
+            logger.warning("Health server cleanup failed: %s", e)
+    global _db_singleton
+    if _db_singleton is not None:
+        try:
+            _db_singleton.commit()
+            _db_singleton.close()
+        except Exception as e:
+            logger.warning("DB close failed: %s", e)
+        _db_singleton = None
+    logger.info("Shutdown complete")
 
 
 def main():
@@ -7584,6 +7816,7 @@ def main():
     )
 
     app.post_init = on_startup
+    app.post_shutdown = on_shutdown
 
     logger.info("Bot starting...")
     app.run_polling()
