@@ -5630,6 +5630,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         target = watched.get(chat_id, {}).get(addr)
         if not target:
             _pop_pending_minfill(ctx)
+            await update.message.reply_text(t(chat_id, "note_not_found"))
             return
         raw = (update.message.text or "").strip().lstrip("$").replace(",", "")
         try:
@@ -5690,6 +5691,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         target = watched.get(chat_id, {}).get(addr)
         if not target:
             _pop_pending_dustinterval(ctx)
+            await update.message.reply_text(t(chat_id, "note_not_found"))
             return
         sec = _parse_dust_interval_raw(update.message.text or "")
         if sec is None:
@@ -5785,6 +5787,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addr = pending.get("address") or ""
     target = watched.get(chat_id, {}).get(addr)
     if not target:
+        await update.message.reply_text(t(chat_id, "note_not_found"))
         return
     target.note = update.message.text.strip()
     save_watch(target)
@@ -5832,8 +5835,20 @@ async def _show_positions_via_callback(
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
+    # Acknowledge the tap so the client stops the loading spinner. A callback
+    # that's already expired ("query is too old") or a transient network blip
+    # makes answer() raise; swallow it so the real work below still runs
+    # instead of the button looking completely dead.
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    # effective_chat stays valid even when query.message is inaccessible/None
+    # (deleted or very old message), where query.message.chat_id would raise.
+    chat = update.effective_chat
+    if chat is None:
+        return
+    chat_id = chat.id
     data = query.data or ""
 
     if data == "noop":
@@ -6016,6 +6031,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
             except BadRequest:
                 pass
+        else:
+            await ctx.bot.send_message(
+                chat_id=chat_id, text=t(chat_id, "note_not_found")
+            )
         return
 
     if data.startswith("list_page:"):
@@ -6182,6 +6201,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("editnote:"):
         addr = data.split(":", 1)[1].strip()
         if addr not in watched.get(chat_id, {}):
+            # Stale row (wallet was unwatched elsewhere) — tell the user
+            # instead of leaving the tap with no response at all.
+            await ctx.bot.send_message(
+                chat_id=chat_id, text=t(chat_id, "note_not_found")
+            )
             return
         _set_pending_note_edit(ctx, chat_id, addr)
         await ctx.bot.send_message(
