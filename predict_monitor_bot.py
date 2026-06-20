@@ -1374,6 +1374,37 @@ I18N = {
 # ==================== API ====================
 
 
+# A single process-wide aiohttp session shared by all command handlers, so
+# every /pos, /watch, /import, etc. reuses one connection pool + keep-alive
+# sockets instead of paying a fresh TLS handshake per invocation. The poll
+# loop keeps its own long-lived session (it's hot and self-contained).
+_http_session: "aiohttp.ClientSession | None" = None
+
+
+async def get_http_session() -> aiohttp.ClientSession:
+    """Lazily create (and reuse) the shared command-side aiohttp session.
+
+    Created inside the running event loop on first use; recreated if a prior
+    instance was closed.
+    """
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
+
+
+class _shared_session:
+    """Drop-in for ``aiohttp.ClientSession()`` at call sites that do
+    ``async with ... as session:`` — yields the shared session and, crucially,
+    does NOT close it on exit so it stays alive for the next handler."""
+
+    async def __aenter__(self) -> aiohttp.ClientSession:
+        return await get_http_session()
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
 def db_conn():
     db_path = Path(SQLITE_PATH)
     if db_path.parent and str(db_path.parent) not in ("", "."):
@@ -3320,7 +3351,7 @@ async def _render_positions(
     portfolio: bool = False,
     page: int = 0,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    async with aiohttp.ClientSession() as session:
+    async with _shared_session() as session:
         positions, _ = await _fetch_positions_with_markets(session, addr)
     total_pages = 1
     if positions is None:
@@ -3385,7 +3416,7 @@ async def _render_positions(
 async def _render_orders(
     chat_id: int, addr: str, page: int = 0
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    async with aiohttp.ClientSession() as session:
+    async with _shared_session() as session:
         matches = await fetch_order_matches(session, addr, first=ORDERS_FETCH_LIMIT)
         if isinstance(matches, RateLimited):
             matches = None
@@ -3607,16 +3638,23 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         and watched[chat_id][first_addr].note != first_note
     ):
         existing = watched[chat_id][first_addr]
+        # Stash the proposed note in user_data instead of the callback payload:
+        # Telegram caps callback_data at 64 bytes and "watchover:" + a 42-char
+        # address already eats 53, so even a short note (≈4 Chinese chars at
+        # 3 bytes each) overflows and Telegram rejects the whole message with
+        # BadRequest, leaving the user with no reply. Keyed by address so
+        # concurrent prompts don't clobber each other.
+        ctx.user_data.setdefault("pending_watchover", {})[first_addr] = first_note
         keyboard = InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
                         t(chat_id, "btn_overwrite_note"),
-                        callback_data=f"watchover:{first_addr}:{first_note[:50]}",
+                        callback_data=f"watchover:ok:{first_addr}",
                     ),
                     InlineKeyboardButton(
                         t(chat_id, "btn_cancel"),
-                        callback_data=f"watchover:{first_addr}:__CANCEL__",
+                        callback_data=f"watchover:cancel:{first_addr}",
                     ),
                 ]
             ]
@@ -3663,12 +3701,12 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     last_addr = ""
     last_count = 0
 
-    async with aiohttp.ClientSession() as session:
+    async with _shared_session() as session:
         for addr, note in pairs:
             if not _is_addr(addr):
                 skipped += 1
                 continue
-            if addr.lower() in {a.lower() for a in watched[chat_id]}:
+            if addr.lower() in existing_lower:
                 skipped += 1
                 continue
             # Per-add cap check (handles batches that straddle the limit).
@@ -3707,6 +3745,9 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 last_check=time.time(),
             )
             save_watch(watched[chat_id][addr])
+            # Keep the running set in sync so a batch that lists the same
+            # address twice skips the duplicate without an O(n) rescan.
+            existing_lower.add(addr.lower())
             added += 1
             last_addr = addr
             last_count = len(positions)
@@ -4327,7 +4368,7 @@ async def cmd_raw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         count = 10
     count = max(1, min(count, 50))
 
-    async with aiohttp.ClientSession() as session:
+    async with _shared_session() as session:
         matches_url = f"{PREDICT_API}/v1/orders/matches"
         matches_params = {"signerAddress": addr, "first": str(count)}
         positions_url = f"{PREDICT_API}/v1/positions/{addr}"
@@ -4494,7 +4535,7 @@ async def cmd_speedtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Per-level rows: [(interval_ms, ok, n429, n_err, latencies, aborted_early)]
     rows: list[tuple[int, int, int, int, list[float], bool]] = []
 
-    async with aiohttp.ClientSession() as session:
+    async with _shared_session() as session:
         for interval_ms in _SPEEDTEST_LEVELS:
             ok = 0
             n429 = 0
@@ -5475,7 +5516,8 @@ async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     quota_dropped = 0
     watched.setdefault(chat_id, {})
     limit = watch_limit_for(chat_id)
-    async with aiohttp.ClientSession() as session:
+    existing_lower = {a.lower() for a in watched[chat_id]}
+    async with _shared_session() as session:
         for rec in records:
             if not isinstance(rec, dict):
                 skipped += 1
@@ -5484,7 +5526,7 @@ async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not (addr.startswith("0x") and len(addr) == 42):
                 skipped += 1
                 continue
-            if addr.lower() in {a.lower() for a in watched[chat_id]}:
+            if addr.lower() in existing_lower:
                 skipped += 1
                 continue
             if (
@@ -5519,6 +5561,7 @@ async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 last_check=time.time(),
             )
             save_watch(watched[chat_id][addr])
+            existing_lower.add(addr.lower())
             added += 1
 
     await msg.reply_text(
@@ -5623,6 +5666,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         target = watched.get(chat_id, {}).get(addr)
         if not target:
             _pop_pending_minfill(ctx)
+            await update.message.reply_text(t(chat_id, "note_not_found"))
             return
         raw = (update.message.text or "").strip().lstrip("$").replace(",", "")
         try:
@@ -5683,6 +5727,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         target = watched.get(chat_id, {}).get(addr)
         if not target:
             _pop_pending_dustinterval(ctx)
+            await update.message.reply_text(t(chat_id, "note_not_found"))
             return
         sec = _parse_dust_interval_raw(update.message.text or "")
         if sec is None:
@@ -5778,6 +5823,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addr = pending.get("address") or ""
     target = watched.get(chat_id, {}).get(addr)
     if not target:
+        await update.message.reply_text(t(chat_id, "note_not_found"))
         return
     target.note = update.message.text.strip()
     save_watch(target)
@@ -5785,6 +5831,30 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         t(chat_id, "edit_note_saved", addr=fmt_addr(addr), note=_html_escape(target.note)),
         parse_mode="HTML",
     )
+
+
+async def on_paste_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Start monitoring from a plain pasted address — no /watch, no reply.
+
+    Casual users routinely just paste a wallet address into the chat. We only
+    engage when the message *leads* with a 0x address so ordinary chat that
+    merely mentions one isn't hijacked. Notes, multi-line input and batch
+    pastes go through the exact same /watch pipeline (dedupe, limit, snapshot).
+    """
+    if not update.message or not update.message.text:
+        return
+    stripped = update.message.text.lstrip()
+    if not _ADDR_RE.match(stripped):
+        return
+    pairs = _parse_watch_pairs(update.message.text)
+    if not pairs:
+        return
+    # Drop any dangling watch prompt so it can't re-capture the next message.
+    ctx.user_data.pop("pending_watch", None)
+    # cmd_watch re-parses the message body; ctx.args just needs to be truthy
+    # so it takes the watch path instead of showing the onboarding guide.
+    ctx.args = [a for a, _ in pairs]
+    await cmd_watch(update, ctx)
 
 
 # ==================== Callback handling ====================
@@ -5825,8 +5895,20 @@ async def _show_positions_via_callback(
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
+    # Acknowledge the tap so the client stops the loading spinner. A callback
+    # that's already expired ("query is too old") or a transient network blip
+    # makes answer() raise; swallow it so the real work below still runs
+    # instead of the button looking completely dead.
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    # effective_chat stays valid even when query.message is inaccessible/None
+    # (deleted or very old message), where query.message.chat_id would raise.
+    chat = update.effective_chat
+    if chat is None:
+        return
+    chat_id = chat.id
     data = query.data or ""
 
     if data == "noop":
@@ -6009,6 +6091,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
             except BadRequest:
                 pass
+        else:
+            await ctx.bot.send_message(
+                chat_id=chat_id, text=t(chat_id, "note_not_found")
+            )
         return
 
     if data.startswith("list_page:"):
@@ -6175,6 +6261,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("editnote:"):
         addr = data.split(":", 1)[1].strip()
         if addr not in watched.get(chat_id, {}):
+            # Stale row (wallet was unwatched elsewhere) — tell the user
+            # instead of leaving the tap with no response at all.
+            await ctx.bot.send_message(
+                chat_id=chat_id, text=t(chat_id, "note_not_found")
+            )
             return
         _set_pending_note_edit(ctx, chat_id, addr)
         await ctx.bot.send_message(
@@ -6185,13 +6276,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # watchover:<addr>:<base64-note> — confirm overwriting an existing note.
+    # watchover:<ok|cancel>:<addr> — confirm overwriting an existing note. The
+    # proposed note lives in user_data["pending_watchover"] (keeping it out of
+    # the callback payload, which is limited to 64 bytes).
     if data.startswith("watchover:"):
         parts = data.split(":", 2)
-        addr = parts[1].strip() if len(parts) > 1 else ""
-        new_note = parts[2] if len(parts) > 2 else ""
+        action = parts[1] if len(parts) > 1 else ""
+        addr = parts[2].strip() if len(parts) > 2 else ""
+        pending = ctx.user_data.get("pending_watchover", {})
+        new_note = pending.pop(addr, None)
         target = watched.get(chat_id, {}).get(addr)
-        if target and new_note != "__CANCEL__":
+        if target and action == "ok" and new_note is not None:
             target.note = new_note
             save_watch(target)
             try:
@@ -7467,6 +7562,25 @@ async def poll_loop(app: Application):
 
 # ==================== Main ====================
 
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    """Last-resort handler for exceptions raised inside other handlers.
+
+    Without this, python-telegram-bot swallows handler exceptions after
+    logging them at DEBUG, so a failed button or command just looks like
+    "the bot didn't respond". Logging at ERROR with the offending update
+    makes those silent failures visible.
+    """
+    logger.error("Unhandled exception while processing update: %s", update, exc_info=ctx.error)
+
+
+async def on_shutdown(app: Application):
+    """Close the shared command-side aiohttp session on a clean shutdown."""
+    global _http_session
+    if _http_session is not None and not _http_session.closed:
+        await _http_session.close()
+        _http_session = None
+
+
 async def on_startup(app: Application):
     init_db()
     load_state()
@@ -7578,12 +7692,21 @@ def main():
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(on_error)
     # Reply-based note edit capture (must not match /-commands).
     app.add_handler(
         MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, on_message)
     )
+    # Plain (non-reply) text that leads with a 0x address → start monitoring,
+    # so users can just paste an address without typing /watch.
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~filters.REPLY, on_paste_watch
+        )
+    )
 
     app.post_init = on_startup
+    app.post_shutdown = on_shutdown
 
     logger.info("Bot starting...")
     app.run_polling()
