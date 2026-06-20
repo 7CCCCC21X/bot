@@ -3607,16 +3607,23 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         and watched[chat_id][first_addr].note != first_note
     ):
         existing = watched[chat_id][first_addr]
+        # Stash the proposed note in user_data instead of the callback payload:
+        # Telegram caps callback_data at 64 bytes and "watchover:" + a 42-char
+        # address already eats 53, so even a short note (≈4 Chinese chars at
+        # 3 bytes each) overflows and Telegram rejects the whole message with
+        # BadRequest, leaving the user with no reply. Keyed by address so
+        # concurrent prompts don't clobber each other.
+        ctx.user_data.setdefault("pending_watchover", {})[first_addr] = first_note
         keyboard = InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
                         t(chat_id, "btn_overwrite_note"),
-                        callback_data=f"watchover:{first_addr}:{first_note[:50]}",
+                        callback_data=f"watchover:ok:{first_addr}",
                     ),
                     InlineKeyboardButton(
                         t(chat_id, "btn_cancel"),
-                        callback_data=f"watchover:{first_addr}:__CANCEL__",
+                        callback_data=f"watchover:cancel:{first_addr}",
                     ),
                 ]
             ]
@@ -6185,13 +6192,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # watchover:<addr>:<base64-note> — confirm overwriting an existing note.
+    # watchover:<ok|cancel>:<addr> — confirm overwriting an existing note. The
+    # proposed note lives in user_data["pending_watchover"] (keeping it out of
+    # the callback payload, which is limited to 64 bytes).
     if data.startswith("watchover:"):
         parts = data.split(":", 2)
-        addr = parts[1].strip() if len(parts) > 1 else ""
-        new_note = parts[2] if len(parts) > 2 else ""
+        action = parts[1] if len(parts) > 1 else ""
+        addr = parts[2].strip() if len(parts) > 2 else ""
+        pending = ctx.user_data.get("pending_watchover", {})
+        new_note = pending.pop(addr, None)
         target = watched.get(chat_id, {}).get(addr)
-        if target and new_note != "__CANCEL__":
+        if target and action == "ok" and new_note is not None:
             target.note = new_note
             save_watch(target)
             try:
@@ -7467,6 +7478,17 @@ async def poll_loop(app: Application):
 
 # ==================== Main ====================
 
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    """Last-resort handler for exceptions raised inside other handlers.
+
+    Without this, python-telegram-bot swallows handler exceptions after
+    logging them at DEBUG, so a failed button or command just looks like
+    "the bot didn't respond". Logging at ERROR with the offending update
+    makes those silent failures visible.
+    """
+    logger.error("Unhandled exception while processing update: %s", update, exc_info=ctx.error)
+
+
 async def on_startup(app: Application):
     init_db()
     load_state()
@@ -7578,6 +7600,7 @@ def main():
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(on_error)
     # Reply-based note edit capture (must not match /-commands).
     app.add_handler(
         MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, on_message)
