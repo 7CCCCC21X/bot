@@ -149,6 +149,63 @@ if POS_MIN_VALUE_USD < 0:
 PREDICT_WEB_BASE = os.environ.get("PREDICT_WEB_BASE", "https://predict.fun/market/")
 GUIDE_IMAGE_PATH = os.environ.get("GUIDE_IMAGE_PATH", os.path.join(os.path.dirname(__file__), "images", "guide_deposit_address.png"))
 
+# --- On-chain deposit / withdrawal alerts ---------------------------------
+# A separate transfer_loop scans BNB Chain for ERC-20 transfers that touch
+# watched wallets and pushes 充值 / 提现 cards. Trading settlements are
+# excluded by checking each tx receipt for ERC-1155 events (conditional
+# token moves always accompany fills / splits / merges / redeems), so only
+# genuine external transfers alert. Set TRANSFER_ALERTS_ENABLED=0 to turn
+# the whole subsystem off for a deployment.
+TRANSFER_ALERTS_ENABLED = os.environ.get(
+    "TRANSFER_ALERTS_ENABLED", "1"
+).strip().lower() not in ("0", "false", "off")
+BSC_RPC_URLS = [
+    u.strip()
+    for u in os.environ.get(
+        "BSC_RPC_URLS",
+        "https://bsc-dataseed.binance.org,"
+        "https://bsc-rpc.publicnode.com,"
+        "https://bsc-dataseed1.defibit.io",
+    ).split(",")
+    if u.strip()
+]
+try:
+    TRANSFER_POLL_INTERVAL = max(
+        5, int(os.environ.get("TRANSFER_POLL_INTERVAL", "20") or 20)
+    )
+except ValueError:
+    TRANSFER_POLL_INTERVAL = 20
+# Tokens scanned for deposits/withdrawals, comma-separated addr:symbol:decimals.
+# Defaults to BSC-USD (USDT), the settlement currency on predict.fun.
+_DEFAULT_TRANSFER_TOKENS = "0x55d398326f99059fF775485246999027B3197955:USDT:18"
+TRANSFER_TOKENS: dict[str, tuple[str, int]] = {}
+for _spec in os.environ.get("TRANSFER_TOKENS", _DEFAULT_TRANSFER_TOKENS).split(","):
+    _parts = _spec.strip().split(":")
+    if len(_parts) == 3 and _parts[0].startswith("0x") and len(_parts[0]) == 42:
+        try:
+            TRANSFER_TOKENS[_parts[0].lower()] = (_parts[1] or "TOKEN", int(_parts[2]))
+        except ValueError:
+            pass
+# Transfers below this notional are ignored (assumes ≈$1 stable tokens).
+try:
+    MIN_TRANSFER_USD = float(os.environ.get("MIN_TRANSFER_USD", "1") or 1)
+except ValueError:
+    MIN_TRANSFER_USD = 1.0
+# Cap on how many blocks a single eth_getLogs call may span. Also bounds the
+# catch-up window after downtime — anything older is skipped (with a log
+# line) instead of replaying hours of history into Telegram.
+try:
+    TRANSFER_MAX_BLOCK_RANGE = max(
+        50, int(os.environ.get("TRANSFER_MAX_BLOCK_RANGE", "1200") or 1200)
+    )
+except ValueError:
+    TRANSFER_MAX_BLOCK_RANGE = 1200
+ADDR_EXPLORER_BASE = os.environ.get("ADDR_EXPLORER_BASE", "https://bscscan.com/address/")
+# keccak topic hashes: ERC-20 Transfer, ERC-1155 TransferSingle/TransferBatch.
+ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+ERC1155_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
+ERC1155_BATCH_TOPIC = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
+
 # How many consecutive polling failures before we alert the chat. We alert once
 # per error burst — the counter resets when a request succeeds.
 ERROR_ALERT_THRESHOLD = 5
@@ -160,7 +217,7 @@ LIST_PAGE_SIZE = 8
 # the menu bar shows. Handlers for removed commands (/alert /export /mute etc.)
 # are still registered so typing them continues to work.
 HELP_CATEGORIES: list[tuple[str, list[str]]] = [
-    ("watch", ["watch", "unwatch", "list", "stop"]),
+    ("watch", ["watch", "unwatch", "list", "transfer", "stop"]),
     ("query", ["pos", "orders"]),
     ("other", ["settings", "defaults", "digest", "start"]),
 ]
@@ -227,6 +284,8 @@ class WatchedWallet:
     # Wall-clock of the last real activity (emitted notification). Powers the
     # "stale" badge in /list.
     last_activity: float = 0
+    # Whether on-chain deposit/withdrawal alerts fire for this wallet.
+    transfer_alerts: bool = True
     # Cache of market resolution state keyed by market_id so we only alert
     # once on resolution transitions.
     resolved_markets: dict = field(default_factory=dict)
@@ -503,6 +562,24 @@ I18N = {
         "fetch_error_msg": "⚠️ Predict.fun API is unavailable right now. Try again in a moment.",
         "rate_limited_alert": "🚦 Predict.fun rate-limited <code>{addr}</code>. Pausing {backoff}s; will auto-resume.",
         "rate_limit_recovered": "✅ Rate limit cleared for <code>{addr}</code>.",
+        "transfer_deposit_header": "💰 <b>Deposit</b> <code>{addr}</code>{note}\n\n",
+        "transfer_withdraw_header": "💸 <b>Withdrawal</b> <code>{addr}</code>{note}\n\n",
+        "transfer_from": "From",
+        "transfer_to": "To",
+        "transfer_status_header": "<b>Deposit / withdrawal alerts</b>",
+        "transfer_usage": (
+            "Usage:\n"
+            "• <code>/transfer on</code> / <code>/transfer off</code> — all wallets\n"
+            "• <code>/transfer on 0xAddr|alias</code> — one wallet"
+        ),
+        "transfer_on_ok": "💰 Deposit/withdrawal alerts ON for <code>{addr}</code>",
+        "transfer_off_ok": "🔕 Deposit/withdrawal alerts OFF for <code>{addr}</code>",
+        "transfer_all_on": "💰 Deposit/withdrawal alerts ON for all {count} wallets",
+        "transfer_all_off": "🔕 Deposit/withdrawal alerts OFF for all {count} wallets",
+        "transfer_disabled_global": (
+            "⚠️ On-chain deposit/withdrawal alerts are disabled on this "
+            "deployment (TRANSFER_ALERTS_ENABLED=0)."
+        ),
         "relt_never": "never",
         "relt_just_now": "just now",
         "relt_seconds": "{n}s ago",
@@ -520,6 +597,7 @@ I18N = {
             "/list - watched list\n"
             "/pos <code>addr|alias</code> - view positions\n"
             "/orders <code>addr|alias</code> - recent fills\n"
+            "/transfer - on-chain deposit/withdrawal alerts\n"
             "/settings - preferences\n"
             "/digest <code>minutes</code> - periodic deduped activity digest\n"
             "/stop - stop all"
@@ -837,6 +915,17 @@ I18N = {
             "• <code>/digest off</code> — disable\n"
             "• <code>/digest</code> — show cadence, pending entries, time to next flush"
         ),
+        "help_cmd_transfer": (
+            "<b>/transfer</b> — On-chain deposit/withdrawal alerts\n\n"
+            "Watches BNB Chain for USDT moving in or out of your watched wallets and "
+            "pushes a 💰 deposit / 💸 withdrawal card with amount, counterparty and tx "
+            "link. Trading settlements are filtered out automatically, so only real "
+            "external transfers alert. On by default for every watched wallet.\n\n"
+            "<b>Usage</b>\n"
+            "• <code>/transfer</code> — show per-wallet status\n"
+            "• <code>/transfer on|off</code> — toggle for all wallets\n"
+            "• <code>/transfer on|off 0xAddr|alias</code> — toggle one wallet"
+        ),
         "help_cmd_lang": (
             "<b>/lang</b> — Switch bot language\n\n"
             "<b>Usage</b>\n"
@@ -1033,6 +1122,23 @@ I18N = {
         "fetch_error_msg": "⚠️ Predict.fun API 暂时无响应，请稍后再试。",
         "rate_limited_alert": "🚦 Predict.fun 限流：<code>{addr}</code>，暂停 {backoff} 秒后自动恢复。",
         "rate_limit_recovered": "✅ <code>{addr}</code> 限流已恢复。",
+        "transfer_deposit_header": "💰 <b>充值到账</b> <code>{addr}</code>{note}\n\n",
+        "transfer_withdraw_header": "💸 <b>提现转出</b> <code>{addr}</code>{note}\n\n",
+        "transfer_from": "来自",
+        "transfer_to": "转往",
+        "transfer_status_header": "<b>充值 / 提现提醒</b>",
+        "transfer_usage": (
+            "用法：\n"
+            "• <code>/transfer on</code> / <code>/transfer off</code> — 全部钱包\n"
+            "• <code>/transfer on 0x地址|备注</code> — 单个钱包"
+        ),
+        "transfer_on_ok": "💰 已开启 <code>{addr}</code> 的充值/提现提醒",
+        "transfer_off_ok": "🔕 已关闭 <code>{addr}</code> 的充值/提现提醒",
+        "transfer_all_on": "💰 已为全部 {count} 个钱包开启充值/提现提醒",
+        "transfer_all_off": "🔕 已为全部 {count} 个钱包关闭充值/提现提醒",
+        "transfer_disabled_global": (
+            "⚠️ 当前部署未启用链上充值/提现提醒（TRANSFER_ALERTS_ENABLED=0）。"
+        ),
         "relt_never": "未执行",
         "relt_just_now": "刚刚",
         "relt_seconds": "{n} 秒前",
@@ -1050,6 +1156,7 @@ I18N = {
             "/list - 查看监控列表\n"
             "/pos <code>地址或备注</code> - 查看持仓\n"
             "/orders <code>地址或备注</code> - 查看最近成交\n"
+            "/transfer - 链上充值/提现提醒\n"
             "/settings - 偏好设置\n"
             "/digest <code>分钟</code> - 摘要汇总（按市场去重，防遗漏）\n"
             "/stop - 清空全部监控"
@@ -1350,6 +1457,16 @@ I18N = {
             "• <code>/digest off</code> — 关闭\n"
             "• <code>/digest</code> — 查看当前间隔、已缓冲条数、距下次还多久"
         ),
+        "help_cmd_transfer": (
+            "<b>/transfer</b> — 链上充值 / 提现提醒\n\n"
+            "监听 BNB 链上被监控钱包的 USDT 转入 / 转出，推送 💰 充值 / 💸 提现卡片，"
+            "包含金额、对方地址和交易链接。交易撮合产生的资金流会自动过滤，"
+            "只提醒真正的外部转账。每个监控钱包默认开启。\n\n"
+            "<b>用法</b>\n"
+            "• <code>/transfer</code> — 查看各钱包开关状态\n"
+            "• <code>/transfer on|off</code> — 全部钱包开 / 关\n"
+            "• <code>/transfer on|off 0x地址|备注</code> — 单个钱包开 / 关"
+        ),
         "help_cmd_lang": (
             "<b>/lang</b> — 切换机器人语言\n\n"
             "<b>用法</b>\n"
@@ -1431,6 +1548,7 @@ def init_db():
                 resolved_markets TEXT NOT NULL DEFAULT '{}',
                 min_fill_usd REAL NOT NULL DEFAULT 0,
                 dust_interval_s INTEGER NOT NULL DEFAULT 0,
+                transfer_alerts INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (chat_id, address)
             )
             """
@@ -1445,6 +1563,7 @@ def init_db():
             "ALTER TABLE watches ADD COLUMN resolved_markets TEXT NOT NULL DEFAULT '{}'",
             "ALTER TABLE watches ADD COLUMN min_fill_usd REAL NOT NULL DEFAULT 0",
             "ALTER TABLE watches ADD COLUMN dust_interval_s INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE watches ADD COLUMN transfer_alerts INTEGER NOT NULL DEFAULT 1",
         ):
             try:
                 conn.execute(ddl)
@@ -1520,6 +1639,16 @@ def init_db():
         conn.execute(
             "CREATE INDEX IF NOT EXISTS alerts_by_chat ON alerts(chat_id, address)"
         )
+        # Tiny kv store for the transfer_loop's scan cursor so restarts resume
+        # from the last scanned block instead of replaying or skipping events.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transfer_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -1531,9 +1660,9 @@ def save_watch(w: WatchedWallet):
               chat_id, address, note, position_snapshot, order_match_snapshot,
               last_check, muted, position_titles, change_threshold_pct,
               poll_interval_s, last_activity, resolved_markets, min_fill_usd,
-              dust_interval_s
+              dust_interval_s, transfer_alerts
             )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(chat_id, address) DO UPDATE SET
               note=excluded.note,
               position_snapshot=excluded.position_snapshot,
@@ -1546,7 +1675,8 @@ def save_watch(w: WatchedWallet):
               last_activity=excluded.last_activity,
               resolved_markets=excluded.resolved_markets,
               min_fill_usd=excluded.min_fill_usd,
-              dust_interval_s=excluded.dust_interval_s
+              dust_interval_s=excluded.dust_interval_s,
+              transfer_alerts=excluded.transfer_alerts
             """,
             (
                 w.chat_id,
@@ -1563,6 +1693,7 @@ def save_watch(w: WatchedWallet):
                 json.dumps(w.resolved_markets, ensure_ascii=False),
                 float(w.min_fill_usd or 0),
                 int(w.dust_interval_s or 0),
+                1 if w.transfer_alerts else 0,
             ),
         )
         conn.commit()
@@ -1789,7 +1920,7 @@ def load_state():
             SELECT chat_id, address, note, position_snapshot, order_match_snapshot,
                    last_check, muted, position_titles, change_threshold_pct,
                    poll_interval_s, last_activity, resolved_markets, min_fill_usd,
-                   dust_interval_s
+                   dust_interval_s, transfer_alerts
             FROM watches
             """
         ):
@@ -1808,6 +1939,7 @@ def load_state():
                 resolved_json,
                 min_fill_usd,
                 dust_interval_s,
+                transfer_alerts,
             ) = row
             if int(chat_id) not in watched:
                 watched[int(chat_id)] = {}
@@ -1826,7 +1958,35 @@ def load_state():
                 resolved_markets=json.loads(resolved_json or "{}"),
                 min_fill_usd=float(min_fill_usd or 0),
                 dust_interval_s=int(dust_interval_s or 0),
+                transfer_alerts=bool(1 if transfer_alerts is None else transfer_alerts),
             )
+
+
+def db_get_transfer_block() -> int:
+    """Last block already scanned by transfer_loop (0 = never scanned)."""
+    with db_lock, db_conn() as conn:
+        try:
+            row = conn.execute(
+                "SELECT value FROM transfer_state WHERE key='last_scanned_block'"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return 0
+    try:
+        return int(row[0]) if row else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def db_set_transfer_block(block: int) -> None:
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO transfer_state(key, value) VALUES('last_scanned_block', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (str(int(block)),),
+        )
+        conn.commit()
 
 
 def db_counts() -> tuple[int, int]:
@@ -4119,6 +4279,61 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _set_mute(update, ctx, False)
+
+
+async def cmd_transfer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Toggle / inspect on-chain deposit-withdrawal alerts.
+
+    /transfer                → per-wallet status + usage
+    /transfer on|off         → toggle every watched wallet in this chat
+    /transfer on|off <addr>  → toggle a single wallet (addr or alias)
+    """
+    chat_id = update.effective_chat.id
+    if not TRANSFER_ALERTS_ENABLED:
+        await update.message.reply_text(t(chat_id, "transfer_disabled_global"))
+        return
+    wallets = watched.get(chat_id, {})
+    if not wallets:
+        await update.message.reply_text(t(chat_id, "no_watched_wallets"))
+        return
+    args = ctx.args or []
+    if not args:
+        lines = [t(chat_id, "transfer_status_header")]
+        for a, w in wallets.items():
+            state = "🔔" if w.transfer_alerts else "🔕"
+            note = f" · {_html_escape(w.note)}" if w.note else ""
+            lines.append(f"{state} <code>{fmt_addr(a)}</code>{note}")
+        lines.append("")
+        lines.append(t(chat_id, "transfer_usage"))
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+    mode = args[0].lower()
+    if mode not in ("on", "off"):
+        await update.message.reply_text(
+            t(chat_id, "transfer_usage"), parse_mode="HTML"
+        )
+        return
+    enable = mode == "on"
+    if len(args) >= 2:
+        addr = resolve_addr(chat_id, " ".join(args[1:]))
+        target = wallets.get(addr) if addr else None
+        if not target:
+            await update.message.reply_text(t(chat_id, "not_found"))
+            return
+        target.transfer_alerts = enable
+        save_watch(target)
+        key = "transfer_on_ok" if enable else "transfer_off_ok"
+        await update.message.reply_text(
+            t(chat_id, key, addr=fmt_addr(target.address)), parse_mode="HTML"
+        )
+        return
+    for w in wallets.values():
+        w.transfer_alerts = enable
+        save_watch(w)
+    key = "transfer_all_on" if enable else "transfer_all_off"
+    await update.message.reply_text(
+        t(chat_id, key, count=len(wallets)), parse_mode="HTML"
+    )
 
 
 def _settings_body(chat_id: int) -> str:
@@ -7560,6 +7775,268 @@ async def poll_loop(app: Application):
             elapsed = time.monotonic() - cycle_started
             await asyncio.sleep(max(0.0, POLL_INTERVAL - elapsed))
 
+# ==================== Transfer (deposit/withdrawal) loop ====================
+
+# Index of the RPC endpoint that last worked; _bsc_rpc rotates from here so a
+# dead endpoint is only retried after the healthy ones.
+_rpc_index = 0
+# tx hash → "is this a trading settlement?" verdict cache, so multi-transfer
+# txs (CEX batch payouts) and rescans don't refetch the same receipt.
+_trade_tx_cache: dict[str, bool] = {}
+# (tx hash, log index) pairs already notified. Guards against double-sending
+# when a partially-failed scan cycle is retried over the same block range.
+_sent_transfer_keys: set[tuple[str, str]] = set()
+_sent_transfer_order: deque = deque(maxlen=2000)
+
+
+async def _bsc_rpc(session: aiohttp.ClientSession, method: str, params: list):
+    """JSON-RPC call against the configured BSC endpoints with failover.
+
+    Tries each endpoint once starting from the last known-good one; returns
+    the ``result`` payload, or ``None`` when every endpoint failed.
+    """
+    global _rpc_index
+    last_err: str | None = None
+    for i in range(len(BSC_RPC_URLS)):
+        idx = (_rpc_index + i) % len(BSC_RPC_URLS)
+        url = BSC_RPC_URLS[idx]
+        try:
+            async with session.post(
+                url,
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    last_err = f"HTTP {resp.status} @ {url}"
+                    continue
+                data = await resp.json(content_type=None)
+                if isinstance(data, dict) and data.get("error") is None and "result" in data:
+                    _rpc_index = idx
+                    return data["result"]
+                last_err = f"{(data or {}).get('error')} @ {url}" if isinstance(data, dict) else f"bad payload @ {url}"
+        except Exception as e:
+            last_err = f"{e} @ {url}"
+    logger.warning(f"BSC RPC {method} failed on all endpoints: {last_err}")
+    return None
+
+
+def _topic_addr(addr: str) -> str:
+    """Left-pad a 0x address to the 32-byte topic form used in event filters."""
+    return "0x" + addr[2:].lower().rjust(64, "0")
+
+
+async def _fetch_wallet_transfers(
+    session: aiohttp.ClientSession,
+    from_block: int,
+    to_block: int,
+    addresses: list[str],
+) -> list[dict] | None:
+    """ERC-20 Transfer events touching ``addresses`` in the block range.
+
+    Two eth_getLogs calls (sender-side and recipient-side) across all
+    configured tokens. Returns ``None`` if either call failed so the caller
+    can retry the whole range instead of advancing past unseen events.
+    """
+    addr_topics = [_topic_addr(a) for a in addresses]
+    token_addrs = list(TRANSFER_TOKENS.keys())
+    raw_logs: list[dict] = []
+    for topics in (
+        [ERC20_TRANSFER_TOPIC, addr_topics],          # wallet is sender
+        [ERC20_TRANSFER_TOPIC, None, addr_topics],    # wallet is recipient
+    ):
+        result = await _bsc_rpc(
+            session,
+            "eth_getLogs",
+            [{
+                "fromBlock": hex(from_block),
+                "toBlock": hex(to_block),
+                "address": token_addrs,
+                "topics": topics,
+            }],
+        )
+        if not isinstance(result, list):
+            return None
+        raw_logs.extend(result)
+
+    # A watched→watched transfer shows up in both calls; dedupe on
+    # (tx, logIndex) while parsing.
+    parsed: dict[tuple[str, str], dict] = {}
+    for lg in raw_logs:
+        try:
+            topics = lg.get("topics") or []
+            tx = lg.get("transactionHash") or ""
+            key = (tx, str(lg.get("logIndex")))
+            if len(topics) < 3 or not tx or key in parsed:
+                continue
+            parsed[key] = {
+                "key": key,
+                "tx": tx,
+                "token": (lg.get("address") or "").lower(),
+                "from": "0x" + topics[1][-40:].lower(),
+                "to": "0x" + topics[2][-40:].lower(),
+                "value": int(lg.get("data") or "0x0", 16),
+            }
+        except (ValueError, TypeError):
+            continue
+    return list(parsed.values())
+
+
+async def _tx_is_trade(session: aiohttp.ClientSession, tx_hash: str) -> bool | None:
+    """Whether the tx is a conditional-token settlement rather than a plain
+    transfer.
+
+    Every predict.fun fill / split / merge / redeem moves ERC-1155 outcome
+    tokens in the same tx, while deposits and withdrawals never do — so the
+    presence of a TransferSingle/TransferBatch log is a reliable
+    discriminator. Returns ``None`` when the receipt couldn't be fetched.
+    """
+    if tx_hash in _trade_tx_cache:
+        return _trade_tx_cache[tx_hash]
+    receipt = await _bsc_rpc(session, "eth_getTransactionReceipt", [tx_hash])
+    if not isinstance(receipt, dict):
+        return None
+    is_trade = any(
+        ((lg.get("topics") or [""])[0] or "").lower()
+        in (ERC1155_SINGLE_TOPIC, ERC1155_BATCH_TOPIC)
+        for lg in receipt.get("logs") or []
+    )
+    if len(_trade_tx_cache) > 512:
+        _trade_tx_cache.clear()
+    _trade_tx_cache[tx_hash] = is_trade
+    return is_trade
+
+
+def _mark_transfer_sent(key: tuple[str, str]) -> None:
+    if len(_sent_transfer_order) == _sent_transfer_order.maxlen:
+        _sent_transfer_keys.discard(_sent_transfer_order[0])
+    _sent_transfer_order.append(key)
+    _sent_transfer_keys.add(key)
+
+
+async def _scan_and_notify_transfers(
+    app: Application,
+    session: aiohttp.ClientSession,
+    from_block: int,
+    to_block: int,
+    addr_map: dict[str, list[tuple[int, WatchedWallet]]],
+) -> bool:
+    """Scan one block range and push deposit/withdrawal cards.
+
+    Returns True when the range was fully processed (safe to advance the
+    cursor) and False on any RPC failure — the caller keeps the cursor so the
+    same range is rescanned next cycle; `_sent_transfer_keys` keeps rescans
+    from double-notifying events that already went out.
+    """
+    events = await _fetch_wallet_transfers(
+        session, from_block, to_block, list(addr_map.keys())
+    )
+    if events is None:
+        return False
+    for ev in events:
+        if ev["key"] in _sent_transfer_keys or ev["from"] == ev["to"]:
+            continue
+        symbol, decimals = TRANSFER_TOKENS.get(ev["token"], ("TOKEN", 18))
+        amount = ev["value"] / (10 ** decimals)
+        if amount < MIN_TRANSFER_USD:
+            continue
+        is_trade = await _tx_is_trade(session, ev["tx"])
+        if is_trade is None:
+            return False
+        if is_trade:
+            _mark_transfer_sent(ev["key"])
+            continue
+
+        # One event can hit two watched wallets (watched → watched transfer):
+        # the recipient gets a deposit card, the sender a withdrawal card.
+        targets: list[tuple[str, str, str]] = []
+        if ev["to"] in addr_map:
+            targets.append(("deposit", ev["to"], ev["from"]))
+        if ev["from"] in addr_map:
+            targets.append(("withdraw", ev["from"], ev["to"]))
+        _mark_transfer_sent(ev["key"])
+        tx_url = f"{TX_EXPLORER_BASE.rstrip('/')}/{ev['tx']}"
+        for kind, wallet_lower, counterparty in targets:
+            header_key = (
+                "transfer_deposit_header" if kind == "deposit"
+                else "transfer_withdraw_header"
+            )
+            cp_label_key = "transfer_from" if kind == "deposit" else "transfer_to"
+            cp_url = f"{ADDR_EXPLORER_BASE.rstrip('/')}/{counterparty}"
+            for chat_id, w in addr_map.get(wallet_lower, []):
+                note = f" · {_html_escape(w.note)}" if w.note else ""
+                msg = (
+                    t(chat_id, header_key, addr=w.address, note=note)
+                    + f"💵 <b>{amount:,.2f} {symbol}</b>\n"
+                    + f"{t(chat_id, cp_label_key)}: "
+                    + f'<a href="{cp_url}"><code>{fmt_addr(counterparty)}</code></a>\n'
+                    + f'🔗 <a href="{tx_url}">{t(chat_id, "view_tx")}</a>'
+                )
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=msg,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    w.last_activity = time.time()
+                except Exception as send_err:
+                    logger.warning(
+                        f"Failed to send transfer alert for {w.address}: {send_err}"
+                    )
+    return True
+
+
+async def transfer_loop(app: Application):
+    """Poll BNB Chain for deposits/withdrawals on watched wallets."""
+    if not (TRANSFER_ALERTS_ENABLED and BSC_RPC_URLS and TRANSFER_TOKENS):
+        logger.info("Transfer loop disabled (env config)")
+        return
+    await asyncio.sleep(5)
+    last_block = db_get_transfer_block()
+    logger.info(
+        f"Transfer loop started | rpc={len(BSC_RPC_URLS)} tokens={len(TRANSFER_TOKENS)} "
+        f"resume_block={last_block or 'latest'}"
+    )
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                latest_raw = await _bsc_rpc(session, "eth_blockNumber", [])
+                latest = int(latest_raw, 16) if isinstance(latest_raw, str) else 0
+                if latest > 0:
+                    if not last_block:
+                        # First run: anchor at the tip — history isn't replayed.
+                        last_block = latest
+                        db_set_transfer_block(latest)
+                    elif latest > last_block:
+                        start = last_block + 1
+                        if latest - last_block > TRANSFER_MAX_BLOCK_RANGE:
+                            logger.warning(
+                                f"Transfer scan {latest - last_block} blocks behind; "
+                                f"skipping ahead to the last {TRANSFER_MAX_BLOCK_RANGE}"
+                            )
+                            start = latest - TRANSFER_MAX_BLOCK_RANGE + 1
+                        addr_map: dict[str, list[tuple[int, WatchedWallet]]] = {}
+                        for chat_id, wallets in list(watched.items()):
+                            for a, w in list(wallets.items()):
+                                if w.transfer_alerts and not w.muted:
+                                    addr_map.setdefault(a.lower(), []).append(
+                                        (chat_id, w)
+                                    )
+                        if not addr_map:
+                            # Nothing to scan for — keep the cursor moving so a
+                            # later /transfer on doesn't replay old blocks.
+                            last_block = latest
+                            db_set_transfer_block(latest)
+                        elif await _scan_and_notify_transfers(
+                            app, session, start, latest, addr_map
+                        ):
+                            last_block = latest
+                            db_set_transfer_block(latest)
+            except Exception as e:
+                logger.error(f"Transfer loop error: {e}")
+            await asyncio.sleep(TRANSFER_POLL_INTERVAL)
+
+
 # ==================== Main ====================
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
@@ -7618,6 +8095,7 @@ async def on_startup(app: Application):
         BotCommand("pos", "查询持仓 / View positions"),
         BotCommand("orders", "最近成交 / Recent fills"),
         BotCommand("settings", "偏好设置 / Settings"),
+        BotCommand("transfer", "充提提醒 / Deposit-withdrawal alerts"),
         BotCommand("defaults", "小额默认 / Micro-fill defaults"),
         BotCommand("digest", "摘要汇总 / Activity digest"),
         BotCommand("stop", "停止全部监控 / Stop all"),
@@ -7649,6 +8127,7 @@ async def on_startup(app: Application):
             )
     asyncio.create_task(poll_loop(app))
     asyncio.create_task(digest_loop(app))
+    asyncio.create_task(transfer_loop(app))
 
 
 def main():
@@ -7669,6 +8148,7 @@ def main():
     app.add_handler(CommandHandler("note", cmd_note))
     app.add_handler(CommandHandler("mute", cmd_mute))
     app.add_handler(CommandHandler("unmute", cmd_unmute))
+    app.add_handler(CommandHandler("transfer", cmd_transfer))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("defaults", cmd_defaults))
     app.add_handler(CommandHandler("export", cmd_export))
