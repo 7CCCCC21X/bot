@@ -7351,7 +7351,19 @@ async def poll_loop(app: Application):
                                 m["market"] = merged
                         positions_by_key = {pos_key(p): p for p in positions}
 
-                        if positions_ok:
+                        # Diff positions only when THIS poll also has fills
+                        # data. With matches gated (rate-limit cooldown) or
+                        # failed, a fill would surface as a bare 持仓变化
+                        # card now (no fill context to dedupe against) and
+                        # then AGAIN as a 订单成交 card once matches
+                        # recovers. Deferring the diff — snapshot untouched
+                        # below — means both land in the same later poll,
+                        # where the fill card wins and the duplicate 持仓变化
+                        # is suppressed as usual. Positions are still
+                        # fetched meanwhile for price alerts and resolution
+                        # detection.
+                        diff_ready = positions_ok and matches_ok
+                        if diff_ready:
                             added, changed, closed = diff_positions(
                                 w.position_snapshot,
                                 positions,
@@ -7435,7 +7447,11 @@ async def poll_loop(app: Application):
                         # Preserve titles for keys that have disappeared this
                         # poll so we can still render their resolution notice.
                         merged_titles = {**old_titles, **new_titles}
-                        if positions_ok:
+                        # Snapshot refresh is tied to diff_ready (not just
+                        # positions_ok): advancing the snapshot on a poll
+                        # whose diff was deferred would swallow the change
+                        # forever instead of alerting it next clean poll.
+                        if diff_ready:
                             w.position_titles = new_titles
                             w.position_snapshot = {pos_key(p): pos_size(p) for p in positions}
                         w.last_check = time.time()
