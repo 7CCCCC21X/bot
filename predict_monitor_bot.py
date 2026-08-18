@@ -77,30 +77,6 @@ try:
     POLL_CONCURRENCY = max(1, int(os.environ.get("POLL_CONCURRENCY", "8") or 8))
 except ValueError:
     POLL_CONCURRENCY = 8
-# Minimum spacing (milliseconds) between outbound Predict.fun API requests,
-# enforced globally across all wallets and endpoints. The API's quotas are
-# per endpoint but shared across wallets, so without pacing a cycle over N
-# wallets fires a 2N-request burst every POLL_INTERVAL and trips a 429 wave
-# across every wallet at once.
-# 100ms ≈ 10 req/s. Set API_MIN_INTERVAL_MS=0 to disable pacing.
-try:
-    API_MIN_INTERVAL_MS = max(0, int(os.environ.get("API_MIN_INTERVAL_MS", "100") or 100))
-except ValueError:
-    API_MIN_INTERVAL_MS = 100
-# How many CONSECUTIVE 429s (zero successes in between, across all wallets)
-# before the global cooldown wave opens. Stray 429s below this streak are
-# soft failures: the wallet simply retries on the next 2s cycle, which is
-# how the original (pre-cooldown) build behaved and what keeps alert
-# latency in seconds. The predict.fun quota is a burst-tolerant token
-# bucket, so ~5% scattered 429s are normal background noise — only an
-# unbroken streak (or an explicit Retry-After header) signals real
-# sustained throttling worth pausing for.
-try:
-    RATE_LIMIT_TRIP_CONSEC = max(
-        1, int(os.environ.get("RATE_LIMIT_TRIP_CONSEC", "10") or 10)
-    )
-except ValueError:
-    RATE_LIMIT_TRIP_CONSEC = 10
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
 # Fallback dust floor used when a wallet has no per-wallet `min_fill_usd` set.
 # Set MIN_FILL_USD=0 to disable by default (every fill shows, even $0.04 dust).
@@ -257,6 +233,13 @@ class WatchedWallet:
     # Transient runtime counters (not persisted).
     fetch_errors: int = 0
     error_notified: bool = False
+    # Rate-limit cooldown state (transient). `rate_limit_until` is a wall-clock
+    # epoch second; while now < rate_limit_until, the polling loop skips this
+    # wallet entirely. `rate_limit_level` counts consecutive 429s and drives
+    # the exponential backoff fallback when no Retry-After header is present.
+    rate_limit_until: float = 0
+    rate_limit_level: int = 0
+    rate_limit_notified: bool = False
     # Transient dust-summary accumulator. Holds match dicts for dust fills
     # that haven't been flushed yet (only used when the effective
     # dust_interval > 0). Not persisted — on restart the snapshot dedupe
@@ -337,29 +320,6 @@ whitelisted_chats: set[int] = set()
 api_stats: dict[str, deque] = {
     "positions": deque(maxlen=2000),
     "matches": deque(maxlen=2000),
-}
-# Global Predict.fun rate-limit cooldown. Observed behavior (via /apistatus):
-# the quota is per *endpoint*, not per IP — /orders/matches throttles while
-# /positions runs clean at the same request rate, and it tolerates bursts
-# (token bucket), so a single 429 only means the matches budget is briefly
-# exhausted. The wave therefore gates ONLY the matches fetch by default;
-# positions/market polling keeps running so position diffs stay fresh.
-# `positions_hit` flips on if a positions call ever 429s, extending the gate
-# to positions too for that wave. `until` is a wall-clock epoch second;
-# `level` counts consecutive waves and drives the exponential-backoff
-# fallback when no Retry-After header is present; `notified_chats` holds the
-# chats already alerted about the current wave so each gets at most one
-# message per wave.
-# `consec_429` counts back-to-back rate-limited polls (reset by any real
-# matches success); the wave only opens once it reaches
-# RATE_LIMIT_TRIP_CONSEC or the server sends an explicit Retry-After —
-# scattered 429s are soft per-poll failures that never pause anything.
-rate_limit_global: dict = {
-    "until": 0.0,
-    "level": 0,
-    "consec_429": 0,
-    "positions_hit": False,
-    "notified_chats": set(),
 }
 NOTIFY_MODES = ("split", "merged")
 db_lock = threading.Lock()
@@ -515,10 +475,9 @@ I18N = {
             "<i>{note}</i>"
         ),
         "speedtest_note_ip": (
-            "Normal polling kept running during the test; the rate limit is "
-            "per endpoint (matches has its own burst-tolerant budget), so a "
-            "burst can briefly delay fill alerts for other wallets. "
-            "Re-check /apistatus after ~1 min."
+            "Normal polling kept running during the test; rate limit is "
+            "IP-scoped, so an instant burst can briefly delay other "
+            "wallets. Re-check /apistatus after ~1 min."
         ),
         "btn_wl_add": "➕ Add chat",
         "btn_wl_back": "⬅ Back",
@@ -542,8 +501,8 @@ I18N = {
         "export_caption": "Your watch list ({count} wallets)",
         "fetch_error_alert": "⚠️ Failed to reach Predict.fun API {count}× for <code>{addr}</code>. Will keep retrying silently.",
         "fetch_error_msg": "⚠️ Predict.fun API is unavailable right now. Try again in a moment.",
-        "rate_limited_alert": "🚦 Predict.fun rate limit hit — fill polling paused for {backoff}s (position tracking keeps running); will auto-resume.",
-        "rate_limit_recovered": "✅ Predict.fun rate limit cleared — polling resumed.",
+        "rate_limited_alert": "🚦 Predict.fun rate-limited <code>{addr}</code>. Pausing {backoff}s; will auto-resume.",
+        "rate_limit_recovered": "✅ Rate limit cleared for <code>{addr}</code>.",
         "relt_never": "never",
         "relt_just_now": "just now",
         "relt_seconds": "{n}s ago",
@@ -1049,9 +1008,8 @@ I18N = {
             "<i>{note}</i>"
         ),
         "speedtest_note_ip": (
-            "测试期间正常轮询仍在跑；限流按端点计（matches 有独立配额、"
-            "允许突发），瞬时打满可能短暂影响其他钱包的成交提醒，"
-            "建议 1 分钟后再观察 /apistatus。"
+            "测试期间正常轮询仍在跑；rate-limit 是 IP 级，瞬时打满会"
+            "短暂影响其他钱包查询，建议 1 分钟后再观察 /apistatus。"
         ),
         "btn_wl_add": "➕ 添加",
         "btn_wl_back": "⬅ 返回",
@@ -1073,8 +1031,8 @@ I18N = {
         "export_caption": "监控列表（{count} 个钱包）",
         "fetch_error_alert": "⚠️ 连续 {count} 次无法访问 Predict.fun API：<code>{addr}</code>。会继续静默重试。",
         "fetch_error_msg": "⚠️ Predict.fun API 暂时无响应，请稍后再试。",
-        "rate_limited_alert": "🚦 Predict.fun 触发限流，成交监控暂停 {backoff} 秒（持仓监控不受影响），到时自动恢复。",
-        "rate_limit_recovered": "✅ Predict.fun 限流已解除，监控已恢复。",
+        "rate_limited_alert": "🚦 Predict.fun 限流：<code>{addr}</code>，暂停 {backoff} 秒后自动恢复。",
+        "rate_limit_recovered": "✅ <code>{addr}</code> 限流已恢复。",
         "relt_never": "未执行",
         "relt_just_now": "刚刚",
         "relt_seconds": "{n} 秒前",
@@ -1889,30 +1847,9 @@ class RateLimited:
     """Sentinel returned by fetch_* helpers when the API responded with 429.
 
     Carries the parsed Retry-After hint (seconds) when the server provided one.
-    The polling loop uses this to open the shared global cooldown wave.
+    The polling loop uses this to set a per-wallet cooldown.
     """
     retry_after_s: float | None = None
-
-
-# Global request pacer: hands out evenly spaced send slots so concurrent
-# wallet polls can't burst-fire and trip the per-key/IP rate limit. The lock
-# only guards slot assignment; the actual sleep happens outside it so waiters
-# queue up in parallel instead of serializing their sleeps.
-_api_pace_lock = asyncio.Lock()
-_api_next_slot = 0.0
-
-
-async def _api_pace() -> None:
-    global _api_next_slot
-    if API_MIN_INTERVAL_MS <= 0:
-        return
-    gap = API_MIN_INTERVAL_MS / 1000.0
-    async with _api_pace_lock:
-        now = time.monotonic()
-        wait = _api_next_slot - now
-        _api_next_slot = (now if wait <= 0 else _api_next_slot) + gap
-    if wait > 0:
-        await asyncio.sleep(wait)
 
 
 def _record_api(endpoint: str, label: str) -> None:
@@ -1948,7 +1885,7 @@ async def fetch_positions(
 
     An empty list means the wallet genuinely has no positions; ``None`` lets
     callers track consecutive failures for alerting; a ``RateLimited`` instance
-    signals the caller should pause polling globally (the limit is per key/IP).
+    signals the caller should back off polling for this wallet.
 
     predict.fun caps each positions page, so we follow its Relay-style
     ``cursor`` (passing it back as ``after``) until the wallet is fully
@@ -1968,7 +1905,6 @@ async def fetch_positions(
             params = {"first": str(POSITIONS_FETCH_LIMIT)}
             if cursor:
                 params["after"] = cursor
-            await _api_pace()
             async with session.get(
                 base_url,
                 params=params,
@@ -2026,7 +1962,6 @@ async def fetch_market(session: aiohttp.ClientSession, market_id: str) -> dict:
 
     url = f"{PREDICT_API}/v1/markets/{market_id}"
     try:
-        await _api_pace()
         async with session.get(
             url,
             headers=_headers(),
@@ -2054,7 +1989,6 @@ async def fetch_order_matches(
         "first": str(first),
     }
     try:
-        await _api_pace()
         async with session.get(
             url,
             params=params,
@@ -3787,10 +3721,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 continue
 
             positions = await fetch_positions(session, addr)
-            # Keep the priming window aligned with the poll loop's first=50:
-            # a smaller prime would leave older fills out of the snapshot and
-            # replay them as "new" on the first poll.
-            matches = await fetch_order_matches(session, addr, first=50)
+            matches = await fetch_order_matches(session, addr, first=30)
             if isinstance(positions, RateLimited):
                 positions = None
             if isinstance(matches, RateLimited):
@@ -4523,25 +4454,25 @@ async def cmd_apistatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{counts['5xx']} 5xx · {counts['timeout']} timeout · {counts['other']} other"
         )
 
+    throttled = []
+    for cid, wallets in watched.items():
+        for addr_, w in wallets.items():
+            if w.rate_limit_until and w.rate_limit_until > now:
+                throttled.append((w.rate_limit_until - now, addr_, cid, w.rate_limit_level))
+    throttled.sort()
+
     lines.append("")
-    rl_until = rate_limit_global["until"]
-    if rl_until > now:
-        scope = (
-            "matches+positions paused"
-            if rate_limit_global["positions_hit"]
-            else "matches paused, positions still polling"
-        )
-        lines.append(
-            f"Global rate-limit cooldown: {int(rl_until - now)}s remaining "
-            f"(level {rate_limit_global['level']}, {scope})"
-        )
+    if throttled:
+        lines.append(f"Currently throttled: {len(throttled)} wallets")
+        for remaining, addr_, cid, level in throttled[:20]:
+            lines.append(
+                f"  • {addr_[:10]}…{addr_[-4:]} (chat {cid}) "
+                f"— retry in {int(remaining)}s (level {level})"
+            )
+        if len(throttled) > 20:
+            lines.append(f"  … and {len(throttled) - 20} more")
     else:
-        lines.append("Global rate-limit cooldown: none")
-    lines.append(
-        f"Request pacing: {API_MIN_INTERVAL_MS}ms min gap"
-        if API_MIN_INTERVAL_MS > 0
-        else "Request pacing: disabled"
-    )
+        lines.append("Currently throttled: none")
 
     body = "\n".join(lines)
     await update.message.reply_text(f"<pre>{body}</pre>", parse_mode="HTML")
@@ -5607,10 +5538,7 @@ async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 continue
 
             positions = await fetch_positions(session, addr)
-            # Keep the priming window aligned with the poll loop's first=50:
-            # a smaller prime would leave older fills out of the snapshot and
-            # replay them as "new" on the first poll.
-            matches = await fetch_order_matches(session, addr, first=50)
+            matches = await fetch_order_matches(session, addr, first=30)
             if isinstance(positions, RateLimited):
                 positions = None
             if isinstance(matches, RateLimited):
@@ -7120,20 +7048,11 @@ async def poll_loop(app: Application):
                         ):
                             return
 
-                        # Endpoint-scoped rate-limit gate. The quota is per
-                        # endpoint (observed: matches 429s while positions
-                        # runs clean at the same rate), so a wave pauses ONLY
-                        # the matches fetch by default — positions/market
-                        # polling keeps flowing. Positions joins the pause
-                        # for the rest of the wave only if one of its own
-                        # calls tripped a 429 (positions_hit). The old
-                        # behavior (skip the wallet entirely) turned every
-                        # stray matches 429 into a 30s full-fleet blackout,
-                        # which is where the hours-long alert delays came
-                        # from.
-                        gated = time.time() < rate_limit_global["until"]
-                        poll_matches = not gated
-                        if gated and rate_limit_global["positions_hit"]:
+                        # Rate-limit cooldown gate: if the API recently 429'd
+                        # for this wallet, skip both calls until the backoff
+                        # window expires. The window is set when fetch_*
+                        # returns a RateLimited sentinel below.
+                        if w.rate_limit_until and time.time() < w.rate_limit_until:
                             return
 
                         # Fan the two endpoints out in parallel — they're
@@ -7141,114 +7060,50 @@ async def poll_loop(app: Application):
                         # serializing them just doubles the per-wallet RTT.
                         # Each helper internally swallows exceptions and
                         # returns None, so no need for return_exceptions.
-                        # A gate-skipped matches fetch stays None: downstream
-                        # treats it like a failed fetch and leaves the match
-                        # snapshot untouched, so fills surface on the next
-                        # clean poll instead of being lost.
-                        if poll_matches:
-                            positions_raw, matches_raw = await asyncio.gather(
-                                fetch_positions(session, w.address),
-                                fetch_order_matches(session, w.address, first=50),
-                            )
-                        else:
-                            positions_raw = await fetch_positions(session, w.address)
-                            matches_raw = None
+                        positions_raw, matches_raw = await asyncio.gather(
+                            fetch_positions(session, w.address),
+                            fetch_order_matches(session, w.address, first=20),
+                        )
 
-                        # 429 handling. A stray 429 is a SOFT failure: the
-                        # quota is a burst-tolerant token bucket that runs a
-                        # few percent of background 429s at our steady rate,
-                        # so the right response is what the original build
-                        # did — skip this wallet's data for this cycle and
-                        # retry 2s later. Pausing globally on every 429
-                        # (any earlier revision of the cooldown) turned each
-                        # blip into a fleet-wide stall: when the gate lifted
-                        # every wallet re-fired at once, one of N calls
-                        # would 429 again, and the gate re-armed — leaving
-                        # random wallets starved for minutes to hours.
-                        # The shared cooldown wave now opens ONLY on real
-                        # evidence of sustained throttling: an explicit
-                        # Retry-After header, or RATE_LIMIT_TRIP_CONSEC
-                        # consecutive 429s with zero successes in between.
-                        # Each chat still gets at most one deduped alert per
-                        # wave (the original fix for the per-wallet flood).
-                        if (
-                            poll_matches
-                            and matches_raw is not None
-                            and not isinstance(matches_raw, RateLimited)
-                        ):
-                            rate_limit_global["consec_429"] = 0
+                        # 429 handling: extract Retry-After (preferring the
+                        # larger of the two endpoints' hints), apply
+                        # exponential backoff, and emit a one-shot Telegram
+                        # alert once we've been throttled twice in a row.
                         rl_results = [
                             r for r in (positions_raw, matches_raw)
                             if isinstance(r, RateLimited)
                         ]
                         if rl_results:
-                            rate_limit_global["consec_429"] += 1
-                            if isinstance(positions_raw, RateLimited):
-                                rate_limit_global["positions_hit"] = True
                             retry_after = max(
                                 (r.retry_after_s or 0) for r in rl_results
                             )
-                            now = time.time()
-                            hard_throttle = (
-                                retry_after > 0
-                                or rate_limit_global["consec_429"]
-                                >= RATE_LIMIT_TRIP_CONSEC
+                            w.rate_limit_level += 1
+                            backoff = (
+                                retry_after
+                                if retry_after > 0
+                                else min(30 * (2 ** (w.rate_limit_level - 1)), 300)
                             )
-                            if hard_throttle and now >= rate_limit_global["until"]:
-                                rate_limit_global["level"] += 1
-                                backoff = (
-                                    retry_after
-                                    if retry_after > 0
-                                    else min(
-                                        5 * (2 ** (rate_limit_global["level"] - 1)),
-                                        60,
-                                    )
-                                )
-                                rate_limit_global["until"] = now + backoff
-                                logger.warning(
-                                    "Rate-limit wave opened: "
-                                    f"{rate_limit_global['consec_429']} consecutive 429s, "
-                                    f"retry_after={retry_after or 'n/a'}, "
-                                    f"backoff={backoff:.0f}s "
-                                    f"(level {rate_limit_global['level']})"
-                                )
-                            elif retry_after > 0:
-                                # Wave already open — honor a longer
-                                # Retry-After hint but don't escalate.
-                                rate_limit_global["until"] = max(
-                                    rate_limit_global["until"], now + retry_after
-                                )
-                            # Only tell chats about *sustained* throttling.
-                            # A wave now only opens after a long unbroken
-                            # 429 streak (or Retry-After), so two chained
-                            # waves already mean the API stayed throttled
-                            # through a recovery attempt — worth one deduped
-                            # heads-up. Soft scattered 429s never get here.
+                            w.rate_limit_until = time.time() + backoff
                             if (
-                                rate_limit_global["level"] >= 2
-                                and chat_id not in rate_limit_global["notified_chats"]
+                                w.rate_limit_level >= 2
+                                and not w.rate_limit_notified
                                 and not w.muted
                             ):
-                                rate_limit_global["notified_chats"].add(chat_id)
                                 try:
                                     await app.bot.send_message(
                                         chat_id=chat_id,
                                         text=t(
                                             chat_id,
                                             "rate_limited_alert",
-                                            backoff=int(
-                                                max(
-                                                    1,
-                                                    rate_limit_global["until"]
-                                                    - time.time(),
-                                                )
-                                            ),
+                                            addr=fmt_addr(w.address),
+                                            backoff=int(backoff),
                                         ),
                                         parse_mode="HTML",
                                     )
+                                    w.rate_limit_notified = True
                                 except Exception as send_err:
                                     logger.warning(
-                                        f"Failed to send rate_limited_alert to chat {chat_id}: {send_err}"
+                                        f"Failed to send rate_limited_alert for {addr}: {send_err}"
                                     )
                             # Coerce RateLimited → None so downstream
                             # diff/error logic treats this as a failed fetch
@@ -7258,17 +7113,10 @@ async def poll_loop(app: Application):
                             if isinstance(matches_raw, RateLimited):
                                 matches_raw = None
 
-                        # B1 fix: count as failure if EITHER *attempted* call
-                        # failed; reset only when everything attempted
-                        # succeeds. A gate-skipped matches fetch is not a
-                        # failure — otherwise every cooldown tick would walk
-                        # wallets toward the fetch-error alert threshold.
-                        any_failed = positions_raw is None or (
-                            poll_matches and matches_raw is None
-                        )
-                        all_failed = positions_raw is None and (
-                            not poll_matches or matches_raw is None
-                        )
+                        # B1 fix: count as failure if EITHER call failed.
+                        # Reset only when BOTH succeed.
+                        any_failed = positions_raw is None or matches_raw is None
+                        all_failed = positions_raw is None and matches_raw is None
 
                         if any_failed:
                             w.fetch_errors += 1
@@ -7318,39 +7166,26 @@ async def poll_loop(app: Application):
                                         f"Failed to send api_recovered for {addr}: {send_err}"
                                     )
 
-                            # Clear the global rate-limit wave after a clean
-                            # poll — but only once the cooldown window has
-                            # actually expired, so a poll that was already in
-                            # flight when the wave opened (and happened to
-                            # succeed) can't short-circuit the backoff. The
-                            # poll must also have actually attempted the
-                            # matches endpoint (the rate-limited one): a
-                            # positions-only poll that raced the window
-                            # expiry proves nothing about the matches quota.
-                            if (
-                                poll_matches
-                                and (
-                                    rate_limit_global["level"]
-                                    or rate_limit_global["until"]
-                                )
-                                and time.time() >= rate_limit_global["until"]
-                            ):
-                                notified = list(rate_limit_global["notified_chats"])
-                                rate_limit_global["level"] = 0
-                                rate_limit_global["until"] = 0.0
-                                rate_limit_global["consec_429"] = 0
-                                rate_limit_global["positions_hit"] = False
-                                rate_limit_global["notified_chats"] = set()
-                                for cid in notified:
+                            # Clear rate-limit cooldown after a clean poll.
+                            if w.rate_limit_level or w.rate_limit_until:
+                                rl_was_notified = w.rate_limit_notified
+                                w.rate_limit_level = 0
+                                w.rate_limit_until = 0
+                                w.rate_limit_notified = False
+                                if rl_was_notified and not w.muted:
                                     try:
                                         await app.bot.send_message(
-                                            chat_id=cid,
-                                            text=t(cid, "rate_limit_recovered"),
+                                            chat_id=chat_id,
+                                            text=t(
+                                                chat_id,
+                                                "rate_limit_recovered",
+                                                addr=fmt_addr(w.address),
+                                            ),
                                             parse_mode="HTML",
                                         )
                                     except Exception as send_err:
                                         logger.warning(
-                                            f"Failed to send rate_limit_recovered to chat {cid}: {send_err}"
+                                            f"Failed to send rate_limit_recovered for {addr}: {send_err}"
                                         )
 
                         # Only diff / refresh snapshots for endpoints that
@@ -7394,19 +7229,7 @@ async def poll_loop(app: Application):
                                 m["market"] = merged
                         positions_by_key = {pos_key(p): p for p in positions}
 
-                        # Diff positions only when THIS poll also has fills
-                        # data. With matches gated (rate-limit cooldown) or
-                        # failed, a fill would surface as a bare 持仓变化
-                        # card now (no fill context to dedupe against) and
-                        # then AGAIN as a 订单成交 card once matches
-                        # recovers. Deferring the diff — snapshot untouched
-                        # below — means both land in the same later poll,
-                        # where the fill card wins and the duplicate 持仓变化
-                        # is suppressed as usual. Positions are still
-                        # fetched meanwhile for price alerts and resolution
-                        # detection.
-                        diff_ready = positions_ok and matches_ok
-                        if diff_ready:
+                        if positions_ok:
                             added, changed, closed = diff_positions(
                                 w.position_snapshot,
                                 positions,
@@ -7422,31 +7245,6 @@ async def poll_loop(app: Application):
                                 m for m in matches
                                 if match_key(m) not in w.order_match_snapshot
                             ]
-                            # Freshness gate (same STALE_TRADE_S window the
-                            # position cards use): a fill that executed long
-                            # ago but isn't in the snapshot is a replay, not
-                            # news — the snapshot was wiped, primed with a
-                            # smaller fetch window (e.g. the 20→50 widening),
-                            # or the bot was down past the window. Absorb
-                            # them silently: the snapshot refresh below
-                            # records their keys so they never alert.
-                            if STALE_TRADE_S > 0 and new_fills:
-                                _fills_now = time.time()
-                                stale = [
-                                    m for m in new_fills
-                                    if (_executed_ts(m) or _fills_now)
-                                    < _fills_now - STALE_TRADE_S
-                                ]
-                                if stale:
-                                    logger.info(
-                                        f"Suppressing {len(stale)} stale fill(s) "
-                                        f"(>{STALE_TRADE_S}s old) for {w.address}"
-                                    )
-                                    stale_keys = {match_key(m) for m in stale}
-                                    new_fills = [
-                                        m for m in new_fills
-                                        if match_key(m) not in stale_keys
-                                    ]
                             # Dust filter: fills whose USD notional is below
                             # the effective floor fold into a single summary
                             # line instead of firing full cards. Lookup order
@@ -7490,11 +7288,7 @@ async def poll_loop(app: Application):
                         # Preserve titles for keys that have disappeared this
                         # poll so we can still render their resolution notice.
                         merged_titles = {**old_titles, **new_titles}
-                        # Snapshot refresh is tied to diff_ready (not just
-                        # positions_ok): advancing the snapshot on a poll
-                        # whose diff was deferred would swallow the change
-                        # forever instead of alerting it next clean poll.
-                        if diff_ready:
+                        if positions_ok:
                             w.position_titles = new_titles
                             w.position_snapshot = {pos_key(p): pos_size(p) for p in positions}
                         w.last_check = time.time()
