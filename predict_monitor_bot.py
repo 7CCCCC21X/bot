@@ -87,6 +87,20 @@ try:
     API_MIN_INTERVAL_MS = max(0, int(os.environ.get("API_MIN_INTERVAL_MS", "100") or 100))
 except ValueError:
     API_MIN_INTERVAL_MS = 100
+# How many CONSECUTIVE 429s (zero successes in between, across all wallets)
+# before the global cooldown wave opens. Stray 429s below this streak are
+# soft failures: the wallet simply retries on the next 2s cycle, which is
+# how the original (pre-cooldown) build behaved and what keeps alert
+# latency in seconds. The predict.fun quota is a burst-tolerant token
+# bucket, so ~5% scattered 429s are normal background noise — only an
+# unbroken streak (or an explicit Retry-After header) signals real
+# sustained throttling worth pausing for.
+try:
+    RATE_LIMIT_TRIP_CONSEC = max(
+        1, int(os.environ.get("RATE_LIMIT_TRIP_CONSEC", "10") or 10)
+    )
+except ValueError:
+    RATE_LIMIT_TRIP_CONSEC = 10
 TX_EXPLORER_BASE = os.environ.get("TX_EXPLORER_BASE", "https://bscscan.com/tx/")
 # Fallback dust floor used when a wallet has no per-wallet `min_fill_usd` set.
 # Set MIN_FILL_USD=0 to disable by default (every fill shows, even $0.04 dust).
@@ -336,9 +350,14 @@ api_stats: dict[str, deque] = {
 # fallback when no Retry-After header is present; `notified_chats` holds the
 # chats already alerted about the current wave so each gets at most one
 # message per wave.
+# `consec_429` counts back-to-back rate-limited polls (reset by any real
+# matches success); the wave only opens once it reaches
+# RATE_LIMIT_TRIP_CONSEC or the server sends an explicit Retry-After —
+# scattered 429s are soft per-poll failures that never pause anything.
 rate_limit_global: dict = {
     "until": 0.0,
     "level": 0,
+    "consec_429": 0,
     "positions_hit": False,
     "notified_chats": set(),
 }
@@ -7135,32 +7154,47 @@ async def poll_loop(app: Application):
                             positions_raw = await fetch_positions(session, w.address)
                             matches_raw = None
 
-                        # 429 handling: the quota is shared across wallets
-                        # (per endpoint), so open (or extend) ONE shared
-                        # cooldown wave instead of per-wallet state. Only the
-                        # first 429 of a wave escalates the backoff level —
-                        # the rest of the in-flight polls that 429
-                        # concurrently just ride the same window. Each chat
-                        # gets at most one alert per wave (this is what used
-                        # to flood chats with a near-identical message per
-                        # watched wallet). The backoff starts at 5s: the API
-                        # is a burst-tolerant token bucket (verified via
-                        # /speedtest — 40 back-to-back requests, zero 429s),
-                        # so a 429 means "budget briefly empty", not an
-                        # outage; the old 30s floor multiplied every stray
-                        # 429 into a fleet-wide stall.
+                        # 429 handling. A stray 429 is a SOFT failure: the
+                        # quota is a burst-tolerant token bucket that runs a
+                        # few percent of background 429s at our steady rate,
+                        # so the right response is what the original build
+                        # did — skip this wallet's data for this cycle and
+                        # retry 2s later. Pausing globally on every 429
+                        # (any earlier revision of the cooldown) turned each
+                        # blip into a fleet-wide stall: when the gate lifted
+                        # every wallet re-fired at once, one of N calls
+                        # would 429 again, and the gate re-armed — leaving
+                        # random wallets starved for minutes to hours.
+                        # The shared cooldown wave now opens ONLY on real
+                        # evidence of sustained throttling: an explicit
+                        # Retry-After header, or RATE_LIMIT_TRIP_CONSEC
+                        # consecutive 429s with zero successes in between.
+                        # Each chat still gets at most one deduped alert per
+                        # wave (the original fix for the per-wallet flood).
+                        if (
+                            poll_matches
+                            and matches_raw is not None
+                            and not isinstance(matches_raw, RateLimited)
+                        ):
+                            rate_limit_global["consec_429"] = 0
                         rl_results = [
                             r for r in (positions_raw, matches_raw)
                             if isinstance(r, RateLimited)
                         ]
                         if rl_results:
+                            rate_limit_global["consec_429"] += 1
                             if isinstance(positions_raw, RateLimited):
                                 rate_limit_global["positions_hit"] = True
                             retry_after = max(
                                 (r.retry_after_s or 0) for r in rl_results
                             )
                             now = time.time()
-                            if now >= rate_limit_global["until"]:
+                            hard_throttle = (
+                                retry_after > 0
+                                or rate_limit_global["consec_429"]
+                                >= RATE_LIMIT_TRIP_CONSEC
+                            )
+                            if hard_throttle and now >= rate_limit_global["until"]:
                                 rate_limit_global["level"] += 1
                                 backoff = (
                                     retry_after
@@ -7171,19 +7205,27 @@ async def poll_loop(app: Application):
                                     )
                                 )
                                 rate_limit_global["until"] = now + backoff
+                                logger.warning(
+                                    "Rate-limit wave opened: "
+                                    f"{rate_limit_global['consec_429']} consecutive 429s, "
+                                    f"retry_after={retry_after or 'n/a'}, "
+                                    f"backoff={backoff:.0f}s "
+                                    f"(level {rate_limit_global['level']})"
+                                )
                             elif retry_after > 0:
                                 # Wave already open — honor a longer
                                 # Retry-After hint but don't escalate.
                                 rate_limit_global["until"] = max(
                                     rate_limit_global["until"], now + retry_after
                                 )
-                            # Only tell chats about *sustained* throttling
-                            # (level 4 ≈ 35s of chained waves). Brief
-                            # token-bucket blips now clear in seconds and
-                            # positions keeps polling through them, so an
-                            # alert at level 2 would just be noise.
+                            # Only tell chats about *sustained* throttling.
+                            # A wave now only opens after a long unbroken
+                            # 429 streak (or Retry-After), so two chained
+                            # waves already mean the API stayed throttled
+                            # through a recovery attempt — worth one deduped
+                            # heads-up. Soft scattered 429s never get here.
                             if (
-                                rate_limit_global["level"] >= 4
+                                rate_limit_global["level"] >= 2
                                 and chat_id not in rate_limit_global["notified_chats"]
                                 and not w.muted
                             ):
@@ -7296,6 +7338,7 @@ async def poll_loop(app: Application):
                                 notified = list(rate_limit_global["notified_chats"])
                                 rate_limit_global["level"] = 0
                                 rate_limit_global["until"] = 0.0
+                                rate_limit_global["consec_429"] = 0
                                 rate_limit_global["positions_hit"] = False
                                 rate_limit_global["notified_chats"] = set()
                                 for cid in notified:
