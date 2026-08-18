@@ -7367,6 +7367,31 @@ async def poll_loop(app: Application):
                                 m for m in matches
                                 if match_key(m) not in w.order_match_snapshot
                             ]
+                            # Freshness gate (same STALE_TRADE_S window the
+                            # position cards use): a fill that executed long
+                            # ago but isn't in the snapshot is a replay, not
+                            # news — the snapshot was wiped, primed with a
+                            # smaller fetch window (e.g. the 20→50 widening),
+                            # or the bot was down past the window. Absorb
+                            # them silently: the snapshot refresh below
+                            # records their keys so they never alert.
+                            if STALE_TRADE_S > 0 and new_fills:
+                                _fills_now = time.time()
+                                stale = [
+                                    m for m in new_fills
+                                    if (_executed_ts(m) or _fills_now)
+                                    < _fills_now - STALE_TRADE_S
+                                ]
+                                if stale:
+                                    logger.info(
+                                        f"Suppressing {len(stale)} stale fill(s) "
+                                        f"(>{STALE_TRADE_S}s old) for {w.address}"
+                                    )
+                                    stale_keys = {match_key(m) for m in stale}
+                                    new_fills = [
+                                        m for m in new_fills
+                                        if match_key(m) not in stale_keys
+                                    ]
                             # Dust filter: fills whose USD notional is below
                             # the effective floor fold into a single summary
                             # line instead of firing full cards. Lookup order
