@@ -153,6 +153,10 @@ GUIDE_IMAGE_PATH = os.environ.get("GUIDE_IMAGE_PATH", os.path.join(os.path.dirna
 # per error burst — the counter resets when a request succeeds.
 ERROR_ALERT_THRESHOLD = 5
 LIST_PAGE_SIZE = 8
+# The poll loop only writes a wallet row when its persisted state actually
+# changed; this interval forces a periodic checkpoint anyway so last_check
+# survives restarts without paying a full-table write every cycle.
+WATCH_PERSIST_INTERVAL_S = 300
 
 # Categories for the /help browser. Keys are i18n-less identifiers; labels and
 # command help strings live in I18N under `help_cat_<id>` and `help_cmd_<name>`.
@@ -246,6 +250,10 @@ class WatchedWallet:
     # logic keeps old fills out of the queue.
     pending_dust_fills: list = field(default_factory=list)
     last_dust_flush: float = 0
+    # Wall-clock of the last successful save_watch persist (transient). Lets
+    # the poll loop skip no-change DB writes while still checkpointing
+    # last_check every WATCH_PERSIST_INTERVAL_S.
+    last_saved: float = 0
 
 
 @dataclass
@@ -295,7 +303,13 @@ class DigestState:
 
 
 watched: dict[int, dict[str, WatchedWallet]] = {}
-market_cache: dict[str, dict] = {}
+# Market cache: market_id -> (fetched_at_epoch_s, payload). Unresolved markets
+# expire after MARKET_CACHE_TTL_S so resolution transitions and price updates
+# are actually observed by the poll loop; resolved markets are terminal state
+# and stay cached until evicted by the size cap. Read via _market_cache_get.
+market_cache: dict[str, tuple[float, dict]] = {}
+MARKET_CACHE_TTL_S = 60.0
+MARKET_CACHE_MAX = 4000
 chat_lang: dict[int, str] = {}
 # Per-chat notification mode: "split" (default — one message per block) or
 # "merged" (legacy T13 — position changes + fills + resolution joined by
@@ -314,6 +328,10 @@ bulk_selection: dict[int, set[str]] = {}
 # Chats that the admin has granted the higher WHITELIST_WATCH_LIMIT cap to.
 # Persisted in the chat_whitelist table; load_state populates it on startup.
 whitelisted_chats: set[int] = set()
+# In-memory mirror of the alerts table, keyed by chat_id and kept sorted by
+# created_at. Populated by load_state and kept in sync by insert_alert /
+# delete_alert so the poll loop never hits SQLite just to learn "no alerts".
+alerts_cache: dict[int, list[dict]] = {}
 # Rolling per-endpoint API status log. Each entry is (epoch_s, label) where
 # label ∈ {"ok", "429", "5xx", "timeout", "other"}. Powers /apistatus. Capped
 # at 2000 entries per endpoint (~roughly the last several hours of polling).
@@ -1406,14 +1424,18 @@ class _shared_session:
 
 
 def db_conn():
-    db_path = Path(SQLITE_PATH)
-    if db_path.parent and str(db_path.parent) not in ("", "."):
-        db_path.parent.mkdir(parents=True, exist_ok=True)
     return sqlite3.connect(SQLITE_PATH)
 
 
 def init_db():
+    db_path = Path(SQLITE_PATH)
+    if db_path.parent and str(db_path.parent) not in ("", "."):
+        db_path.parent.mkdir(parents=True, exist_ok=True)
     with db_lock, db_conn() as conn:
+        # WAL keeps readers and the frequent poll-loop writers from blocking
+        # each other. The mode is sticky per database file, so setting it
+        # once at startup covers every later db_conn().
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS watches (
@@ -1566,6 +1588,7 @@ def save_watch(w: WatchedWallet):
             ),
         )
         conn.commit()
+    w.last_saved = time.time()
 
 
 def delete_watch(chat_id: int, address: str):
@@ -1690,6 +1713,7 @@ def insert_alert(
     threshold_cents: float,
 ) -> int:
     """Persist a new price alert and return its id."""
+    created_at = time.time()
     with db_lock, db_conn() as conn:
         cur = conn.execute(
             """
@@ -1703,35 +1727,38 @@ def insert_alert(
                 int(outcome_index),
                 op,
                 float(threshold_cents),
-                time.time(),
+                created_at,
             ),
         )
         conn.commit()
-        return int(cur.lastrowid or 0)
+        alert_id = int(cur.lastrowid or 0)
+    # Keep the in-memory mirror in sync (appending preserves created_at order).
+    alerts_cache.setdefault(chat_id, []).append(
+        {
+            "id": alert_id,
+            "chat_id": chat_id,
+            "address": address,
+            "market_id": market_id,
+            "outcome_index": int(outcome_index),
+            "op": op,
+            "threshold": float(threshold_cents),
+            "created_at": created_at,
+        }
+    )
+    return alert_id
 
 
 def list_alerts(chat_id: int, address: str | None = None) -> list[dict]:
-    query = "SELECT id, chat_id, address, market_id, outcome_index, op, threshold, created_at FROM alerts WHERE chat_id=?"
-    args: list = [chat_id]
+    """Read alerts from the in-memory mirror (see alerts_cache).
+
+    Backed entirely by memory so the poll loop can call this every cycle
+    without touching SQLite; load_state seeds the mirror on startup.
+    """
+    alerts = alerts_cache.get(chat_id, [])
     if address:
-        query += " AND lower(address)=lower(?)"
-        args.append(address)
-    query += " ORDER BY created_at ASC"
-    with db_lock, db_conn() as conn:
-        rows = conn.execute(query, args).fetchall()
-    return [
-        {
-            "id": r[0],
-            "chat_id": r[1],
-            "address": r[2],
-            "market_id": r[3],
-            "outcome_index": r[4],
-            "op": r[5],
-            "threshold": r[6],
-            "created_at": r[7],
-        }
-        for r in rows
-    ]
+        want = address.lower()
+        alerts = [a for a in alerts if str(a["address"]).lower() == want]
+    return list(alerts)
 
 
 def delete_alert(chat_id: int, alert_id: int) -> bool:
@@ -1740,7 +1767,12 @@ def delete_alert(chat_id: int, alert_id: int) -> bool:
             "DELETE FROM alerts WHERE chat_id=? AND id=?", (chat_id, alert_id)
         )
         conn.commit()
-        return cur.rowcount > 0
+        deleted = cur.rowcount > 0
+    if deleted:
+        bucket = alerts_cache.get(chat_id)
+        if bucket is not None:
+            alerts_cache[chat_id] = [a for a in bucket if a["id"] != alert_id]
+    return deleted
 
 
 def load_state():
@@ -1784,6 +1816,27 @@ def load_state():
         except sqlite3.OperationalError:
             pass
 
+        alerts_cache.clear()
+        try:
+            for r in conn.execute(
+                "SELECT id, chat_id, address, market_id, outcome_index, op, threshold, created_at "
+                "FROM alerts ORDER BY created_at ASC"
+            ):
+                alerts_cache.setdefault(int(r[1]), []).append(
+                    {
+                        "id": r[0],
+                        "chat_id": int(r[1]),
+                        "address": r[2],
+                        "market_id": r[3],
+                        "outcome_index": r[4],
+                        "op": r[5],
+                        "threshold": r[6],
+                        "created_at": r[7],
+                    }
+                )
+        except sqlite3.OperationalError:
+            pass
+
         for row in conn.execute(
             """
             SELECT chat_id, address, note, position_snapshot, order_match_snapshot,
@@ -1793,40 +1846,45 @@ def load_state():
             FROM watches
             """
         ):
-            (
-                chat_id,
-                address,
-                note,
-                pos_json,
-                matches_json,
-                last_check,
-                muted,
-                titles_json,
-                change_threshold_pct,
-                poll_interval_s,
-                last_activity,
-                resolved_json,
-                min_fill_usd,
-                dust_interval_s,
-            ) = row
-            if int(chat_id) not in watched:
-                watched[int(chat_id)] = {}
-            watched[int(chat_id)][address] = WatchedWallet(
-                address=address,
-                chat_id=int(chat_id),
-                note=note or "",
-                position_snapshot=json.loads(pos_json or "{}"),
-                order_match_snapshot=set(json.loads(matches_json or "[]")),
-                last_check=float(last_check or 0),
-                muted=bool(muted),
-                position_titles=json.loads(titles_json or "{}"),
-                change_threshold_pct=float(change_threshold_pct or 0),
-                poll_interval_s=int(poll_interval_s or 0),
-                last_activity=float(last_activity or 0),
-                resolved_markets=json.loads(resolved_json or "{}"),
-                min_fill_usd=float(min_fill_usd or 0),
-                dust_interval_s=int(dust_interval_s or 0),
-            )
+            # Tolerate a corrupt row (bad JSON, wrong types) by skipping it
+            # instead of taking the whole bot down at startup.
+            try:
+                (
+                    chat_id,
+                    address,
+                    note,
+                    pos_json,
+                    matches_json,
+                    last_check,
+                    muted,
+                    titles_json,
+                    change_threshold_pct,
+                    poll_interval_s,
+                    last_activity,
+                    resolved_json,
+                    min_fill_usd,
+                    dust_interval_s,
+                ) = row
+                if int(chat_id) not in watched:
+                    watched[int(chat_id)] = {}
+                watched[int(chat_id)][address] = WatchedWallet(
+                    address=address,
+                    chat_id=int(chat_id),
+                    note=note or "",
+                    position_snapshot=json.loads(pos_json or "{}"),
+                    order_match_snapshot=set(json.loads(matches_json or "[]")),
+                    last_check=float(last_check or 0),
+                    muted=bool(muted),
+                    position_titles=json.loads(titles_json or "{}"),
+                    change_threshold_pct=float(change_threshold_pct or 0),
+                    poll_interval_s=int(poll_interval_s or 0),
+                    last_activity=float(last_activity or 0),
+                    resolved_markets=json.loads(resolved_json or "{}"),
+                    min_fill_usd=float(min_fill_usd or 0),
+                    dust_interval_s=int(dust_interval_s or 0),
+                )
+            except Exception as e:
+                logger.warning("Skipping corrupt watch row %r: %s", row[:2], e)
 
 
 def db_counts() -> tuple[int, int]:
@@ -1951,31 +2009,88 @@ async def fetch_positions(
         logger.error(f"fetch_positions timeout for {address}")
         return collected if collected else None
     except Exception as e:
-        _record_api("positions", "timeout")
+        _record_api("positions", "other")
         logger.error(f"fetch_positions error: {e}")
         return collected if collected else None
 
 
+def _market_cache_get(market_id: str, allow_stale: bool = False) -> dict | None:
+    """Read a market from the cache, honoring the freshness rules.
+
+    Resolved markets (with a recorded winner) are terminal state and never
+    expire; unresolved markets expire after MARKET_CACHE_TTL_S so status /
+    price transitions are actually observed. ``allow_stale=True`` bypasses
+    the TTL — used for display-only lookups and as a fallback when a
+    refetch fails.
+    """
+    entry = market_cache.get(market_id)
+    if not entry:
+        return None
+    fetched_at, data = entry
+    if allow_stale:
+        return data
+    resolved, winning = market_resolution(data)
+    if resolved and winning is not None:
+        return data
+    if (time.time() - fetched_at) > MARKET_CACHE_TTL_S:
+        return None
+    return data
+
+
+def _market_cache_put(market_id: str, data: dict) -> None:
+    if len(market_cache) >= MARKET_CACHE_MAX and market_id not in market_cache:
+        # Evict the oldest ~10% in one pass so insertion stays cheap and the
+        # cache can't grow without bound over months of uptime.
+        for k in sorted(market_cache, key=lambda k: market_cache[k][0])[
+            : MARKET_CACHE_MAX // 10
+        ]:
+            market_cache.pop(k, None)
+    market_cache[market_id] = (time.time(), data)
+
+
+# Bounds concurrent /v1/markets/{id} refetches so a wallet holding dozens of
+# markets doesn't burst-trigger the IP rate limit when its TTLs expire together.
+_market_fetch_sem = asyncio.Semaphore(8)
+
+
 async def fetch_market(session: aiohttp.ClientSession, market_id: str) -> dict:
-    if market_id in market_cache:
-        return market_cache[market_id]
+    cached = _market_cache_get(market_id)
+    if cached is not None:
+        return cached
 
     url = f"{PREDICT_API}/v1/markets/{market_id}"
     try:
-        async with session.get(
-            url,
-            headers=_headers(),
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data.get("success"):
-                    market_cache[market_id] = data.get("data", {})
-                    return market_cache[market_id]
+        async with _market_fetch_sem:
+            async with session.get(
+                url,
+                headers=_headers(),
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("success"):
+                        payload = data.get("data", {}) or {}
+                        _market_cache_put(market_id, payload)
+                        return payload
     except Exception:
         pass
 
-    return {}
+    # Refetch failed — serve the stale copy (better than dropping titles and
+    # slugs from every card) or an empty dict when we never had one.
+    stale = _market_cache_get(market_id, allow_stale=True)
+    return stale if stale is not None else {}
+
+
+async def _fetch_markets(
+    session: aiohttp.ClientSession, market_ids
+) -> dict[str, dict]:
+    """Fetch a batch of markets concurrently. Cached entries return
+    instantly; only misses hit the network (bounded by _market_fetch_sem)."""
+    ids = [mid for mid in dict.fromkeys(market_ids) if mid]
+    if not ids:
+        return {}
+    results = await asyncio.gather(*(fetch_market(session, mid) for mid in ids))
+    return dict(zip(ids, results))
 
 
 async def fetch_order_matches(
@@ -2014,7 +2129,7 @@ async def fetch_order_matches(
         logger.error(f"fetch_order_matches timeout for {address}")
         return None
     except Exception as e:
-        _record_api("matches", "timeout")
+        _record_api("matches", "other")
         logger.error(f"fetch_order_matches error: {e}")
         return None
 
@@ -2047,7 +2162,7 @@ async def _speedtest_probe(
                 retry = _parse_retry_after(resp.headers.get("Retry-After"))
                 return ("429", elapsed_ms, retry)
             return ("err", elapsed_ms, None)
-    except (asyncio.TimeoutError, Exception):
+    except Exception:
         return ("err", (time.monotonic() - started) * 1000.0, None)
 
 
@@ -2100,6 +2215,14 @@ def watch_limit_for(chat_id: int) -> int:
     return DEFAULT_WATCH_LIMIT
 
 
+def _watch_quota_exceeded(chat_id: int) -> bool:
+    """True when this chat may not add another watch. Admin and whitelisted
+    chats are exempt from the cap entirely."""
+    if is_admin(chat_id) or is_whitelisted(chat_id):
+        return False
+    return len(watched.get(chat_id, {})) >= watch_limit_for(chat_id)
+
+
 def watch_limit_message(chat_id: int) -> str:
     """Localized prompt shown when a chat tries to exceed its quota."""
     return t(
@@ -2113,6 +2236,26 @@ def watch_limit_message(chat_id: int) -> str:
     )
 
 
+def _extract_slug(*sources) -> str | None:
+    """Return the first slug-like field found across the given market dicts.
+
+    The API surfaces the slug under several names depending on endpoint and
+    version; every caller wants the same preference order, so it lives here.
+    """
+    for d in sources:
+        if not isinstance(d, dict):
+            continue
+        slug = (
+            d.get("slug")
+            or d.get("marketSlug")
+            or d.get("categorySlug")
+            or d.get("category_slug")
+        )
+        if slug:
+            return slug
+    return None
+
+
 def market_url(market: dict | None) -> str | None:
     if not isinstance(market, dict):
         return None
@@ -2121,12 +2264,7 @@ def market_url(market: dict | None) -> str | None:
     # and /market/<uuid> both hit a placeholder/404 — so we omit the link
     # entirely when no slug-like field is available instead of producing a
     # link that 404s when the user taps it.
-    slug = (
-        market.get("slug")
-        or market.get("marketSlug")
-        or market.get("categorySlug")
-        or market.get("category_slug")
-    )
+    slug = _extract_slug(market)
     if not slug:
         return None
     return f"{PREDICT_WEB_BASE.rstrip('/')}/{slug}?ref=B00EA"
@@ -2180,12 +2318,7 @@ def _resolve_title(market: dict | None, api_title: str | None) -> tuple[str, str
     primary = (api_title or "").strip()
     if not isinstance(market, dict):
         return primary, ""
-    slug = (
-        market.get("slug")
-        or market.get("marketSlug")
-        or market.get("categorySlug")
-        or market.get("category_slug")
-    )
+    slug = _extract_slug(market)
     slug_title = _slug_to_title(slug if isinstance(slug, str) else None)
     if slug_title and len(slug_title) > len(primary) + 4:
         return slug_title, primary
@@ -2460,6 +2593,19 @@ def _safe_float(v):
         return None
 
 
+def _pos_cost_usd(pos: dict) -> float | None:
+    """Total USD cost the API recorded for a position, under any of the
+    field names it has used over time. None when no cost field is present."""
+    return _safe_float(
+        pos.get("costUsd")
+        or pos.get("cost_usd")
+        or pos.get("totalCost")
+        or pos.get("totalCostUsd")
+        or pos.get("initialValue")
+        or pos.get("initialValueUsd")
+    )
+
+
 def _norm_price_to_cents(price):
     p = _safe_float(price)
     if p is None:
@@ -2626,14 +2772,7 @@ def display_fields(pos: dict, market: dict | None = None) -> tuple[str, str, str
     # current mark price so 总持仓 reflects what the wallet actually paid,
     # not the (possibly drifted) market quote.
     if price_c is None:
-        cost_usd = _safe_float(
-            pos.get("costUsd")
-            or pos.get("cost_usd")
-            or pos.get("totalCost")
-            or pos.get("totalCostUsd")
-            or pos.get("initialValue")
-            or pos.get("initialValueUsd")
-        )
+        cost_usd = _pos_cost_usd(pos)
         if cost_usd is not None and shares_num and shares_num > 0:
             price_c = cost_usd / shares_num * 100
 
@@ -2698,16 +2837,7 @@ def _title_cache_entry(pos: dict, market: dict | None = None) -> dict:
     title, outcome, _, _ = display_fields(pos, market or {})
     combined = market or pos.get("_market") or {}
     nested = pos.get("market") if isinstance(pos.get("market"), dict) else {}
-    slug = (
-        combined.get("slug")
-        or combined.get("marketSlug")
-        or combined.get("categorySlug")
-        or combined.get("category_slug")
-        or nested.get("slug")
-        or nested.get("marketSlug")
-        or nested.get("categorySlug")
-        or nested.get("category_slug")
-    )
+    slug = _extract_slug(combined, nested)
     return {
         "title": (title or "")[:80],
         "outcome": outcome or "",
@@ -2738,14 +2868,7 @@ def fmt_pos(
 
     # Use the API's own USD cost when exposed — avoids drift from rounding
     # `avg` to 2dp when the real avg has more precision (e.g. 0.333…¢).
-    cost_usd_raw = _safe_float(
-        pos.get("costUsd")
-        or pos.get("cost_usd")
-        or pos.get("totalCost")
-        or pos.get("totalCostUsd")
-        or pos.get("initialValue")
-        or pos.get("initialValueUsd")
-    )
+    cost_usd_raw = _pos_cost_usd(pos)
     if cost_usd_raw is not None:
         val = f"${cost_usd_raw:,.2f}"
     else:
@@ -3095,6 +3218,26 @@ def _match_market_view(match: dict) -> dict:
     return out
 
 
+def _backfill_match_market(m: dict, fresh: dict | None) -> None:
+    """Fold the flat match fields and the cached /v1/markets/{id} payload into
+    ``m["market"]`` so downstream helpers (title, slug, URL) see the richest
+    possible dict regardless of which API shape the upstream returned.
+
+    Prefers the parent question from /v1/markets/{id} for the main title while
+    preserving the per-trade label as ``_sub_title`` for the secondary line.
+    """
+    view = _match_market_view(m)
+    merged = {**view, **(fresh or {})}
+    if view.get("_sub_title"):
+        merged["_sub_title"] = view["_sub_title"]
+    if not merged.get("title") and view.get("title"):
+        merged["title"] = view["title"]
+    if view.get("slug"):
+        merged["slug"] = view["slug"]
+    if merged:
+        m["market"] = merged
+
+
 def _fill_market_outcome_key(match: dict) -> str | None:
     """Stable ``marketId_outcomeIndex`` key to match fills against positions."""
     market = _match_market_view(match)
@@ -3207,14 +3350,7 @@ def fmt_match(
             # Prefer the API's own USD cost for the total, so rounding the
             # displayed avg price to 2dp (e.g. 0.33¢ for 0.333…¢) doesn't
             # drift the total by several dollars on large positions.
-            cost_usd_raw = _safe_float(
-                current_pos.get("costUsd")
-                or current_pos.get("cost_usd")
-                or current_pos.get("totalCost")
-                or current_pos.get("totalCostUsd")
-                or current_pos.get("initialValue")
-                or current_pos.get("initialValueUsd")
-            )
+            cost_usd_raw = _pos_cost_usd(current_pos)
             if cost_usd_raw is not None:
                 total_val = f"${cost_usd_raw:,.2f}"
             else:
@@ -3277,6 +3413,17 @@ def fmt_match(
 # ==================== Telegram ====================
 
 
+async def _safe_edit(query, text: str, **kwargs) -> bool:
+    """edit_message_text that treats BadRequest (stale message, unchanged
+    content, message too old) as a soft failure. Returns True on success so
+    callers can fall back to sending a fresh message when needed."""
+    try:
+        await query.edit_message_text(text, **kwargs)
+        return True
+    except BadRequest:
+        return False
+
+
 def _start_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
@@ -3324,7 +3471,7 @@ async def _fetch_positions_with_markets(session, addr):
     if positions is None or isinstance(positions, RateLimited):
         return None, {}
     market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
-    markets = {mid: await fetch_market(session, mid) for mid in market_ids}
+    markets = await _fetch_markets(session, market_ids)
     for p in positions:
         p["_market"] = markets.get(p.get("marketId"), {})
     return positions, {pos_key(p): p for p in positions}
@@ -3427,21 +3574,14 @@ async def _render_orders(
         # /market/{uuid} links that 404. Backfill with the cached
         # /v1/markets/{id} payload so title + slug line up with the page the
         # user actually traded.
+        match_market_ids = {
+            _match_market_view(m).get("id") for m in matches or []
+        }
+        fresh_markets = await _fetch_markets(session, match_market_ids)
         for m in matches or []:
-            view = _match_market_view(m)
-            mid = view.get("id")
-            fresh = await fetch_market(session, mid) if mid else {}
-            merged = {**view, **(fresh or {})}
-            # Prefer the parent question from /v1/markets/{id}; keep the
-            # per-trade label as _sub_title for the secondary line.
-            if view.get("_sub_title"):
-                merged["_sub_title"] = view["_sub_title"]
-            if not merged.get("title") and view.get("title"):
-                merged["title"] = view["title"]
-            if view.get("slug"):
-                merged["slug"] = view["slug"]
-            if merged:
-                m["market"] = merged
+            _backfill_match_market(
+                m, fresh_markets.get(_match_market_view(m).get("id"))
+            )
 
     if matches is None and positions is None:
         return t(chat_id, "fetch_error_msg"), None
@@ -3680,12 +3820,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # duplicates or invalid addresses) fall through to the regular flow.
     existing_lower = {a.lower() for a in watched[chat_id]}
     has_new = any(_is_addr(a) and a.lower() not in existing_lower for a, _ in pairs)
-    if (
-        has_new
-        and len(watched[chat_id]) >= limit
-        and not is_admin(chat_id)
-        and not is_whitelisted(chat_id)
-    ):
+    if has_new and _watch_quota_exceeded(chat_id):
         await update.message.reply_text(
             watch_limit_message(chat_id),
             parse_mode="HTML",
@@ -3697,6 +3832,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     added = 0
     skipped = 0
+    fetch_failed = 0
     quota_dropped = 0
     last_addr = ""
     last_count = 0
@@ -3712,26 +3848,26 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # Per-add cap check (handles batches that straddle the limit).
             # Admin/whitelisted chats are exempt; everyone else stops at
             # `limit` total entries and we report the dropped count below.
-            if (
-                len(watched[chat_id]) >= limit
-                and not is_admin(chat_id)
-                and not is_whitelisted(chat_id)
-            ):
+            if _watch_quota_exceeded(chat_id):
                 quota_dropped += 1
                 continue
 
-            positions = await fetch_positions(session, addr)
-            matches = await fetch_order_matches(session, addr, first=30)
+            positions, matches = await asyncio.gather(
+                fetch_positions(session, addr),
+                fetch_order_matches(session, addr, first=30),
+            )
             if isinstance(positions, RateLimited):
                 positions = None
             if isinstance(matches, RateLimited):
                 matches = None
-            if positions is None and matches is None:
-                # Treat as skipped — can't establish a snapshot reliably.
-                skipped += 1
+            if positions is None or matches is None:
+                # Refuse to add unless BOTH snapshots were established. A
+                # missing matches snapshot (e.g. a 429 while batch-adding)
+                # used to store an empty set — and the next poll would then
+                # replay the wallet's entire visible fill history as "new"
+                # trade cards. Same story for positions and phantom 新开仓.
+                fetch_failed += 1
                 continue
-            positions = positions or []
-            matches = matches or []
 
             snapshot = {pos_key(p): pos_size(p) for p in positions}
             title_cache = {pos_key(p): _title_cache_entry(p) for p in positions}
@@ -3765,7 +3901,9 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             contact=UPGRADE_CONTACT,
         )
     elif multi_mode:
-        final_text = t(chat_id, "watching_multi", added=added, skipped=skipped)
+        final_text = t(
+            chat_id, "watching_multi", added=added, skipped=skipped + fetch_failed
+        )
     elif added == 1:
         final_text = t(
             chat_id,
@@ -3774,6 +3912,10 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             count=last_count,
             interval=POLL_INTERVAL,
         )
+    elif fetch_failed and added == 0:
+        # Couldn't establish the snapshots — tell the user to retry instead
+        # of pretending the address is already watched or invalid.
+        final_text = t(chat_id, "fetch_error_msg")
     elif skipped == 1 and added == 0 and _is_addr(first_addr):
         final_text = t(chat_id, "already_watching", addr=fmt_addr(first_addr))
     else:
@@ -5107,12 +5249,10 @@ async def _show_chatdef_picker(
 ):
     body = _chatdef_body(chat_id)
     markup = _chatdef_keyboard(chat_id)
-    if query is not None:
-        try:
-            await query.edit_message_text(body, parse_mode="HTML", reply_markup=markup)
-            return
-        except BadRequest:
-            pass
+    if query is not None and await _safe_edit(
+        query, body, parse_mode="HTML", reply_markup=markup
+    ):
+        return
     await ctx.bot.send_message(
         chat_id=chat_id, text=body, parse_mode="HTML", reply_markup=markup
     )
@@ -5129,23 +5269,16 @@ async def _show_minfill_picker(
     target = watched.get(chat_id, {}).get(addr)
     if not target:
         if query is not None:
-            try:
-                await query.edit_message_text(t(chat_id, "not_found"))
-            except BadRequest:
-                pass
+            await _safe_edit(query, t(chat_id, "not_found"))
         elif update is not None and update.message is not None:
             await update.message.reply_text(t(chat_id, "not_found"))
         return
     body = _minfill_body(chat_id, addr, target)
     markup = _minfill_keyboard(chat_id, addr, target)
-    if query is not None:
-        try:
-            await query.edit_message_text(
-                body, parse_mode="HTML", reply_markup=markup
-            )
-            return
-        except BadRequest:
-            pass
+    if query is not None and await _safe_edit(
+        query, body, parse_mode="HTML", reply_markup=markup
+    ):
+        return
     if update is not None and update.message is not None:
         await update.message.reply_text(
             body, parse_mode="HTML", reply_markup=markup
@@ -5271,7 +5404,7 @@ def _find_outcome_index(
         market_id, _, idx_str = k.rpartition("_")
         if not market_id:
             continue
-        market = market_cache.get(market_id) or {}
+        market = _market_cache_get(market_id, allow_stale=True) or {}
         outcomes = market.get("outcomes") or market.get("outcomeNames") or []
         try:
             idx = int(idx_str)
@@ -5285,7 +5418,7 @@ def _find_outcome_index(
     # Second pass: any outcome in market_cache for any of the user's markets.
     for k in w.position_snapshot.keys():
         market_id, _, _ = k.rpartition("_")
-        market = market_cache.get(market_id) or {}
+        market = _market_cache_get(market_id, allow_stale=True) or {}
         outcomes = market.get("outcomes") or market.get("outcomeNames") or []
         if isinstance(outcomes, list):
             for i, o in enumerate(outcomes):
@@ -5349,7 +5482,7 @@ async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     lines = [t(chat_id, "alerts_header", count=len(alerts))]
     for a in alerts:
-        market = market_cache.get(a["market_id"]) or {}
+        market = _market_cache_get(a["market_id"], allow_stale=True) or {}
         outcomes = market.get("outcomes") or market.get("outcomeNames") or []
         outcome_name = "?"
         try:
@@ -5529,25 +5662,24 @@ async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if addr.lower() in existing_lower:
                 skipped += 1
                 continue
-            if (
-                len(watched[chat_id]) >= limit
-                and not is_admin(chat_id)
-                and not is_whitelisted(chat_id)
-            ):
+            if _watch_quota_exceeded(chat_id):
                 quota_dropped += 1
                 continue
 
-            positions = await fetch_positions(session, addr)
-            matches = await fetch_order_matches(session, addr, first=30)
+            positions, matches = await asyncio.gather(
+                fetch_positions(session, addr),
+                fetch_order_matches(session, addr, first=30),
+            )
             if isinstance(positions, RateLimited):
                 positions = None
             if isinstance(matches, RateLimited):
                 matches = None
-            if positions is None and matches is None:
+            if positions is None or matches is None:
+                # Both snapshots must be established — a half-failed add
+                # replays historical fills / positions as "new" on the next
+                # poll (see cmd_watch).
                 skipped += 1
                 continue
-            positions = positions or []
-            matches = matches or []
             snapshot = {pos_key(p): pos_size(p) for p in positions}
             title_cache = {pos_key(p): _title_cache_entry(p) for p in positions}
             watched[chat_id][addr] = WatchedWallet(
@@ -5873,17 +6005,14 @@ async def _show_positions_via_callback(
     text, markup = await _render_positions(
         chat_id, addr, sort_key=sort_key, portfolio=portfolio, page=page
     )
-    if edit:
-        try:
-            await query.edit_message_text(
-                text,
-                parse_mode="HTML",
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-            return
-        except BadRequest:
-            pass
+    if edit and await _safe_edit(
+        query,
+        text,
+        parse_mode="HTML",
+        reply_markup=markup,
+        disable_web_page_preview=True,
+    ):
+        return
     await ctx.bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -5918,14 +6047,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lang = data.split("_")[1]
         chat_lang[chat_id] = lang
         save_chat_lang(chat_id, lang)
-        try:
-            await query.edit_message_text(
-                t(chat_id, "start") + "\n\n" + t(chat_id, "choose_lang"),
-                parse_mode="HTML",
-                reply_markup=_start_keyboard(chat_id),
-            )
-        except BadRequest:
-            pass
+        await _safe_edit(
+            query,
+            t(chat_id, "start") + "\n\n" + t(chat_id, "choose_lang"),
+            parse_mode="HTML",
+            reply_markup=_start_keyboard(chat_id),
+        )
         return
 
     # admin:wl[*] — admin-only whitelist panel (root, add prompt, remove).
@@ -5953,14 +6080,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=ForceReply(selective=True),
             )
             return
-        try:
-            await query.edit_message_text(
-                _format_whitelist_panel(chat_id),
-                parse_mode="HTML",
-                reply_markup=_whitelist_panel_keyboard(chat_id),
-                disable_web_page_preview=True,
-            )
-        except BadRequest:
+        if not await _safe_edit(
+            query,
+            _format_whitelist_panel(chat_id),
+            parse_mode="HTML",
+            reply_markup=_whitelist_panel_keyboard(chat_id),
+            disable_web_page_preview=True,
+        ):
             await ctx.bot.send_message(
                 chat_id=chat_id,
                 text=_format_whitelist_panel(chat_id),
@@ -5977,14 +6103,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         chat_notify[chat_id] = mode
         save_chat_notify(chat_id, mode)
-        try:
-            await query.edit_message_text(
-                _settings_body(chat_id),
-                parse_mode="HTML",
-                reply_markup=_settings_keyboard(chat_id),
-            )
-        except BadRequest:
-            pass
+        await _safe_edit(
+            query,
+            _settings_body(chat_id),
+            parse_mode="HTML",
+            reply_markup=_settings_keyboard(chat_id),
+        )
         return
 
     # pos:<addr> | refresh_pos:<addr>[:sort[:portfolio]] | sortpos:<addr>:<sort>:<portfolio>
@@ -6029,14 +6153,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, markup = await _render_orders(chat_id, addr, page=page)
         # B2: edit the existing message if the button came from an existing
         # orders view (page > 0 or tapping again). Fall back to sending new.
-        try:
-            await query.edit_message_text(
-                text,
-                parse_mode="HTML",
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-        except BadRequest:
+        if not await _safe_edit(
+            query,
+            text,
+            parse_mode="HTML",
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        ):
             await ctx.bot.send_message(
                 chat_id=chat_id,
                 text=text,
@@ -6063,16 +6186,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # the "removed last item on the last page" case.
         if watched.get(chat_id):
             text, markup = _render_list_page(chat_id, page)
-            try:
-                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
-            except BadRequest:
-                pass
+            await _safe_edit(query, text, parse_mode="HTML", reply_markup=markup)
         else:
             bulk_selection.pop(chat_id, None)
-            try:
-                await query.edit_message_text(t(chat_id, "no_watched_wallets"))
-            except BadRequest:
-                pass
+            await _safe_edit(query, t(chat_id, "no_watched_wallets"))
         return
 
     if data.startswith("togglemute:"):
@@ -6087,10 +6204,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             target.muted = not target.muted
             save_watch(target)
             text, markup = _render_list_page(chat_id, page)
-            try:
-                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
-            except BadRequest:
-                pass
+            await _safe_edit(query, text, parse_mode="HTML", reply_markup=markup)
         else:
             await ctx.bot.send_message(
                 chat_id=chat_id, text=t(chat_id, "note_not_found")
@@ -6107,10 +6221,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         select_mode = len(parts) > 2 and parts[2] == "s"
         text, markup = _render_list_page(chat_id, page, select_mode=select_mode)
-        try:
-            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
-        except BadRequest:
-            pass
+        await _safe_edit(query, text, parse_mode="HTML", reply_markup=markup)
         return
 
     if data == "listcopy":
@@ -6159,20 +6270,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             page = _page_arg(2)
             bulk_selection.setdefault(chat_id, set())
             text, markup = _render_list_page(chat_id, page, select_mode=True)
-            try:
-                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
-            except BadRequest:
-                pass
+            await _safe_edit(query, text, parse_mode="HTML", reply_markup=markup)
             return
 
         if action == "exit":
             page = _page_arg(2)
             bulk_selection.pop(chat_id, None)
             text, markup = _render_list_page(chat_id, page, select_mode=False)
-            try:
-                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
-            except BadRequest:
-                pass
+            await _safe_edit(query, text, parse_mode="HTML", reply_markup=markup)
             return
 
         if action == "tog":
@@ -6185,10 +6290,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 else:
                     sel.add(addr)
             text, markup = _render_list_page(chat_id, page, select_mode=True)
-            try:
-                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
-            except BadRequest:
-                pass
+            await _safe_edit(query, text, parse_mode="HTML", reply_markup=markup)
             return
 
         if action == "all":
@@ -6199,20 +6301,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sel = bulk_selection.setdefault(chat_id, set())
             sel.update(addr for addr, _ in chunk)
             text, markup = _render_list_page(chat_id, page, select_mode=True)
-            try:
-                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
-            except BadRequest:
-                pass
+            await _safe_edit(query, text, parse_mode="HTML", reply_markup=markup)
             return
 
         if action == "clear":
             page = _page_arg(2)
             bulk_selection[chat_id] = set()
             text, markup = _render_list_page(chat_id, page, select_mode=True)
-            try:
-                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
-            except BadRequest:
-                pass
+            await _safe_edit(query, text, parse_mode="HTML", reply_markup=markup)
             return
 
         if action == "del":
@@ -6242,17 +6338,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pass
             if watched.get(chat_id):
                 text, markup = _render_list_page(chat_id, page, select_mode=False)
-                try:
-                    await query.edit_message_text(
-                        text, parse_mode="HTML", reply_markup=markup
-                    )
-                except BadRequest:
-                    pass
+                await _safe_edit(query, text, parse_mode="HTML", reply_markup=markup)
             else:
-                try:
-                    await query.edit_message_text(t(chat_id, "no_watched_wallets"))
-                except BadRequest:
-                    pass
+                await _safe_edit(query, t(chat_id, "no_watched_wallets"))
             return
 
         return
@@ -6289,15 +6377,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if target and action == "ok" and new_note is not None:
             target.note = new_note
             save_watch(target)
-            try:
-                await query.edit_message_text(t(chat_id, "dup_watch_overwritten"))
-            except BadRequest:
-                pass
+            await _safe_edit(query, t(chat_id, "dup_watch_overwritten"))
         else:
-            try:
-                await query.edit_message_text(t(chat_id, "dup_watch_cancelled"))
-            except BadRequest:
-                pass
+            await _safe_edit(query, t(chat_id, "dup_watch_cancelled"))
         return
 
     if data == "watch_guide":
@@ -6333,11 +6415,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             _digest_apply(chat_id, minutes)
             text, markup = _digest_card(chat_id)
-            try:
-                await query.edit_message_text(
-                    text, parse_mode="HTML", reply_markup=markup
-                )
-            except BadRequest:
+            if not await _safe_edit(
+                query, text, parse_mode="HTML", reply_markup=markup
+            ):
                 await ctx.bot.send_message(
                     chat_id=chat_id,
                     text=text,
@@ -6353,10 +6433,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         addr = parts[2] if len(parts) > 2 else ""
         target = watched.get(chat_id, {}).get(addr)
         if not target:
-            try:
-                await query.edit_message_text(t(chat_id, "not_found"))
-            except BadRequest:
-                pass
+            await _safe_edit(query, t(chat_id, "not_found"))
             return
         if action == "open":
             await _show_minfill_picker(None, ctx, chat_id, addr, query=query)
@@ -6413,18 +6490,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         if action == "close":
-            try:
-                await query.edit_message_text(
-                    t(
-                        chat_id,
-                        "minfill_set",
-                        addr=fmt_addr(addr),
-                        usd=_effective_min_fill(target),
-                    ),
-                    parse_mode="HTML",
-                )
-            except BadRequest:
-                pass
+            await _safe_edit(
+                query,
+                t(
+                    chat_id,
+                    "minfill_set",
+                    addr=fmt_addr(addr),
+                    usd=_effective_min_fill(target),
+                ),
+                parse_mode="HTML",
+            )
             return
         return
 
@@ -6478,42 +6553,32 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         if action == "close":
-            try:
-                await query.edit_message_text(
-                    t(chat_id, "chatdef_saved"),
-                    parse_mode="HTML",
-                )
-            except BadRequest:
-                pass
+            await _safe_edit(query, t(chat_id, "chatdef_saved"), parse_mode="HTML")
             return
         return
 
     # /help browser callbacks.
     if data == "help_root":
-        try:
-            await query.edit_message_text(
-                t(chat_id, "help_title"),
-                parse_mode="HTML",
-                reply_markup=_help_root_markup(chat_id),
-                disable_web_page_preview=True,
-            )
-        except BadRequest:
-            pass
+        await _safe_edit(
+            query,
+            t(chat_id, "help_title"),
+            parse_mode="HTML",
+            reply_markup=_help_root_markup(chat_id),
+            disable_web_page_preview=True,
+        )
         return
 
     if data.startswith("help_cat:"):
         cat_id = data.split(":", 1)[1]
         if cat_id not in {cid for cid, _ in HELP_CATEGORIES}:
             return
-        try:
-            await query.edit_message_text(
-                _help_category_text(chat_id, cat_id),
-                parse_mode="HTML",
-                reply_markup=_help_category_markup(chat_id, cat_id),
-                disable_web_page_preview=True,
-            )
-        except BadRequest:
-            pass
+        await _safe_edit(
+            query,
+            _help_category_text(chat_id, cat_id),
+            parse_mode="HTML",
+            reply_markup=_help_category_markup(chat_id, cat_id),
+            disable_web_page_preview=True,
+        )
         return
 
     if data.startswith("help_cmd:"):
@@ -6524,15 +6589,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Safety net: if someone passes an unknown command, bounce back.
         if i18n_key not in I18N.get(get_lang(chat_id), {}) and i18n_key not in I18N["en"]:
             return
-        try:
-            await query.edit_message_text(
-                t(chat_id, i18n_key),
-                parse_mode="HTML",
-                reply_markup=_help_command_markup(chat_id, back_cat),
-                disable_web_page_preview=True,
-            )
-        except BadRequest:
-            pass
+        await _safe_edit(
+            query,
+            t(chat_id, i18n_key),
+            parse_mode="HTML",
+            reply_markup=_help_command_markup(chat_id, back_cat),
+            disable_web_page_preview=True,
+        )
         return
 
 
@@ -6564,12 +6627,12 @@ async def _evaluate_alerts(
     positions_by_key: dict,
     markets: dict,
 ):
-    """Check each stored price alert for this wallet; fire and delete matches."""
-    try:
-        alerts = list_alerts(chat_id, w.address)
-    except Exception as e:
-        logger.warning(f"list_alerts failed for {w.address}: {e}")
-        return
+    """Check each stored price alert for this wallet; fire and delete matches.
+
+    Reads come from the in-memory alerts mirror (free); only the delete after
+    a fired alert touches SQLite, off the event loop.
+    """
+    alerts = list_alerts(chat_id, w.address)
     if not alerts:
         return
 
@@ -6607,7 +6670,7 @@ async def _evaluate_alerts(
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
-            delete_alert(chat_id, a["id"])
+            await asyncio.to_thread(delete_alert, chat_id, a["id"])
         except Exception as e:
             logger.warning(f"alert send failed for {w.address}: {e}")
 
@@ -6764,12 +6827,7 @@ def _digest_feed(
         fresh = markets.get(market_id) if isinstance(markets, dict) else None
         link_market = {**market, **(fresh or {})}
         title = link_market.get("title") or link_market.get("question") or market.get("_sub_title") or ""
-        slug = (
-            link_market.get("slug")
-            or link_market.get("marketSlug")
-            or link_market.get("categorySlug")
-            or link_market.get("category_slug")
-        )
+        slug = _extract_slug(link_market)
 
         shares = _norm_amount_to_shares(m.get("amountFilled"))
         if shares is None:
@@ -6816,12 +6874,7 @@ def _digest_feed(
         fetched = p.get("_market") if isinstance(p.get("_market"), dict) else {}
         link_market = {**nested, **fetched}
         title, outcome_name, _, _ = display_fields(p, link_market)
-        slug = (
-            link_market.get("slug")
-            or link_market.get("marketSlug")
-            or link_market.get("categorySlug")
-            or link_market.get("category_slug")
-        )
+        slug = _extract_slug(link_market)
         e = _digest_entry_for(
             state, addr, note, market_id, outcome_index_int,
             title, outcome_name, slug,
@@ -6994,7 +7047,7 @@ async def digest_loop(app: Application):
                 if not state.entries:
                     if state.last_sent_ts <= 0:
                         state.last_sent_ts = now
-                        save_chat_digest(chat_id)
+                        await asyncio.to_thread(save_chat_digest, chat_id)
                     continue
                 window_s = (
                     now - state.last_sent_ts
@@ -7013,7 +7066,7 @@ async def digest_loop(app: Application):
                     logger.warning(f"Failed to send digest for chat {chat_id}: {send_err}")
                 state.entries = {}
                 state.last_sent_ts = now
-                save_chat_digest(chat_id)
+                await asyncio.to_thread(save_chat_digest, chat_id)
         except Exception as e:
             logger.exception(f"digest_loop iteration error: {e}")
         await asyncio.sleep(DIGEST_SWEEP_INTERVAL_S)
@@ -7025,542 +7078,636 @@ async def poll_loop(app: Application):
     sem = asyncio.Semaphore(POLL_CONCURRENCY)
 
     async with aiohttp.ClientSession() as session:
-        while True:
-            cycle_started = time.monotonic()
 
-            async def _poll_one(chat_id, addr, w):
-                async with sem:
+        async def _process_watcher(
+            chat_id: int,
+            w: WatchedWallet,
+            *,
+            rl_hit: bool,
+            rl_retry_after: float,
+            positions_ok: bool,
+            matches_ok: bool,
+            positions: list[dict],
+            matches: list[dict],
+            positions_by_key: dict,
+            markets: dict,
+            new_match_keys: set[str] | None,
+        ):
+            """Diff + notify one (chat, wallet) pair from the shared
+            per-address fetch (see _poll_address)."""
+            # Tracks whether any *persisted* field actually changed this
+            # cycle, so the tail of this function can skip no-op DB writes.
+            dirty = False
+
+            # 429 handling: apply exponential backoff (preferring the
+            # server's Retry-After hint) and emit a one-shot Telegram alert
+            # once we've been throttled twice in a row.
+            if rl_hit:
+                w.rate_limit_level += 1
+                backoff = (
+                    rl_retry_after
+                    if rl_retry_after > 0
+                    else min(30 * (2 ** (w.rate_limit_level - 1)), 300)
+                )
+                w.rate_limit_until = time.time() + backoff
+                if (
+                    w.rate_limit_level >= 2
+                    and not w.rate_limit_notified
+                    and not w.muted
+                ):
                     try:
-                        # The outer iteration uses a list() snapshot, so a
-                        # /unwatch (or bulk delete) that lands between two
-                        # polls would otherwise leave the snapshotted entry
-                        # alive long enough for save_watch() to resurrect
-                        # it in the DB — and a container restart would then
-                        # reload the "deleted" wallet on load_state. Bail
-                        # immediately if the user already removed it.
-                        if addr not in watched.get(chat_id, {}):
-                            return
-                        # Per-wallet interval gating: skip wallets whose
-                        # personal interval hasn't elapsed. 0 = use global.
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=t(
+                                chat_id,
+                                "rate_limited_alert",
+                                addr=fmt_addr(w.address),
+                                backoff=int(backoff),
+                            ),
+                            parse_mode="HTML",
+                        )
+                        w.rate_limit_notified = True
+                    except Exception as send_err:
+                        logger.warning(
+                            f"Failed to send rate_limited_alert for {w.address}: {send_err}"
+                        )
+
+            # B1 fix: count as failure if EITHER call failed.
+            # Reset only when BOTH succeed.
+            any_failed = not positions_ok or not matches_ok
+            all_failed = not positions_ok and not matches_ok
+
+            if any_failed:
+                w.fetch_errors += 1
+                if (
+                    w.fetch_errors >= ERROR_ALERT_THRESHOLD
+                    and not w.error_notified
+                    and not w.muted
+                ):
+                    try:
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=t(
+                                chat_id,
+                                "fetch_error_alert",
+                                count=w.fetch_errors,
+                                addr=fmt_addr(w.address),
+                            ),
+                            parse_mode="HTML",
+                        )
+                        w.error_notified = True
+                    except Exception as send_err:
+                        logger.warning(
+                            f"Failed to send fetch-error alert for {w.address}: {send_err}"
+                        )
+                if all_failed:
+                    # No data at all — can't meaningfully diff.
+                    return
+
+            # Both succeeded → recover state and notify if needed.
+            if not any_failed:
+                was_notified = w.error_notified
+                w.fetch_errors = 0
+                w.error_notified = False
+                if was_notified and not w.muted:
+                    try:
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=t(
+                                chat_id,
+                                "api_recovered",
+                                addr=fmt_addr(w.address),
+                            ),
+                            parse_mode="HTML",
+                        )
+                    except Exception as send_err:
+                        logger.warning(
+                            f"Failed to send api_recovered for {w.address}: {send_err}"
+                        )
+
+                # Clear rate-limit cooldown after a clean poll.
+                if w.rate_limit_level or w.rate_limit_until:
+                    rl_was_notified = w.rate_limit_notified
+                    w.rate_limit_level = 0
+                    w.rate_limit_until = 0
+                    w.rate_limit_notified = False
+                    if rl_was_notified and not w.muted:
+                        try:
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=t(
+                                    chat_id,
+                                    "rate_limit_recovered",
+                                    addr=fmt_addr(w.address),
+                                ),
+                                parse_mode="HTML",
+                            )
+                        except Exception as send_err:
+                            logger.warning(
+                                f"Failed to send rate_limit_recovered for {w.address}: {send_err}"
+                            )
+
+            # Only diff / refresh snapshots for endpoints that actually
+            # returned data. A transient 5xx on one call used to be coerced
+            # to [], which flagged every holding as "closed" and then
+            # re-announced them all as "new" on the next successful poll.
+            if positions_ok:
+                added, changed, closed = diff_positions(
+                    w.position_snapshot,
+                    positions,
+                    threshold_pct=w.change_threshold_pct,
+                )
+            else:
+                added, changed, closed = [], [], []
+
+            dust_fills: list[dict] = []
+            if matches_ok:
+                new_fills = [
+                    m for m in matches
+                    if match_key(m) not in w.order_match_snapshot
+                ]
+                # Freshness gate for fills (backstop): when the match
+                # snapshot lost track of history — a failed fetch when the
+                # watch was added, a lost DB row, long downtime — every
+                # historical fill in the API window suddenly looks "new"
+                # and would replay as fresh trade cards. Silently absorb
+                # fills older than STALE_TRADE_S into the snapshot instead
+                # of announcing them. Fills without a parseable timestamp
+                # are kept (never suppress on missing data).
+                if STALE_TRADE_S > 0 and new_fills:
+                    _fill_now = time.time()
+                    new_fills = [
+                        m for m in new_fills
+                        if (
+                            (_ts := _executed_ts(m)) is None
+                            or (_fill_now - _ts) <= STALE_TRADE_S
+                        )
+                    ]
+                # Dust filter: fills whose USD notional is below the
+                # effective floor fold into a single summary line instead
+                # of firing full cards. Lookup order is wallet → chat
+                # default → env fallback, via _effective_min_fill.
+                effective_min = _effective_min_fill(w)
+                if effective_min > 0 and new_fills:
+                    kept: list[dict] = []
+                    for m in new_fills:
+                        v = _fill_usd_value(m, w.address)
+                        if v is not None and v < effective_min:
+                            dust_fills.append(m)
+                        else:
+                            kept.append(m)
+                    new_fills = kept
+            else:
+                new_fills = []
+
+            # Markets that have a brand-new fill will already be
+            # fully described by the 订单成交 block (which now
+            # shows total holding + delta + PnL). Suppress the
+            # duplicate 持仓变化 entry for the same market+outcome
+            # to avoid two near-identical messages in a row.
+            # Dust fills count too: their position delta is tiny
+            # and already represented by the summary line.
+            fill_market_keys: set[str] = set()
+            for m in list(new_fills) + list(dust_fills):
+                k = _fill_market_outcome_key(m)
+                if k:
+                    fill_market_keys.add(k)
+
+            # Refresh the shares snapshot + the title cache. Hold onto
+            # old titles so "closed" notifications can show a real
+            # market name even though the position is gone now.
+            new_titles: dict[str, dict] = {
+                pos_key(p): _title_cache_entry(p, p.get("_market"))
+                for p in positions
+            }
+            old_titles = dict(w.position_titles)
+            # Preserve titles for keys that have disappeared this
+            # poll so we can still render their resolution notice.
+            merged_titles = {**old_titles, **new_titles}
+            if positions_ok:
+                new_snapshot = {pos_key(p): pos_size(p) for p in positions}
+                if (
+                    new_snapshot != w.position_snapshot
+                    or new_titles != w.position_titles
+                ):
+                    dirty = True
+                w.position_titles = new_titles
+                w.position_snapshot = new_snapshot
+            w.last_check = time.time()
+            display_addr = w.address
+            display_note = f" · {_html_escape(w.note)}" if w.note else ""
+
+            # --- Detect market resolutions (fires once per market) ---
+            resolutions = _detect_resolutions(
+                w, markets, merged_titles, positions_by_key
+            )
+            if resolutions:
+                dirty = True
+
+            blocks: list[str] = []  # For merged combined message.
+
+            changed_visible = [
+                (p, prev) for (p, prev) in changed
+                if pos_key(p) not in fill_market_keys
+            ]
+            added_visible = [
+                p for p in added
+                if pos_key(p) not in fill_market_keys
+            ]
+            # Map market+outcome → most recent fill so 新开仓 /
+            # 持仓变化 cards can surface the on-chain tx hash even
+            # when the fill itself wasn't emitted separately (e.g.
+            # suppressed as dust or already seen in a prior poll).
+            # ``matches`` arrives newest-first from the API, so the
+            # first entry per key is the freshest.
+            matches_by_key: dict[str, dict] = {}
+            for m in matches:
+                k = _fill_market_outcome_key(m)
+                if k and k not in matches_by_key:
+                    matches_by_key[k] = m
+
+            # Freshness gate: a position can show up in
+            # ``added``/``changed``/``closed`` without a
+            # corresponding fresh fill when the snapshot drifts
+            # (e.g. a missed initial fetch, a transient empty
+            # positions response, or a previously-closed
+            # position re-appearing). Those phantom entries
+            # were causing 新开仓 / 已平仓 cards for trades
+            # that actually happened a day or more ago — or in
+            # the close case, for positions that never
+            # actually closed but momentarily vanished from
+            # /v1/positions. If STALE_TRADE_S is enabled and
+            # the most recent on-chain fill for this
+            # market+outcome is older than that window (or
+            # absent entirely from the matches feed),
+            # suppress the card — the snapshot still gets
+            # refreshed below so we won't keep alerting on
+            # the same ghost.
+            if STALE_TRADE_S > 0 and matches_ok:
+                _now_ts = time.time()
+
+                def _is_fresh_key(k: str) -> bool:
+                    m = matches_by_key.get(k)
+                    if not m:
+                        return False
+                    ts = _executed_ts(m)
+                    if ts is None:
+                        return False
+                    return (_now_ts - ts) <= STALE_TRADE_S
+
+                def _is_fresh(p: dict) -> bool:
+                    return _is_fresh_key(pos_key(p))
+
+                added_visible = [p for p in added_visible if _is_fresh(p)]
+                changed_visible = [
+                    (p, prev) for (p, prev) in changed_visible
+                    if _is_fresh(p)
+                ]
+                closed = [k for k in closed if _is_fresh_key(k)]
+
+            if added_visible or changed_visible or closed:
+                parts = []
+                for p in added_visible:
+                    parts.append(
+                        fmt_pos(
+                            p,
+                            "added",
+                            chat_id,
+                            markets.get(p.get("marketId")),
+                            match=matches_by_key.get(pos_key(p)),
+                        )
+                    )
+                for p, prev_size in changed_visible:
+                    parts.append(
+                        fmt_pos(
+                            p,
+                            "changed",
+                            chat_id,
+                            markets.get(p.get("marketId")),
+                            prev_shares=prev_size,
+                            match=matches_by_key.get(pos_key(p)),
+                        )
+                    )
+                for k in closed:
+                    entry = merged_titles.get(k)
+                    if isinstance(entry, dict):
+                        title = entry.get("title") or t(
+                            chat_id, "close_fallback", key=k
+                        )
+                        outcome = entry.get("outcome") or ""
+                        slug = entry.get("slug")
+                        market_stub = (
+                            {"slug": slug} if slug else None
+                        )
+                        title_html = _title_html(title, market_stub)
+                    else:
+                        # Legacy cache entry (plain title string).
+                        title_html = _html_escape(
+                            entry
+                            or t(chat_id, "close_fallback", key=k)
+                        )
+                        outcome = ""
+                    closed_line = (
+                        f"{t(chat_id, 'fmt_closed')} <b>{title_html}</b>"
+                    )
+                    if outcome:
+                        closed_line += (
+                            f"\n✅ <b>{_html_escape(outcome)}</b>"
+                        )
+                    parts.append(closed_line)
+                block = t(chat_id, "poll_header", addr=display_addr, note=display_note) + "\n\n".join(parts[:8])
+                if len(parts) > 8:
+                    block += t(chat_id, "fmt_more", count=len(parts) - 8)
+                blocks.append(block)
+
+            # Dust-summary batching: when the effective dust
+            # interval is >0, defer this poll's dust fills into
+            # w.pending_dust_fills and only flush after the
+            # interval has elapsed since the batch window
+            # started. Effective value of 0 = flush every poll.
+            # Resolution (see _effective_dust_interval): wallet
+            # override → chat default → env DUST_INTERVAL.
+            # last_dust_flush==0 means "no active batch window";
+            # it's stamped when the first dust of a batch
+            # arrives and reset on flush.
+            effective_dust_interval = _effective_dust_interval(w)
+            dust_to_emit: list[dict] = []
+            if dust_fills:
+                if effective_dust_interval > 0:
+                    if not w.pending_dust_fills:
+                        w.last_dust_flush = time.time()
+                    w.pending_dust_fills.extend(dust_fills)
+                else:
+                    dust_to_emit.extend(dust_fills)
+            if w.pending_dust_fills:
+                if effective_dust_interval == 0:
+                    # Batching turned off while buffer was full —
+                    # drain immediately.
+                    dust_to_emit.extend(w.pending_dust_fills)
+                    w.pending_dust_fills = []
+                    w.last_dust_flush = 0
+                elif (time.time() - w.last_dust_flush) >= effective_dust_interval:
+                    dust_to_emit.extend(w.pending_dust_fills)
+                    w.pending_dust_fills = []
+                    w.last_dust_flush = 0
+
+            if new_fills or dust_to_emit:
+                merged_fills = consolidate_fills(new_fills, address=w.address) if new_fills else []
+                fill_lines = [
+                    fmt_match(m, chat_id, positions_by_key, address=w.address)
+                    for m in merged_fills[:5]
+                ]
+                if dust_to_emit:
+                    dust_total = sum(
+                        (v for m in dust_to_emit
+                         if (v := _fill_usd_value(m, w.address)) is not None),
+                        0.0,
+                    )
+                    fill_lines.append(
+                        t(
+                            chat_id,
+                            "dust_summary",
+                            count=len(dust_to_emit),
+                            usd=dust_total,
+                        )
+                    )
+                blocks.append(
+                    t(chat_id, "fills_header", addr=display_addr, note=display_note)
+                    + "\n\n".join(fill_lines)
+                )
+
+            if resolutions:
+                lines = []
+                for market, winning_idx, held_idx, title in resolutions:
+                    lines.append(
+                        fmt_resolution(chat_id, market, winning_idx, held_idx)
+                    )
+                blocks.append(
+                    t(chat_id, "poll_resolve_header", addr=display_addr, note=display_note)
+                    + "\n\n".join(lines)
+                )
+
+            # Tee the same events into the chat's digest buffer
+            # before sending. Independent of mute (digest is its
+            # own opt-in channel) and runs even when blocks is
+            # empty so an active digest window keeps anchoring.
+            try:
+                _digest_feed(
+                    chat_id,
+                    w,
+                    added_visible,
+                    changed_visible,
+                    closed,
+                    new_fills,
+                    dust_to_emit,
+                    resolutions,
+                    markets,
+                    merged_titles,
+                )
+            except Exception as feed_err:
+                logger.warning(
+                    f"digest feed error for {w.address} in chat {chat_id}: {feed_err}"
+                )
+
+            # Honor the chat's notification mode:
+            #   "split"  (default) — one Telegram message per
+            #            block (position changes / fills /
+            #            resolution).
+            #   "merged" — all blocks glued together with ───── so
+            #            one poll produces at most one message.
+            # In-block batching always applies: up to 5 fills per
+            # 订单成交 message, up to 8 position changes per 持仓变化
+            # message. This is about cross-block layout only.
+            if blocks and not w.muted:
+                mode = chat_notify.get(chat_id, "split")
+                if mode == "merged":
+                    outgoing = ["\n\n─────\n\n".join(blocks)]
+                else:
+                    outgoing = blocks
+                for msg in outgoing:
+                    try:
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=msg,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
+                        w.last_activity = time.time()
+                        dirty = True
+                    except Exception as send_err:
+                        logger.warning(
+                            f"Failed to send poll block for {w.address}: {send_err}"
+                        )
+
+            # Price-alert evaluation runs regardless of mute state
+            # (alerts are explicit user-configured; mute only
+            # silences auto-detected change/fill spam).
+            await _evaluate_alerts(app, chat_id, w, positions_by_key, markets)
+
+            if (
+                new_match_keys is not None
+                and new_match_keys != w.order_match_snapshot
+            ):
+                w.order_match_snapshot = set(new_match_keys)
+                dirty = True
+            # Persist only when something stored actually changed, plus a
+            # periodic checkpoint so last_check survives restarts without a
+            # full-table write every cycle. Re-check membership after all
+            # the awaits — a delete that arrived while we were talking to
+            # predict.fun must not be resurrected by this write.
+            if (
+                dirty
+                or (time.time() - w.last_saved) >= WATCH_PERSIST_INTERVAL_S
+            ) and w.address in watched.get(chat_id, {}):
+                await asyncio.to_thread(save_watch, w)
+
+        async def _poll_address(watchers: list[tuple[int, WatchedWallet]]):
+            """Fetch one address once per cycle and fan the shared result out
+            to every due (chat, wallet) watcher of that address — a wallet
+            watched by N chats used to cost N× the API calls."""
+            async with sem:
+                try:
+                    now = time.time()
+                    due: list[tuple[int, WatchedWallet]] = []
+                    for chat_id, w in watchers:
+                        # The cycle iterates a list() snapshot, so a /unwatch
+                        # (or bulk delete) that landed since must not be
+                        # polled — or resurrected by save_watch later.
+                        if w.address not in watched.get(chat_id, {}):
+                            continue
+                        # Per-wallet interval gating (0 = use global).
                         if (
                             w.poll_interval_s
-                            and (time.time() - w.last_check) < w.poll_interval_s
+                            and (now - w.last_check) < w.poll_interval_s
                         ):
-                            return
+                            continue
+                        # Rate-limit cooldown gate: skip until the backoff
+                        # window (set below on a 429) expires.
+                        if w.rate_limit_until and now < w.rate_limit_until:
+                            continue
+                        due.append((chat_id, w))
+                    if not due:
+                        return
 
-                        # Rate-limit cooldown gate: if the API recently 429'd
-                        # for this wallet, skip both calls until the backoff
-                        # window expires. The window is set when fetch_*
-                        # returns a RateLimited sentinel below.
-                        if w.rate_limit_until and time.time() < w.rate_limit_until:
-                            return
+                    address = due[0][1].address
+                    # Fan the two endpoints out in parallel — they're
+                    # independent reads keyed on the same wallet. Each helper
+                    # internally swallows exceptions and returns None.
+                    positions_raw, matches_raw = await asyncio.gather(
+                        fetch_positions(session, address),
+                        fetch_order_matches(session, address, first=20),
+                    )
 
-                        # Fan the two endpoints out in parallel — they're
-                        # independent reads keyed on the same wallet, so
-                        # serializing them just doubles the per-wallet RTT.
-                        # Each helper internally swallows exceptions and
-                        # returns None, so no need for return_exceptions.
-                        positions_raw, matches_raw = await asyncio.gather(
-                            fetch_positions(session, w.address),
-                            fetch_order_matches(session, w.address, first=20),
+                    rl_results = [
+                        r for r in (positions_raw, matches_raw)
+                        if isinstance(r, RateLimited)
+                    ]
+                    rl_hit = bool(rl_results)
+                    rl_retry_after = max(
+                        ((r.retry_after_s or 0) for r in rl_results),
+                        default=0.0,
+                    )
+                    # Coerce RateLimited → None so downstream diff/error
+                    # logic treats this as a failed fetch without trying to
+                    # iterate the sentinel.
+                    if isinstance(positions_raw, RateLimited):
+                        positions_raw = None
+                    if isinstance(matches_raw, RateLimited):
+                        matches_raw = None
+
+                    positions_ok = positions_raw is not None
+                    matches_ok = matches_raw is not None
+                    positions = positions_raw or []
+                    matches = matches_raw or []
+
+                    # Annotate positions/matches with their market payloads
+                    # exactly once — the dicts are shared by every watcher.
+                    market_ids = {
+                        p.get("marketId") for p in positions if p.get("marketId")
+                    }
+                    for m in matches:
+                        mid = _match_market_view(m).get("id")
+                        if mid:
+                            market_ids.add(mid)
+                    markets = await _fetch_markets(session, market_ids)
+                    for p in positions:
+                        p["_market"] = markets.get(p.get("marketId"), {})
+                    for m in matches:
+                        _backfill_match_market(
+                            m, markets.get(_match_market_view(m).get("id"))
                         )
+                    positions_by_key = {pos_key(p): p for p in positions}
+                    new_match_keys = (
+                        {match_key(m) for m in matches} if matches_ok else None
+                    )
 
-                        # 429 handling: extract Retry-After (preferring the
-                        # larger of the two endpoints' hints), apply
-                        # exponential backoff, and emit a one-shot Telegram
-                        # alert once we've been throttled twice in a row.
-                        rl_results = [
-                            r for r in (positions_raw, matches_raw)
-                            if isinstance(r, RateLimited)
-                        ]
-                        if rl_results:
-                            retry_after = max(
-                                (r.retry_after_s or 0) for r in rl_results
-                            )
-                            w.rate_limit_level += 1
-                            backoff = (
-                                retry_after
-                                if retry_after > 0
-                                else min(30 * (2 ** (w.rate_limit_level - 1)), 300)
-                            )
-                            w.rate_limit_until = time.time() + backoff
-                            if (
-                                w.rate_limit_level >= 2
-                                and not w.rate_limit_notified
-                                and not w.muted
-                            ):
-                                try:
-                                    await app.bot.send_message(
-                                        chat_id=chat_id,
-                                        text=t(
-                                            chat_id,
-                                            "rate_limited_alert",
-                                            addr=fmt_addr(w.address),
-                                            backoff=int(backoff),
-                                        ),
-                                        parse_mode="HTML",
-                                    )
-                                    w.rate_limit_notified = True
-                                except Exception as send_err:
-                                    logger.warning(
-                                        f"Failed to send rate_limited_alert for {addr}: {send_err}"
-                                    )
-                            # Coerce RateLimited → None so downstream
-                            # diff/error logic treats this as a failed fetch
-                            # without trying to iterate the sentinel.
-                            if isinstance(positions_raw, RateLimited):
-                                positions_raw = None
-                            if isinstance(matches_raw, RateLimited):
-                                matches_raw = None
-
-                        # B1 fix: count as failure if EITHER call failed.
-                        # Reset only when BOTH succeed.
-                        any_failed = positions_raw is None or matches_raw is None
-                        all_failed = positions_raw is None and matches_raw is None
-
-                        if any_failed:
-                            w.fetch_errors += 1
-                            if (
-                                w.fetch_errors >= ERROR_ALERT_THRESHOLD
-                                and not w.error_notified
-                                and not w.muted
-                            ):
-                                try:
-                                    await app.bot.send_message(
-                                        chat_id=chat_id,
-                                        text=t(
-                                            chat_id,
-                                            "fetch_error_alert",
-                                            count=w.fetch_errors,
-                                            addr=fmt_addr(w.address),
-                                        ),
-                                        parse_mode="HTML",
-                                    )
-                                    w.error_notified = True
-                                except Exception as send_err:
-                                    logger.warning(
-                                        f"Failed to send fetch-error alert for {addr}: {send_err}"
-                                    )
-                            if all_failed:
-                                # No data at all — can't meaningfully diff.
-                                return
-
-                        # Both succeeded → recover state and notify if needed.
-                        if not any_failed:
-                            was_notified = w.error_notified
-                            w.fetch_errors = 0
-                            w.error_notified = False
-                            if was_notified and not w.muted:
-                                try:
-                                    await app.bot.send_message(
-                                        chat_id=chat_id,
-                                        text=t(
-                                            chat_id,
-                                            "api_recovered",
-                                            addr=fmt_addr(w.address),
-                                        ),
-                                        parse_mode="HTML",
-                                    )
-                                except Exception as send_err:
-                                    logger.warning(
-                                        f"Failed to send api_recovered for {addr}: {send_err}"
-                                    )
-
-                            # Clear rate-limit cooldown after a clean poll.
-                            if w.rate_limit_level or w.rate_limit_until:
-                                rl_was_notified = w.rate_limit_notified
-                                w.rate_limit_level = 0
-                                w.rate_limit_until = 0
-                                w.rate_limit_notified = False
-                                if rl_was_notified and not w.muted:
-                                    try:
-                                        await app.bot.send_message(
-                                            chat_id=chat_id,
-                                            text=t(
-                                                chat_id,
-                                                "rate_limit_recovered",
-                                                addr=fmt_addr(w.address),
-                                            ),
-                                            parse_mode="HTML",
-                                        )
-                                    except Exception as send_err:
-                                        logger.warning(
-                                            f"Failed to send rate_limit_recovered for {addr}: {send_err}"
-                                        )
-
-                        # Only diff / refresh snapshots for endpoints that
-                        # actually returned data. A transient 5xx on one call
-                        # used to be coerced to [], which flagged every
-                        # holding as "closed" and then re-announced them all
-                        # as "new" on the next successful poll.
-                        positions_ok = positions_raw is not None
-                        matches_ok = matches_raw is not None
-                        positions = positions_raw or []
-                        matches = matches_raw or []
-                        market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
-                        for m in matches:
-                            mid = _match_market_view(m).get("id")
-                            if mid:
-                                market_ids.add(mid)
-                        markets = {mid: await fetch_market(session, mid) for mid in market_ids}
-                        for p in positions:
-                            p["_market"] = markets.get(p.get("marketId"), {})
-                        for m in matches:
-                            view = _match_market_view(m)
-                            fresh = markets.get(view.get("id")) or {}
-                            # Fold both the flat match fields and the cached
-                            # /v1/markets/{id} payload into match["market"] so
-                            # downstream helpers (title, slug, URL) see the
-                            # richest possible dict regardless of which API
-                            # shape the upstream returned.
-                            merged = {**view, **fresh}
-                            # Prefer the parent question from /v1/markets/{id}
-                            # for the main title (e.g. "Metamask FDV above ___
-                            # one day after launch?") so users see the full
-                            # context. The per-trade label (e.g. "$700M") is
-                            # preserved as _sub_title for the secondary line.
-                            if view.get("_sub_title"):
-                                merged["_sub_title"] = view["_sub_title"]
-                            if not merged.get("title") and view.get("title"):
-                                merged["title"] = view["title"]
-                            if view.get("slug"):
-                                merged["slug"] = view["slug"]
-                            if merged:
-                                m["market"] = merged
-                        positions_by_key = {pos_key(p): p for p in positions}
-
-                        if positions_ok:
-                            added, changed, closed = diff_positions(
-                                w.position_snapshot,
-                                positions,
-                                threshold_pct=w.change_threshold_pct,
-                            )
-                        else:
-                            added, changed, closed = [], [], []
-
-                        dust_fills: list[dict] = []
-                        if matches_ok:
-                            new_match_keys = {match_key(m) for m in matches}
-                            new_fills = [
-                                m for m in matches
-                                if match_key(m) not in w.order_match_snapshot
-                            ]
-                            # Dust filter: fills whose USD notional is below
-                            # the effective floor fold into a single summary
-                            # line instead of firing full cards. Lookup order
-                            # is wallet → chat default → env fallback, via
-                            # _effective_min_fill.
-                            effective_min = _effective_min_fill(w)
-                            if effective_min > 0 and new_fills:
-                                kept: list[dict] = []
-                                for m in new_fills:
-                                    v = _fill_usd_value(m, w.address)
-                                    if v is not None and v < effective_min:
-                                        dust_fills.append(m)
-                                    else:
-                                        kept.append(m)
-                                new_fills = kept
-                        else:
-                            new_match_keys = None
-                            new_fills = []
-
-                        # Markets that have a brand-new fill will already be
-                        # fully described by the 订单成交 block (which now
-                        # shows total holding + delta + PnL). Suppress the
-                        # duplicate 持仓变化 entry for the same market+outcome
-                        # to avoid two near-identical messages in a row.
-                        # Dust fills count too: their position delta is tiny
-                        # and already represented by the summary line.
-                        fill_market_keys: set[str] = set()
-                        for m in list(new_fills) + list(dust_fills):
-                            k = _fill_market_outcome_key(m)
-                            if k:
-                                fill_market_keys.add(k)
-
-                        # Refresh the shares snapshot + the title cache. Hold onto
-                        # old titles so "closed" notifications can show a real
-                        # market name even though the position is gone now.
-                        new_titles: dict[str, dict] = {
-                            pos_key(p): _title_cache_entry(p, p.get("_market"))
-                            for p in positions
-                        }
-                        old_titles = dict(w.position_titles)
-                        # Preserve titles for keys that have disappeared this
-                        # poll so we can still render their resolution notice.
-                        merged_titles = {**old_titles, **new_titles}
-                        if positions_ok:
-                            w.position_titles = new_titles
-                            w.position_snapshot = {pos_key(p): pos_size(p) for p in positions}
-                        w.last_check = time.time()
-                        display_addr = w.address
-                        display_note = f" · {_html_escape(w.note)}" if w.note else ""
-
-                        # --- Detect market resolutions (fires once per market) ---
-                        resolutions = _detect_resolutions(
-                            w, markets, merged_titles, positions_by_key
-                        )
-
-                        blocks: list[str] = []  # For merged combined message.
-
-                        changed_visible = [
-                            (p, prev) for (p, prev) in changed
-                            if pos_key(p) not in fill_market_keys
-                        ]
-                        added_visible = [
-                            p for p in added
-                            if pos_key(p) not in fill_market_keys
-                        ]
-                        # Map market+outcome → most recent fill so 新开仓 /
-                        # 持仓变化 cards can surface the on-chain tx hash even
-                        # when the fill itself wasn't emitted separately (e.g.
-                        # suppressed as dust or already seen in a prior poll).
-                        # ``matches`` arrives newest-first from the API, so the
-                        # first entry per key is the freshest.
-                        matches_by_key: dict[str, dict] = {}
-                        for m in matches:
-                            k = _fill_market_outcome_key(m)
-                            if k and k not in matches_by_key:
-                                matches_by_key[k] = m
-
-                        # Freshness gate: a position can show up in
-                        # ``added``/``changed``/``closed`` without a
-                        # corresponding fresh fill when the snapshot drifts
-                        # (e.g. a missed initial fetch, a transient empty
-                        # positions response, or a previously-closed
-                        # position re-appearing). Those phantom entries
-                        # were causing 新开仓 / 已平仓 cards for trades
-                        # that actually happened a day or more ago — or in
-                        # the close case, for positions that never
-                        # actually closed but momentarily vanished from
-                        # /v1/positions. If STALE_TRADE_S is enabled and
-                        # the most recent on-chain fill for this
-                        # market+outcome is older than that window (or
-                        # absent entirely from the matches feed),
-                        # suppress the card — the snapshot still gets
-                        # refreshed below so we won't keep alerting on
-                        # the same ghost.
-                        if STALE_TRADE_S > 0 and matches_ok:
-                            _now_ts = time.time()
-
-                            def _is_fresh_key(k: str) -> bool:
-                                m = matches_by_key.get(k)
-                                if not m:
-                                    return False
-                                ts = _executed_ts(m)
-                                if ts is None:
-                                    return False
-                                return (_now_ts - ts) <= STALE_TRADE_S
-
-                            def _is_fresh(p: dict) -> bool:
-                                return _is_fresh_key(pos_key(p))
-
-                            added_visible = [p for p in added_visible if _is_fresh(p)]
-                            changed_visible = [
-                                (p, prev) for (p, prev) in changed_visible
-                                if _is_fresh(p)
-                            ]
-                            closed = [k for k in closed if _is_fresh_key(k)]
-
-                        if added_visible or changed_visible or closed:
-                            parts = []
-                            for p in added_visible:
-                                parts.append(
-                                    fmt_pos(
-                                        p,
-                                        "added",
-                                        chat_id,
-                                        markets.get(p.get("marketId")),
-                                        match=matches_by_key.get(pos_key(p)),
-                                    )
-                                )
-                            for p, prev_size in changed_visible:
-                                parts.append(
-                                    fmt_pos(
-                                        p,
-                                        "changed",
-                                        chat_id,
-                                        markets.get(p.get("marketId")),
-                                        prev_shares=prev_size,
-                                        match=matches_by_key.get(pos_key(p)),
-                                    )
-                                )
-                            for k in closed:
-                                entry = merged_titles.get(k)
-                                if isinstance(entry, dict):
-                                    title = entry.get("title") or t(
-                                        chat_id, "close_fallback", key=k
-                                    )
-                                    outcome = entry.get("outcome") or ""
-                                    slug = entry.get("slug")
-                                    market_stub = (
-                                        {"slug": slug} if slug else None
-                                    )
-                                    title_html = _title_html(title, market_stub)
-                                else:
-                                    # Legacy cache entry (plain title string).
-                                    title_html = _html_escape(
-                                        entry
-                                        or t(chat_id, "close_fallback", key=k)
-                                    )
-                                    outcome = ""
-                                closed_line = (
-                                    f"{t(chat_id, 'fmt_closed')} <b>{title_html}</b>"
-                                )
-                                if outcome:
-                                    closed_line += (
-                                        f"\n✅ <b>{_html_escape(outcome)}</b>"
-                                    )
-                                parts.append(closed_line)
-                            block = t(chat_id, "poll_header", addr=display_addr, note=display_note) + "\n\n".join(parts[:8])
-                            if len(parts) > 8:
-                                block += t(chat_id, "fmt_more", count=len(parts) - 8)
-                            blocks.append(block)
-
-                        # Dust-summary batching: when the effective dust
-                        # interval is >0, defer this poll's dust fills into
-                        # w.pending_dust_fills and only flush after the
-                        # interval has elapsed since the batch window
-                        # started. Effective value of 0 = flush every poll.
-                        # Resolution (see _effective_dust_interval): wallet
-                        # override → chat default → env DUST_INTERVAL.
-                        # last_dust_flush==0 means "no active batch window";
-                        # it's stamped when the first dust of a batch
-                        # arrives and reset on flush.
-                        effective_dust_interval = _effective_dust_interval(w)
-                        dust_to_emit: list[dict] = []
-                        if dust_fills:
-                            if effective_dust_interval > 0:
-                                if not w.pending_dust_fills:
-                                    w.last_dust_flush = time.time()
-                                w.pending_dust_fills.extend(dust_fills)
-                            else:
-                                dust_to_emit.extend(dust_fills)
-                        if w.pending_dust_fills:
-                            if effective_dust_interval == 0:
-                                # Batching turned off while buffer was full —
-                                # drain immediately.
-                                dust_to_emit.extend(w.pending_dust_fills)
-                                w.pending_dust_fills = []
-                                w.last_dust_flush = 0
-                            elif (time.time() - w.last_dust_flush) >= effective_dust_interval:
-                                dust_to_emit.extend(w.pending_dust_fills)
-                                w.pending_dust_fills = []
-                                w.last_dust_flush = 0
-
-                        if new_fills or dust_to_emit:
-                            merged_fills = consolidate_fills(new_fills, address=w.address) if new_fills else []
-                            fill_lines = [
-                                fmt_match(m, chat_id, positions_by_key, address=w.address)
-                                for m in merged_fills[:5]
-                            ]
-                            if dust_to_emit:
-                                dust_total = sum(
-                                    (v for m in dust_to_emit
-                                     if (v := _fill_usd_value(m, w.address)) is not None),
-                                    0.0,
-                                )
-                                fill_lines.append(
-                                    t(
-                                        chat_id,
-                                        "dust_summary",
-                                        count=len(dust_to_emit),
-                                        usd=dust_total,
-                                    )
-                                )
-                            blocks.append(
-                                t(chat_id, "fills_header", addr=display_addr, note=display_note)
-                                + "\n\n".join(fill_lines)
-                            )
-
-                        if resolutions:
-                            lines = []
-                            for market, winning_idx, held_idx, title in resolutions:
-                                lines.append(
-                                    fmt_resolution(chat_id, market, winning_idx, held_idx)
-                                )
-                            blocks.append(
-                                t(chat_id, "poll_resolve_header", addr=display_addr, note=display_note)
-                                + "\n\n".join(lines)
-                            )
-
-                        # Tee the same events into the chat's digest buffer
-                        # before sending. Independent of mute (digest is its
-                        # own opt-in channel) and runs even when blocks is
-                        # empty so an active digest window keeps anchoring.
+                    for chat_id, w in due:
                         try:
-                            _digest_feed(
+                            await _process_watcher(
                                 chat_id,
                                 w,
-                                added_visible,
-                                changed_visible,
-                                closed,
-                                new_fills,
-                                dust_to_emit,
-                                resolutions,
-                                markets,
-                                merged_titles,
+                                rl_hit=rl_hit,
+                                rl_retry_after=rl_retry_after,
+                                positions_ok=positions_ok,
+                                matches_ok=matches_ok,
+                                positions=positions,
+                                matches=matches,
+                                positions_by_key=positions_by_key,
+                                markets=markets,
+                                new_match_keys=new_match_keys,
                             )
-                        except Exception as feed_err:
-                            logger.warning(
-                                f"digest feed error for {w.address} in chat {chat_id}: {feed_err}"
+                        except Exception as e:
+                            logger.error(
+                                f"Poll error {w.address} (chat {chat_id}): {e}"
                             )
+                except Exception as e:
+                    addr0 = watchers[0][1].address if watchers else "?"
+                    logger.error(f"Poll error {addr0}: {e}")
 
-                        # Honor the chat's notification mode:
-                        #   "split"  (default) — one Telegram message per
-                        #            block (position changes / fills /
-                        #            resolution).
-                        #   "merged" — all blocks glued together with ───── so
-                        #            one poll produces at most one message.
-                        # In-block batching always applies: up to 5 fills per
-                        # 订单成交 message, up to 8 position changes per 持仓变化
-                        # message. This is about cross-block layout only.
-                        if blocks and not w.muted:
-                            mode = chat_notify.get(chat_id, "split")
-                            if mode == "merged":
-                                outgoing = ["\n\n─────\n\n".join(blocks)]
-                            else:
-                                outgoing = blocks
-                            for msg in outgoing:
-                                try:
-                                    await app.bot.send_message(
-                                        chat_id=chat_id,
-                                        text=msg,
-                                        parse_mode="HTML",
-                                        disable_web_page_preview=True,
-                                    )
-                                    w.last_activity = time.time()
-                                except Exception as send_err:
-                                    logger.warning(
-                                        f"Failed to send poll block for {addr}: {send_err}"
-                                    )
+        while True:
+            try:
+                cycle_started = time.monotonic()
+                # Group watchers by address so a wallet watched by N chats
+                # is fetched once per cycle instead of N times.
+                groups: dict[str, list[tuple[int, WatchedWallet]]] = {}
+                for chat_id, wallets in list(watched.items()):
+                    for addr, w in list(wallets.items()):
+                        groups.setdefault(addr.lower(), []).append((chat_id, w))
 
-                        # Price-alert evaluation runs regardless of mute state
-                        # (alerts are explicit user-configured; mute only
-                        # silences auto-detected change/fill spam).
-                        await _evaluate_alerts(app, chat_id, w, positions_by_key, markets)
+                tasks = [_poll_address(group) for group in groups.values()]
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
-                        if new_match_keys is not None:
-                            w.order_match_snapshot = set(list(new_match_keys)[:100])
-                        # Re-check after all the awaits — a delete that
-                        # arrived while we were talking to predict.fun
-                        # must not be overwritten by this snapshot.
-                        if addr in watched.get(chat_id, {}):
-                            save_watch(w)
-                    except Exception as e:
-                        logger.error(f"Poll error {addr}: {e}")
-
-            tasks = [
-                _poll_one(chat_id, addr, w)
-                for chat_id, wallets in list(watched.items())
-                for addr, w in list(wallets.items())
-            ]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-            elapsed = time.monotonic() - cycle_started
-            await asyncio.sleep(max(0.0, POLL_INTERVAL - elapsed))
+                elapsed = time.monotonic() - cycle_started
+                sleep_s = max(0.0, POLL_INTERVAL - elapsed)
+            except Exception as e:
+                # Never let a cycle-level failure kill the loop — polling
+                # silently stopping is worse than one skipped cycle.
+                logger.exception(f"poll_loop cycle error: {e}")
+                sleep_s = POLL_INTERVAL
+            await asyncio.sleep(sleep_s)
 
 # ==================== Main ====================
+
+# Strong references to the background loops. asyncio only keeps weak
+# references to tasks, so without this set a running loop can be garbage
+# collected mid-flight; the done callback also surfaces a crashed loop in
+# the logs instead of the bot silently going quiet.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.error("Background task %s died: %r", name, t.exception())
+
+    task.add_done_callback(_done)
+    return task
+
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     """Last-resort handler for exceptions raised inside other handlers.
@@ -7574,8 +7721,11 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_shutdown(app: Application):
-    """Close the shared command-side aiohttp session on a clean shutdown."""
+    """Stop background loops and close the shared command-side aiohttp
+    session on a clean shutdown."""
     global _http_session
+    for task in list(_background_tasks):
+        task.cancel()
     if _http_session is not None and not _http_session.closed:
         await _http_session.close()
         _http_session = None
@@ -7647,8 +7797,8 @@ async def on_startup(app: Application):
             logger.warning(
                 "Skipping admin scope commands for %s: %s", ADMIN_CHAT_ID, e
             )
-    asyncio.create_task(poll_loop(app))
-    asyncio.create_task(digest_loop(app))
+    _spawn_background(poll_loop(app), "poll_loop")
+    _spawn_background(digest_loop(app), "digest_loop")
 
 
 def main():
