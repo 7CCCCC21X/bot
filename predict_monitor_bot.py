@@ -3832,6 +3832,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     added = 0
     skipped = 0
+    fetch_failed = 0
     quota_dropped = 0
     last_addr = ""
     last_count = 0
@@ -3859,12 +3860,14 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 positions = None
             if isinstance(matches, RateLimited):
                 matches = None
-            if positions is None and matches is None:
-                # Treat as skipped — can't establish a snapshot reliably.
-                skipped += 1
+            if positions is None or matches is None:
+                # Refuse to add unless BOTH snapshots were established. A
+                # missing matches snapshot (e.g. a 429 while batch-adding)
+                # used to store an empty set — and the next poll would then
+                # replay the wallet's entire visible fill history as "new"
+                # trade cards. Same story for positions and phantom 新开仓.
+                fetch_failed += 1
                 continue
-            positions = positions or []
-            matches = matches or []
 
             snapshot = {pos_key(p): pos_size(p) for p in positions}
             title_cache = {pos_key(p): _title_cache_entry(p) for p in positions}
@@ -3898,7 +3901,9 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             contact=UPGRADE_CONTACT,
         )
     elif multi_mode:
-        final_text = t(chat_id, "watching_multi", added=added, skipped=skipped)
+        final_text = t(
+            chat_id, "watching_multi", added=added, skipped=skipped + fetch_failed
+        )
     elif added == 1:
         final_text = t(
             chat_id,
@@ -3907,6 +3912,10 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             count=last_count,
             interval=POLL_INTERVAL,
         )
+    elif fetch_failed and added == 0:
+        # Couldn't establish the snapshots — tell the user to retry instead
+        # of pretending the address is already watched or invalid.
+        final_text = t(chat_id, "fetch_error_msg")
     elif skipped == 1 and added == 0 and _is_addr(first_addr):
         final_text = t(chat_id, "already_watching", addr=fmt_addr(first_addr))
     else:
@@ -5665,11 +5674,12 @@ async def cmd_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 positions = None
             if isinstance(matches, RateLimited):
                 matches = None
-            if positions is None and matches is None:
+            if positions is None or matches is None:
+                # Both snapshots must be established — a half-failed add
+                # replays historical fills / positions as "new" on the next
+                # poll (see cmd_watch).
                 skipped += 1
                 continue
-            positions = positions or []
-            matches = matches or []
             snapshot = {pos_key(p): pos_size(p) for p in positions}
             title_cache = {pos_key(p): _title_cache_entry(p) for p in positions}
             watched[chat_id][addr] = WatchedWallet(
@@ -7216,6 +7226,23 @@ async def poll_loop(app: Application):
                     m for m in matches
                     if match_key(m) not in w.order_match_snapshot
                 ]
+                # Freshness gate for fills (backstop): when the match
+                # snapshot lost track of history — a failed fetch when the
+                # watch was added, a lost DB row, long downtime — every
+                # historical fill in the API window suddenly looks "new"
+                # and would replay as fresh trade cards. Silently absorb
+                # fills older than STALE_TRADE_S into the snapshot instead
+                # of announcing them. Fills without a parseable timestamp
+                # are kept (never suppress on missing data).
+                if STALE_TRADE_S > 0 and new_fills:
+                    _fill_now = time.time()
+                    new_fills = [
+                        m for m in new_fills
+                        if (
+                            (_ts := _executed_ts(m)) is None
+                            or (_fill_now - _ts) <= STALE_TRADE_S
+                        )
+                    ]
                 # Dust filter: fills whose USD notional is below the
                 # effective floor fold into a single summary line instead
                 # of firing full cards. Lookup order is wallet → chat
