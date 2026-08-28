@@ -7110,27 +7110,14 @@ async def poll_loop(app: Application):
                     else min(30 * (2 ** (w.rate_limit_level - 1)), 300)
                 )
                 w.rate_limit_until = time.time() + backoff
-                if (
-                    w.rate_limit_level >= 2
-                    and not w.rate_limit_notified
-                    and not w.muted
-                ):
-                    try:
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=t(
-                                chat_id,
-                                "rate_limited_alert",
-                                addr=fmt_addr(w.address),
-                                backoff=int(backoff),
-                            ),
-                            parse_mode="HTML",
-                        )
-                        w.rate_limit_notified = True
-                    except Exception as send_err:
-                        logger.warning(
-                            f"Failed to send rate_limited_alert for {w.address}: {send_err}"
-                        )
+                # Rate-limit alerts are intentionally silent: backoff still
+                # applies, but no Telegram message is sent (they were too
+                # noisy when many wallets throttled at once).
+                if w.rate_limit_level >= 2:
+                    logger.info(
+                        f"Rate-limited {w.address} (level {w.rate_limit_level}), "
+                        f"backing off {int(backoff)}s"
+                    )
 
             # B1 fix: count as failure if EITHER call failed.
             # Reset only when BOTH succeed.
@@ -7185,27 +7172,12 @@ async def poll_loop(app: Application):
                             f"Failed to send api_recovered for {w.address}: {send_err}"
                         )
 
-                # Clear rate-limit cooldown after a clean poll.
+                # Clear rate-limit cooldown after a clean poll (silently —
+                # recovery messages were as noisy as the alerts themselves).
                 if w.rate_limit_level or w.rate_limit_until:
-                    rl_was_notified = w.rate_limit_notified
                     w.rate_limit_level = 0
                     w.rate_limit_until = 0
                     w.rate_limit_notified = False
-                    if rl_was_notified and not w.muted:
-                        try:
-                            await app.bot.send_message(
-                                chat_id=chat_id,
-                                text=t(
-                                    chat_id,
-                                    "rate_limit_recovered",
-                                    addr=fmt_addr(w.address),
-                                ),
-                                parse_mode="HTML",
-                            )
-                        except Exception as send_err:
-                            logger.warning(
-                                f"Failed to send rate_limit_recovered for {w.address}: {send_err}"
-                            )
 
             # Only diff / refresh snapshots for endpoints that actually
             # returned data. A transient 5xx on one call used to be coerced
