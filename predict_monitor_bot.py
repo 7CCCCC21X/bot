@@ -7126,51 +7126,23 @@ async def poll_loop(app: Application):
 
             if any_failed:
                 w.fetch_errors += 1
-                if (
-                    w.fetch_errors >= ERROR_ALERT_THRESHOLD
-                    and not w.error_notified
-                    and not w.muted
-                ):
-                    try:
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=t(
-                                chat_id,
-                                "fetch_error_alert",
-                                count=w.fetch_errors,
-                                addr=fmt_addr(w.address),
-                            ),
-                            parse_mode="HTML",
-                        )
-                        w.error_notified = True
-                    except Exception as send_err:
-                        logger.warning(
-                            f"Failed to send fetch-error alert for {w.address}: {send_err}"
-                        )
+                # Fetch-error alerts are intentionally silent, like the
+                # rate-limit ones: with many wallets an API outage flooded
+                # chats. Failures are only logged; polling retries as before.
+                if w.fetch_errors >= ERROR_ALERT_THRESHOLD and not w.error_notified:
+                    w.error_notified = True
+                    logger.warning(
+                        f"Failed to reach Predict.fun API {w.fetch_errors}x "
+                        f"for {w.address}; retrying silently"
+                    )
                 if all_failed:
                     # No data at all — can't meaningfully diff.
                     return
 
-            # Both succeeded → recover state and notify if needed.
+            # Both succeeded → recover state (silently).
             if not any_failed:
-                was_notified = w.error_notified
                 w.fetch_errors = 0
                 w.error_notified = False
-                if was_notified and not w.muted:
-                    try:
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=t(
-                                chat_id,
-                                "api_recovered",
-                                addr=fmt_addr(w.address),
-                            ),
-                            parse_mode="HTML",
-                        )
-                    except Exception as send_err:
-                        logger.warning(
-                            f"Failed to send api_recovered for {w.address}: {send_err}"
-                        )
 
                 # Clear rate-limit cooldown after a clean poll (silently —
                 # recovery messages were as noisy as the alerts themselves).
