@@ -250,6 +250,12 @@ class WatchedWallet:
     # logic keeps old fills out of the queue.
     pending_dust_fills: list = field(default_factory=list)
     last_dust_flush: float = 0
+    # Transient 已平仓 debounce map: pos_key → epoch second of the first poll
+    # where the position was missing from /v1/positions. A close card only
+    # fires once the key stays missing on the *next* poll too; a reappearance
+    # in between cancels the pending close silently. Not persisted — after a
+    # restart a real close simply takes one extra poll to confirm.
+    pending_closed: dict = field(default_factory=dict)
     # Wall-clock of the last successful save_watch persist (transient). Lets
     # the poll loop skip no-change DB writes while still checkpointing
     # last_check every WATCH_PERSIST_INTERVAL_S.
@@ -7225,6 +7231,10 @@ async def poll_loop(app: Application):
                 for p in positions
             }
             old_titles = dict(w.position_titles)
+            # Keep the pre-refresh snapshot around: the 已平仓 debounce below
+            # needs the old share count to re-seed a deferred key so a
+            # one-poll API flicker doesn't fire phantom close/open cards.
+            old_snapshot = dict(w.position_snapshot)
             # Preserve titles for keys that have disappeared this
             # poll so we can still render their resolution notice.
             merged_titles = {**old_titles, **new_titles}
@@ -7287,27 +7297,68 @@ async def poll_loop(app: Application):
             # suppress the card — the snapshot still gets
             # refreshed below so we won't keep alerting on
             # the same ghost.
+            _now_ts = time.time()
+
+            def _is_fresh_key(k: str) -> bool:
+                m = matches_by_key.get(k)
+                if not m:
+                    return False
+                ts = _executed_ts(m)
+                if ts is None:
+                    return False
+                return (_now_ts - ts) <= STALE_TRADE_S
+
+            def _is_fresh(p: dict) -> bool:
+                return _is_fresh_key(pos_key(p))
+
             if STALE_TRADE_S > 0 and matches_ok:
-                _now_ts = time.time()
-
-                def _is_fresh_key(k: str) -> bool:
-                    m = matches_by_key.get(k)
-                    if not m:
-                        return False
-                    ts = _executed_ts(m)
-                    if ts is None:
-                        return False
-                    return (_now_ts - ts) <= STALE_TRADE_S
-
-                def _is_fresh(p: dict) -> bool:
-                    return _is_fresh_key(pos_key(p))
-
                 added_visible = [p for p in added_visible if _is_fresh(p)]
                 changed_visible = [
                     (p, prev) for (p, prev) in changed_visible
                     if _is_fresh(p)
                 ]
-                closed = [k for k in closed if _is_fresh_key(k)]
+
+            # 已平仓 debounce: /v1/positions occasionally drops a live
+            # position for a single poll (indexing lag, cursor flakiness),
+            # which used to fire a phantom 已平仓 followed by a duplicate
+            # 新开仓 when it came back. Defer the first miss — keep the key
+            # in the snapshot and title cache so a reappearance next poll
+            # is a silent no-op — and only announce once the key has been
+            # missing on two consecutive polls.
+            if positions_ok:
+                for k in list(w.pending_closed):
+                    if k in new_snapshot:
+                        # Position came back — the "close" was a flicker.
+                        del w.pending_closed[k]
+                confirmed_closed: list[str] = []
+                for k in closed:
+                    if w.pending_closed.pop(k, None) is not None:
+                        confirmed_closed.append(k)
+                    else:
+                        w.pending_closed[k] = _now_ts
+                        if k in old_snapshot:
+                            w.position_snapshot[k] = old_snapshot[k]
+                        if k in old_titles:
+                            w.position_titles[k] = old_titles[k]
+                closed = confirmed_closed
+
+            if STALE_TRADE_S > 0 and matches_ok and closed:
+
+                def _closed_by_recent_sell(k: str) -> bool:
+                    # Only a recent *sell* fill justifies a close card: a
+                    # recent buy means the position was just opened, so its
+                    # disappearance is an API flicker, not a close (this was
+                    # letting phantom 已平仓 through for brand-new positions,
+                    # whose opening buy passed the plain freshness check).
+                    # With no recent fill at all the "close" is a stale ghost.
+                    if not _is_fresh_key(k):
+                        return False
+                    our_side = _pick_user_side(
+                        matches_by_key.get(k) or {}, w.address
+                    )
+                    return (our_side.get("quoteType") or "").lower() != "bid"
+
+                closed = [k for k in closed if _closed_by_recent_sell(k)]
 
             if added_visible or changed_visible or closed:
                 parts = []
