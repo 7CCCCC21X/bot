@@ -116,6 +116,17 @@ except ValueError:
     STALE_TRADE_S = 3600
 if STALE_TRADE_S < 0:
     STALE_TRADE_S = 0
+# Position-diff cards (新开仓 / 持仓变化 / 已平仓) are derived from snapshot
+# diffs of /v1/positions, which lag and flicker; next to the on-chain 订单成交
+# (buy/sell) cards they proved noisy and duplicative, so they are disabled by
+# default — only fill notifications (plus resolution notices) are sent. Set
+# POSITION_CARDS=1 to re-enable the legacy position-diff notifications; the
+# snapshot bookkeeping itself always runs so flipping the flag needs no
+# migration.
+POSITION_CARDS = (
+    os.environ.get("POSITION_CARDS", "0").strip().lower()
+    in ("1", "true", "yes", "on")
+)
 # predict.fun's positions endpoint paginates Relay-style (first/after with a
 # top-level ``cursor``) and caps each page well below a large wallet's full
 # holdings. We page through with a generous ``first`` and follow the cursor so
@@ -7360,7 +7371,9 @@ async def poll_loop(app: Application):
 
                 closed = [k for k in closed if _closed_by_recent_sell(k)]
 
-            if added_visible or changed_visible or closed:
+            if POSITION_CARDS and (
+                added_visible or changed_visible or closed
+            ):
                 parts = []
                 for p in added_visible:
                     parts.append(
@@ -7490,9 +7503,9 @@ async def poll_loop(app: Application):
                 _digest_feed(
                     chat_id,
                     w,
-                    added_visible,
-                    changed_visible,
-                    closed,
+                    added_visible if POSITION_CARDS else [],
+                    changed_visible if POSITION_CARDS else [],
+                    closed if POSITION_CARDS else [],
                     new_fills,
                     dust_to_emit,
                     resolutions,
