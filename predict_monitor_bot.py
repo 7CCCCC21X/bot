@@ -163,6 +163,16 @@ GUIDE_IMAGE_PATH = os.environ.get("GUIDE_IMAGE_PATH", os.path.join(os.path.dirna
 # How many consecutive polling failures before we alert the chat. We alert once
 # per error burst — the counter resets when a request succeeds.
 ERROR_ALERT_THRESHOLD = 5
+# Command-side fetches (/watch, /pos, /orders) retry a few times before giving
+# up so one timeout / 5xx doesn't bounce the user back to re-pasting the
+# address. The poll loop keeps its own failure counter and does not use this.
+CMD_FETCH_ATTEMPTS = 3
+CMD_FETCH_BACKOFF_S = (1.0, 2.0)
+# A 429 inside a command is only worth waiting out when the server asks for a
+# short pause; beyond this we surface the rate-limit message instead.
+CMD_FETCH_MAX_RETRY_AFTER_S = 5.0
+# Fallback wait we suggest in the rate-limit message when no Retry-After came.
+CMD_RATE_LIMIT_DEFAULT_WAIT_S = 15
 LIST_PAGE_SIZE = 8
 # The poll loop only writes a wallet row when its persisted state actually
 # changed; this interval forces a periodic checkpoint anyway so last_check
@@ -536,6 +546,12 @@ I18N = {
         "export_caption": "Your watch list ({count} wallets)",
         "fetch_error_alert": "⚠️ Failed to reach Predict.fun API {count}× for <code>{addr}</code>. Will keep retrying silently.",
         "fetch_error_msg": "⚠️ Predict.fun API is unavailable right now. Try again in a moment.",
+        "loading_retry": "⏳ Predict.fun is slow to respond, retrying ({n}/{total})…",
+        "watch_fetch_failed": "⚠️ Still couldn't reach the Predict.fun API after {n} attempts, so <code>{addr}</code> was not added.\nTap the button below to retry — no need to paste the address again.",
+        "watch_fetch_failed_multi": "⚠️ Added {added}, skipped {skipped}. {failed} address(es) could not be fetched after {n} attempts.\nTap the button below to retry just those.",
+        "watch_rate_limited": "🚦 Predict.fun is rate-limiting requests, so <code>{addr}</code> was not added.\nWait about {wait}s, then tap the button below to retry.",
+        "watch_in_progress": "⏳ <code>{addr}</code> is already being added — hang on, no need to resend it.",
+        "btn_retry_watch": "🔄 Retry",
         "rate_limited_alert": "🚦 Predict.fun rate-limited <code>{addr}</code>. Pausing {backoff}s; will auto-resume.",
         "rate_limit_recovered": "✅ Rate limit cleared for <code>{addr}</code>.",
         "relt_never": "never",
@@ -1066,6 +1082,12 @@ I18N = {
         "export_caption": "监控列表（{count} 个钱包）",
         "fetch_error_alert": "⚠️ 连续 {count} 次无法访问 Predict.fun API：<code>{addr}</code>。会继续静默重试。",
         "fetch_error_msg": "⚠️ Predict.fun API 暂时无响应，请稍后再试。",
+        "loading_retry": "⏳ Predict.fun 响应较慢，正在自动重试（{n}/{total}）…",
+        "watch_fetch_failed": "⚠️ 已自动重试 {n} 次仍无法连接 Predict.fun API，<code>{addr}</code> 暂未加入监控。\n点下方按钮即可重试，不用重新粘贴地址。",
+        "watch_fetch_failed_multi": "⚠️ 已添加 {added} 个，跳过 {skipped} 个；另有 {failed} 个地址重试 {n} 次后仍拉取失败。\n点下方按钮只重试失败的地址。",
+        "watch_rate_limited": "🚦 Predict.fun 正在限流，<code>{addr}</code> 暂未加入监控。\n请等约 {wait} 秒后点下方按钮重试。",
+        "watch_in_progress": "⏳ <code>{addr}</code> 正在添加中，请稍候，不用重复发送。",
+        "btn_retry_watch": "🔄 重试",
         "rate_limited_alert": "🚦 Predict.fun 限流：<code>{addr}</code>，暂停 {backoff} 秒后自动恢复。",
         "rate_limit_recovered": "✅ <code>{addr}</code> 限流已恢复。",
         "relt_never": "未执行",
@@ -2149,6 +2171,41 @@ async def fetch_order_matches(
         _record_api("matches", "other")
         logger.error(f"fetch_order_matches error: {e}")
         return None
+
+
+async def _fetch_with_retry(fn, *args, on_retry=None, **kwargs):
+    """Run a ``fetch_*`` helper up to ``CMD_FETCH_ATTEMPTS`` times.
+
+    Retries on ``None`` (timeout / 5xx / network error) with a short backoff,
+    and on ``RateLimited`` only when the server's Retry-After hint is short
+    enough to simply wait out. The last result is returned unchanged so
+    callers keep their existing ``None`` / ``RateLimited`` handling.
+
+    ``on_retry(attempt, total)`` is awaited before each retry so the caller
+    can tell the user we're still working instead of looking hung.
+    """
+    result = None
+    for attempt in range(CMD_FETCH_ATTEMPTS):
+        result = await fn(*args, **kwargs)
+        if result is not None and not isinstance(result, RateLimited):
+            return result
+        if attempt == CMD_FETCH_ATTEMPTS - 1:
+            break
+        if isinstance(result, RateLimited):
+            wait = result.retry_after_s
+            # No hint (or a long one): hammering again just burns quota.
+            if wait is None or wait > CMD_FETCH_MAX_RETRY_AFTER_S:
+                break
+            delay = max(wait, 0.5)
+        else:
+            delay = CMD_FETCH_BACKOFF_S[min(attempt, len(CMD_FETCH_BACKOFF_S) - 1)]
+        if on_retry is not None:
+            try:
+                await on_retry(attempt + 2, CMD_FETCH_ATTEMPTS)
+            except Exception:
+                pass
+        await asyncio.sleep(delay)
+    return result
 
 
 async def _speedtest_probe(
@@ -3484,7 +3541,7 @@ async def _fetch_positions_with_markets(session, addr):
     ``positions`` is ``None`` when the upstream call failed (vs ``[]`` for a
     wallet that legitimately has none).
     """
-    positions = await fetch_positions(session, addr)
+    positions = await _fetch_with_retry(fetch_positions, session, addr)
     if positions is None or isinstance(positions, RateLimited):
         return None, {}
     market_ids = {p.get("marketId") for p in positions if p.get("marketId")}
@@ -3581,7 +3638,9 @@ async def _render_orders(
     chat_id: int, addr: str, page: int = 0
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     async with _shared_session() as session:
-        matches = await fetch_order_matches(session, addr, first=ORDERS_FETCH_LIMIT)
+        matches = await _fetch_with_retry(
+            fetch_order_matches, session, addr, first=ORDERS_FETCH_LIMIT
+        )
         if isinstance(matches, RateLimited):
             matches = None
         positions, positions_by_key = await _fetch_positions_with_markets(session, addr)
@@ -3741,6 +3800,203 @@ def _parse_watch_pairs(text: str) -> list[tuple[str, str]]:
     return pairs
 
 
+# Addresses whose /watch snapshot fetch is currently running, per chat. Users
+# who see no reply for a couple of seconds tend to paste the address again;
+# without this guard every paste spawns another pair of API calls (and, when
+# the API is flaky, another error bubble — see the screenshot that prompted
+# this) and the duplicates can even race each other into the watch list.
+_watch_inflight: dict[int, set[str]] = {}
+
+
+def _is_wallet_addr(a: str) -> bool:
+    return a.startswith("0x") and len(a) == 42
+
+
+def _retry_watch_keyboard(chat_id: int, token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(t(chat_id, "btn_retry_watch"), callback_data=f"watchretry:{token}")]]
+    )
+
+
+async def _watch_add_pairs(
+    chat_id: int,
+    pairs: list[tuple[str, str]],
+    set_status,
+) -> dict:
+    """Fetch snapshots for each (address, note) pair and add the good ones.
+
+    Shared by /watch and the "🔄 Retry" button. ``set_status(text)`` is an
+    async callable that updates the user-facing progress message; it's
+    called on every automatic retry so the user knows the bot is still
+    working rather than hung.
+
+    Returns a dict of counters plus ``failed`` (the pairs whose snapshots
+    couldn't be established and are worth retrying) and ``rate_limited``
+    (the longest Retry-After seen, or None).
+    """
+    watched.setdefault(chat_id, {})
+    existing_lower = {a.lower() for a in watched[chat_id]}
+    inflight = _watch_inflight.setdefault(chat_id, set())
+    res = {
+        "added": 0,
+        "skipped": 0,
+        "in_progress": 0,
+        "quota_dropped": 0,
+        "last_addr": "",
+        "last_count": 0,
+        "failed": [],
+        "rate_limited": None,
+    }
+
+    async def _on_retry(attempt: int, total: int) -> None:
+        await set_status(t(chat_id, "loading_retry", n=attempt, total=total))
+
+    async with _shared_session() as session:
+        for addr, note in pairs:
+            if not _is_wallet_addr(addr):
+                res["skipped"] += 1
+                continue
+            key = addr.lower()
+            if key in existing_lower:
+                res["skipped"] += 1
+                continue
+            if key in inflight:
+                res["in_progress"] += 1
+                continue
+            # Per-add cap check (handles batches that straddle the limit).
+            # Admin/whitelisted chats are exempt; everyone else stops at
+            # `limit` total entries and we report the dropped count below.
+            if _watch_quota_exceeded(chat_id):
+                res["quota_dropped"] += 1
+                continue
+
+            inflight.add(key)
+            try:
+                positions, matches = await asyncio.gather(
+                    _fetch_with_retry(fetch_positions, session, addr, on_retry=_on_retry),
+                    _fetch_with_retry(
+                        fetch_order_matches, session, addr, first=30, on_retry=_on_retry
+                    ),
+                )
+            finally:
+                inflight.discard(key)
+            for r in (positions, matches):
+                if isinstance(r, RateLimited):
+                    wait = r.retry_after_s or CMD_RATE_LIMIT_DEFAULT_WAIT_S
+                    res["rate_limited"] = max(res["rate_limited"] or 0, wait)
+            if isinstance(positions, RateLimited):
+                positions = None
+            if isinstance(matches, RateLimited):
+                matches = None
+            if positions is None or matches is None:
+                # Refuse to add unless BOTH snapshots were established. A
+                # missing matches snapshot (e.g. a 429 while batch-adding)
+                # used to store an empty set — and the next poll would then
+                # replay the wallet's entire visible fill history as "new"
+                # trade cards. Same story for positions and phantom 新开仓.
+                res["failed"].append((addr, note))
+                continue
+
+            snapshot = {pos_key(p): pos_size(p) for p in positions}
+            title_cache = {pos_key(p): _title_cache_entry(p) for p in positions}
+            watched[chat_id][addr] = WatchedWallet(
+                address=addr,
+                chat_id=chat_id,
+                note=note,
+                position_snapshot=snapshot,
+                position_titles=title_cache,
+                order_match_snapshot={match_key(m) for m in matches},
+                last_check=time.time(),
+            )
+            save_watch(watched[chat_id][addr])
+            # Keep the running set in sync so a batch that lists the same
+            # address twice skips the duplicate without an O(n) rescan.
+            existing_lower.add(key)
+            res["added"] += 1
+            res["last_addr"] = addr
+            res["last_count"] = len(positions)
+    return res
+
+
+def _watch_result_message(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    pairs: list[tuple[str, str]],
+    res: dict,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Turn ``_watch_add_pairs`` counters into the final reply.
+
+    When some addresses failed to fetch, the reply carries a Retry button.
+    The failed (address, note) pairs are stashed in ``user_data`` under a
+    token (callback_data is capped at 64 bytes, so the note can't ride
+    along) and replayed by the ``watchretry:`` callback.
+    """
+    multi_mode = len(pairs) > 1
+    first_addr = pairs[0][0] if pairs else ""
+    added = res["added"]
+    skipped = res["skipped"]
+    failed = res["failed"]
+    markup = None
+
+    if failed:
+        token = failed[0][0]
+        ctx.user_data.setdefault("pending_watchretry", {})[token] = list(failed)
+        markup = _retry_watch_keyboard(chat_id, token)
+
+    if res["quota_dropped"]:
+        # Mid-batch cap hit: report partial progress + upgrade hint.
+        text = t(
+            chat_id,
+            "watch_limit_partial",
+            limit=watch_limit_for(chat_id),
+            added=added,
+            dropped=res["quota_dropped"],
+            code=INVITE_CODE,
+            link=INVITE_LINK,
+            contact=UPGRADE_CONTACT,
+        )
+    elif multi_mode and failed:
+        text = t(
+            chat_id,
+            "watch_fetch_failed_multi",
+            added=added,
+            skipped=skipped,
+            failed=len(failed),
+            n=CMD_FETCH_ATTEMPTS,
+        )
+    elif multi_mode:
+        text = t(chat_id, "watching_multi", added=added, skipped=skipped)
+    elif added == 1:
+        text = t(
+            chat_id,
+            "watching_ok",
+            addr=fmt_addr(res["last_addr"]),
+            count=res["last_count"],
+            interval=POLL_INTERVAL,
+        )
+    elif failed:
+        # Couldn't establish the snapshots — say so honestly (and how hard
+        # we tried) instead of pretending the address is watched or invalid,
+        # and hand the user a one-tap retry.
+        addr = fmt_addr(failed[0][0])
+        if res["rate_limited"] is not None:
+            text = t(
+                chat_id,
+                "watch_rate_limited",
+                addr=addr,
+                wait=int(round(res["rate_limited"])),
+            )
+        else:
+            text = t(chat_id, "watch_fetch_failed", addr=addr, n=CMD_FETCH_ATTEMPTS)
+    elif res["in_progress"] and added == 0 and _is_wallet_addr(first_addr):
+        text = t(chat_id, "watch_in_progress", addr=fmt_addr(first_addr))
+    elif skipped == 1 and added == 0 and _is_wallet_addr(first_addr):
+        text = t(chat_id, "already_watching", addr=fmt_addr(first_addr))
+    else:
+        text = t(chat_id, "invalid_address")
+    return text, markup
+
+
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
@@ -3757,9 +4013,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # input ("addr - note" per line) into a flat token stream, which used to
     # silently keep only the first address.
     pairs = _parse_watch_pairs(update.message.text or "")
-
-    def _is_addr(a: str) -> bool:
-        return a.startswith("0x") and len(a) == 42
+    _is_addr = _is_wallet_addr
 
     # Fallback for code paths that hand us ctx.args without a real message
     # body (callbacks, programmatic invocations).
@@ -3830,7 +4084,6 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     watched.setdefault(chat_id, {})
-    limit = watch_limit_for(chat_id)
     # Refuse early when the chat is already at the cap and the request would
     # add at least one fresh address — saves a /v1/positions round-trip and
     # lets the user see the upgrade hint immediately. Pure no-ops (only
@@ -3847,104 +4100,30 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     status = await update.message.reply_text(t(chat_id, "loading_positions"))
 
-    added = 0
-    skipped = 0
-    fetch_failed = 0
-    quota_dropped = 0
-    last_addr = ""
-    last_count = 0
+    async def _set_status(text: str) -> None:
+        try:
+            await status.edit_text(text)
+        except BadRequest:
+            # "message is not modified" when both fetches retry in the same
+            # round — harmless.
+            pass
 
-    async with _shared_session() as session:
-        for addr, note in pairs:
-            if not _is_addr(addr):
-                skipped += 1
-                continue
-            if addr.lower() in existing_lower:
-                skipped += 1
-                continue
-            # Per-add cap check (handles batches that straddle the limit).
-            # Admin/whitelisted chats are exempt; everyone else stops at
-            # `limit` total entries and we report the dropped count below.
-            if _watch_quota_exceeded(chat_id):
-                quota_dropped += 1
-                continue
-
-            positions, matches = await asyncio.gather(
-                fetch_positions(session, addr),
-                fetch_order_matches(session, addr, first=30),
-            )
-            if isinstance(positions, RateLimited):
-                positions = None
-            if isinstance(matches, RateLimited):
-                matches = None
-            if positions is None or matches is None:
-                # Refuse to add unless BOTH snapshots were established. A
-                # missing matches snapshot (e.g. a 429 while batch-adding)
-                # used to store an empty set — and the next poll would then
-                # replay the wallet's entire visible fill history as "new"
-                # trade cards. Same story for positions and phantom 新开仓.
-                fetch_failed += 1
-                continue
-
-            snapshot = {pos_key(p): pos_size(p) for p in positions}
-            title_cache = {pos_key(p): _title_cache_entry(p) for p in positions}
-            watched[chat_id][addr] = WatchedWallet(
-                address=addr,
-                chat_id=chat_id,
-                note=note,
-                position_snapshot=snapshot,
-                position_titles=title_cache,
-                order_match_snapshot={match_key(m) for m in matches},
-                last_check=time.time(),
-            )
-            save_watch(watched[chat_id][addr])
-            # Keep the running set in sync so a batch that lists the same
-            # address twice skips the duplicate without an O(n) rescan.
-            existing_lower.add(addr.lower())
-            added += 1
-            last_addr = addr
-            last_count = len(positions)
-
-    if quota_dropped:
-        # Mid-batch cap hit: report partial progress + upgrade hint.
-        final_text = t(
-            chat_id,
-            "watch_limit_partial",
-            limit=limit,
-            added=added,
-            dropped=quota_dropped,
-            code=INVITE_CODE,
-            link=INVITE_LINK,
-            contact=UPGRADE_CONTACT,
-        )
-    elif multi_mode:
-        final_text = t(
-            chat_id, "watching_multi", added=added, skipped=skipped + fetch_failed
-        )
-    elif added == 1:
-        final_text = t(
-            chat_id,
-            "watching_ok",
-            addr=fmt_addr(last_addr),
-            count=last_count,
-            interval=POLL_INTERVAL,
-        )
-    elif fetch_failed and added == 0:
-        # Couldn't establish the snapshots — tell the user to retry instead
-        # of pretending the address is already watched or invalid.
-        final_text = t(chat_id, "fetch_error_msg")
-    elif skipped == 1 and added == 0 and _is_addr(first_addr):
-        final_text = t(chat_id, "already_watching", addr=fmt_addr(first_addr))
-    else:
-        final_text = t(chat_id, "invalid_address")
+    res = await _watch_add_pairs(chat_id, pairs, _set_status)
+    final_text, markup = _watch_result_message(chat_id, ctx, pairs, res)
 
     try:
         await status.edit_text(
-            final_text, parse_mode="HTML", disable_web_page_preview=True
+            final_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=markup,
         )
     except BadRequest:
         await update.message.reply_text(
-            final_text, parse_mode="HTML", disable_web_page_preview=True
+            final_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=markup,
         )
 
 
@@ -6397,6 +6576,42 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _safe_edit(query, t(chat_id, "dup_watch_overwritten"))
         else:
             await _safe_edit(query, t(chat_id, "dup_watch_cancelled"))
+        return
+
+    # watchretry:<token> — the "🔄 Retry" button under a failed /watch. The
+    # failed (address, note) pairs live in user_data["pending_watchretry"];
+    # if that's gone (bot restarted) fall back to the bare address so the
+    # button still does something useful.
+    if data.startswith("watchretry:"):
+        token = data.split(":", 1)[1].strip()
+        pending = ctx.user_data.get("pending_watchretry", {})
+        pairs = pending.pop(token, None)
+        if not pairs:
+            if not _is_wallet_addr(token):
+                return
+            pairs = [(token, "")]
+        # Drop the button right away so a double-tap can't queue two runs.
+        await _safe_edit(query, t(chat_id, "loading_positions"))
+
+        async def _set_status(text: str) -> None:
+            await _safe_edit(query, text)
+
+        res = await _watch_add_pairs(chat_id, pairs, _set_status)
+        text, markup = _watch_result_message(chat_id, ctx, pairs, res)
+        if not await _safe_edit(
+            query,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=markup,
+        ):
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=markup,
+            )
         return
 
     if data == "watch_guide":
