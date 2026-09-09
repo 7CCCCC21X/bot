@@ -416,7 +416,7 @@ I18N = {
         "already_watching": "Already watching <code>{addr}</code>",
         "loading_positions": "Loading positions...",
         "watching_ok": "Watching <code>{addr}</code>\nPositions: {count}\nInterval: {interval}s",
-        "usage_unwatch": "Usage: /unwatch 0xAddress",
+        "usage_unwatch": "Usage: /unwatch 0xAddress — or reply to a wallet notification with /unwatch",
         "removed": "Removed <code>{addr}</code>",
         "not_found": "Not found",
         "no_watched_wallets": "No watched wallets",
@@ -769,7 +769,8 @@ I18N = {
             "Accepts either the raw address or its note (alias).\n\n"
             "<b>Usage</b>\n"
             "• <code>/unwatch 0x1234…abcd</code>\n"
-            "• <code>/unwatch alice</code>"
+            "• <code>/unwatch alice</code>\n"
+            "• Reply to a fill / position notification with <code>/unwatch</code>"
         ),
         "help_cmd_list": (
             "<b>/list</b> — Watched wallets\n\n"
@@ -955,7 +956,7 @@ I18N = {
         "already_watching": "已在监控 <code>{addr}</code>",
         "loading_positions": "正在加载持仓...",
         "watching_ok": "开始监控 <code>{addr}</code>\n持仓数：{count}\n轮询间隔：{interval} 秒",
-        "usage_unwatch": "用法：/unwatch 0x地址",
+        "usage_unwatch": "用法：/unwatch 0x地址，或直接回复某条订单/持仓消息发送 /unwatch",
         "removed": "已移除 <code>{addr}</code>",
         "not_found": "未找到该地址",
         "no_watched_wallets": "当前没有监控的钱包",
@@ -1299,7 +1300,8 @@ I18N = {
             "地址或备注都可以。\n\n"
             "<b>用法</b>\n"
             "• <code>/unwatch 0x1234…abcd</code>\n"
-            "• <code>/unwatch 张三</code>"
+            "• <code>/unwatch 张三</code>\n"
+            "• 直接回复某条订单成交/持仓消息，发送 <code>/unwatch</code>"
         ),
         "help_cmd_list": (
             "<b>/list</b> — 查看所有被监控的钱包\n\n"
@@ -3722,6 +3724,34 @@ _NOTE_SEP_CHARS = "-—–:：·｜|,，;；"
 _ADDR_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
 
+def _addr_from_reply(update: Update) -> str | None:
+    """Pull the first 0x… address out of the message the user replied to.
+
+    Lets commands like ``/unwatch`` work by simply replying to a fill /
+    position notification (whose header carries the full wallet address)
+    instead of retyping the address. Returns ``None`` when the command is
+    not a reply or the replied-to message carries no address.
+    """
+    msg = update.message
+    target = msg.reply_to_message if msg else None
+    if not target:
+        return None
+    for chunk in (target.text, target.caption):
+        if not chunk:
+            continue
+        m = _ADDR_RE.search(chunk)
+        if m:
+            return m.group(0)
+    # Fall back to link entities (e.g. the "view trade" URL carries the address).
+    for ent in list(target.entities or []) + list(target.caption_entities or []):
+        url = getattr(ent, "url", None)
+        if url:
+            m = _ADDR_RE.search(url)
+            if m:
+                return m.group(0)
+    return None
+
+
 def _parse_watch_pairs(text: str) -> list[tuple[str, str]]:
     """Parse /watch (or watch-reply) input into (address, note) pairs.
 
@@ -4130,11 +4160,14 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
-    if not ctx.args:
+    # Bare /unwatch sent as a reply to a fill / position notification: take
+    # the wallet address from the replied-to message.
+    arg = ctx.args[0] if ctx.args else _addr_from_reply(update)
+    if not arg:
         await update.message.reply_text(t(chat_id, "usage_unwatch"))
         return
 
-    addr = resolve_addr(chat_id, ctx.args[0])
+    addr = resolve_addr(chat_id, arg)
     if not addr or addr not in watched.get(chat_id, {}):
         await update.message.reply_text(t(chat_id, "not_found"))
         return
