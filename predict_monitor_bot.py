@@ -127,6 +127,37 @@ POSITION_CARDS = (
     os.environ.get("POSITION_CARDS", "0").strip().lower()
     in ("1", "true", "yes", "on")
 )
+# The fill feed (/v1/orders/matches) is what drives the buy/sell cards, so it
+# stays on the POLL_INTERVAL cadence. /v1/positions only feeds 已平仓
+# bookkeeping, price alerts and the (default-off) position-diff cards, and it
+# lags the chain anyway — so it is refreshed every POSITIONS_POLL_INTERVAL_S
+# seconds, plus immediately whenever a new fill shows up for the wallet,
+# instead of on every cycle. That removes roughly 40% of the bot's API
+# traffic without delaying fill alerts. With position cards enabled the
+# default drops back to 0 (every cycle) so the legacy cards stay responsive.
+try:
+    POSITIONS_POLL_INTERVAL_S = max(
+        0.0,
+        float(
+            os.environ.get(
+                "POSITIONS_POLL_INTERVAL_S", "0" if POSITION_CARDS else "12"
+            )
+            or 0
+        ),
+    )
+except ValueError:
+    POSITIONS_POLL_INTERVAL_S = 0.0 if POSITION_CARDS else 12.0
+# Adaptive throttle. When predict.fun reports the remaining per-minute quota
+# in rate-limit response headers, the poll loop pauses once the remaining
+# budget drops below this percentage of the window limit (until the window
+# resets) instead of running into 429s and per-wallet backoff. 0 disables
+# the pre-emptive pause; 429 handling stays in place regardless.
+try:
+    RL_MIN_REMAINING_PCT = max(
+        0.0, min(90.0, float(os.environ.get("RL_MIN_REMAINING_PCT", "10") or 10))
+    )
+except ValueError:
+    RL_MIN_REMAINING_PCT = 10.0
 # predict.fun's positions endpoint paginates Relay-style (first/after with a
 # top-level ``cursor``) and caps each page well below a large wallet's full
 # holdings. We page through with a generous ``first`` and follow the cursor so
@@ -335,8 +366,33 @@ watched: dict[int, dict[str, WatchedWallet]] = {}
 # are actually observed by the poll loop; resolved markets are terminal state
 # and stay cached until evicted by the size cap. Read via _market_cache_get.
 market_cache: dict[str, tuple[float, dict]] = {}
-MARKET_CACHE_TTL_S = 60.0
+# Title / slug / outcome names never change, and resolution transitions are
+# also visible in the nested ``market`` object /v1/positions returns (which
+# invalidates the cache entry early — see _invalidate_resolved_markets), so
+# the general TTL can be generous. Markets with an active price alert use the
+# shorter MARKET_CACHE_ALERT_TTL_S so mark prices stay fresh where a user
+# actually asked for them.
+try:
+    MARKET_CACHE_TTL_S = max(
+        5.0, float(os.environ.get("MARKET_CACHE_TTL_S", "300") or 300)
+    )
+except ValueError:
+    MARKET_CACHE_TTL_S = 300.0
+try:
+    MARKET_CACHE_ALERT_TTL_S = max(
+        5.0,
+        min(
+            MARKET_CACHE_TTL_S,
+            float(os.environ.get("MARKET_CACHE_ALERT_TTL_S", "60") or 60),
+        ),
+    )
+except ValueError:
+    MARKET_CACHE_ALERT_TTL_S = min(MARKET_CACHE_TTL_S, 60.0)
 MARKET_CACHE_MAX = 4000
+# Market ids that currently have at least one price alert; rebuilt by the
+# poll loop once per cycle from alerts_cache so _market_cache_get can pick
+# the short TTL without scanning every alert on every lookup.
+_alert_market_ids: set[str] = set()
 chat_lang: dict[int, str] = {}
 # Per-chat notification mode: "split" (default — one message per block) or
 # "merged" (legacy T13 — position changes + fills + resolution joined by
@@ -365,6 +421,7 @@ alerts_cache: dict[int, list[dict]] = {}
 api_stats: dict[str, deque] = {
     "positions": deque(maxlen=2000),
     "matches": deque(maxlen=2000),
+    "markets": deque(maxlen=2000),
 }
 NOTIFY_MODES = ("split", "merged")
 db_lock = threading.Lock()
@@ -1968,6 +2025,118 @@ def _record_api(endpoint: str, label: str) -> None:
         bucket.append((time.time(), label))
 
 
+# Snapshot of the most recent rate-limit headers predict.fun returned. The
+# header names are not documented, so a handful of common spellings are
+# accepted; the first response that carries any of them is logged once so
+# the actual names can be confirmed from the logs.
+rate_limit_state: dict = {
+    "limit": None,      # requests allowed per window
+    "remaining": None,  # requests left in the current window
+    "reset_at": None,   # epoch seconds when the window resets (if known)
+    "seen_at": 0.0,     # epoch seconds of the last response with headers
+    "logged": False,
+}
+_RL_LIMIT_HEADERS = ("x-ratelimit-limit", "ratelimit-limit", "x-rate-limit-limit")
+_RL_REMAINING_HEADERS = (
+    "x-ratelimit-remaining",
+    "ratelimit-remaining",
+    "x-rate-limit-remaining",
+)
+_RL_RESET_HEADERS = ("x-ratelimit-reset", "ratelimit-reset", "x-rate-limit-reset")
+
+
+def _first_header(headers, names) -> tuple[str | None, str | None]:
+    for name in names:
+        value = headers.get(name)
+        if value is not None and str(value).strip() != "":
+            return name, str(value).strip()
+    return None, None
+
+
+def _note_rate_limit_headers(headers) -> None:
+    """Record limit / remaining / reset from a response's rate-limit headers.
+
+    Tolerates the usual spellings and both "seconds until reset" and
+    "epoch seconds/ms" reset formats. A response without any such header is
+    ignored so a CDN error page can't wipe a good reading.
+    """
+    try:
+        _, limit_raw = _first_header(headers, _RL_LIMIT_HEADERS)
+        _, remaining_raw = _first_header(headers, _RL_REMAINING_HEADERS)
+        _, reset_raw = _first_header(headers, _RL_RESET_HEADERS)
+        if remaining_raw is None and limit_raw is None:
+            return
+        now = time.time()
+        st = rate_limit_state
+        if limit_raw is not None:
+            try:
+                st["limit"] = int(float(limit_raw))
+            except ValueError:
+                pass
+        if remaining_raw is not None:
+            try:
+                st["remaining"] = int(float(remaining_raw))
+            except ValueError:
+                pass
+        if reset_raw is not None:
+            reset_at: float | None = None
+            try:
+                v = float(reset_raw)
+                if v > 1e12:          # epoch milliseconds
+                    reset_at = v / 1000.0
+                elif v > 1e9:         # epoch seconds
+                    reset_at = v
+                else:                 # seconds until reset
+                    reset_at = now + v
+            except ValueError:
+                dt = _parse_retry_after(reset_raw)
+                if dt is not None:
+                    reset_at = now + dt
+            if reset_at is not None:
+                st["reset_at"] = reset_at
+        st["seen_at"] = now
+        if not st["logged"]:
+            st["logged"] = True
+            names = [
+                n for n in (
+                    _first_header(headers, _RL_LIMIT_HEADERS)[0],
+                    _first_header(headers, _RL_REMAINING_HEADERS)[0],
+                    _first_header(headers, _RL_RESET_HEADERS)[0],
+                ) if n
+            ]
+            logger.info(
+                "Rate-limit headers detected: %s (limit=%s remaining=%s)",
+                ", ".join(names), st["limit"], st["remaining"],
+            )
+    except Exception:
+        pass
+
+
+def _rate_limit_pause_s(now: float | None = None) -> float:
+    """Seconds the poll loop should wait before its next cycle so the API's
+    remaining quota isn't burned to zero. 0 when the budget is healthy, the
+    headers are unknown, or the last reading is stale."""
+    if RL_MIN_REMAINING_PCT <= 0:
+        return 0.0
+    st = rate_limit_state
+    limit, remaining = st.get("limit"), st.get("remaining")
+    if not limit or remaining is None:
+        return 0.0
+    now = time.time() if now is None else now
+    if now - float(st.get("seen_at") or 0.0) > 120:
+        return 0.0
+    if remaining >= limit * RL_MIN_REMAINING_PCT / 100.0:
+        return 0.0
+    reset_at = st.get("reset_at")
+    if reset_at is not None and reset_at > now:
+        wait = reset_at - now
+    else:
+        # Reset time unknown or already passed but remaining still low:
+        # a short breather is enough for a fresh reading to arrive.
+        wait = 5.0
+    return max(0.0, min(wait, 60.0))
+
+
 def _parse_retry_after(value: str | None) -> float | None:
     """Parse an HTTP Retry-After header value (seconds or HTTP-date)."""
     if not value:
@@ -2020,6 +2189,7 @@ async def fetch_positions(
                 headers=_headers(),
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
+                _note_rate_limit_headers(resp.headers)
                 if resp.status == 200:
                     _record_api("positions", "ok")
                     data = await resp.json()
@@ -2083,9 +2253,51 @@ def _market_cache_get(market_id: str, allow_stale: bool = False) -> dict | None:
     resolved, winning = market_resolution(data)
     if resolved and winning is not None:
         return data
-    if (time.time() - fetched_at) > MARKET_CACHE_TTL_S:
+    ttl = (
+        MARKET_CACHE_ALERT_TTL_S
+        if str(market_id) in _alert_market_ids
+        else MARKET_CACHE_TTL_S
+    )
+    if (time.time() - fetched_at) > ttl:
         return None
     return data
+
+
+def _refresh_alert_market_ids() -> None:
+    """Rebuild the set of market ids that have a live price alert (called
+    once per poll cycle) so those markets get the short cache TTL."""
+    ids: set[str] = set()
+    for alerts in alerts_cache.values():
+        for a in alerts:
+            mid = a.get("market_id")
+            if mid:
+                ids.add(str(mid))
+    _alert_market_ids.clear()
+    _alert_market_ids.update(ids)
+
+
+def _invalidate_resolved_markets(positions: list[dict]) -> None:
+    """/v1/positions embeds a ``market`` object per position. When that copy
+    says the market resolved but our cached /v1/markets/{id} payload still
+    says it's live, drop the cached entry so the next lookup refetches now
+    rather than waiting for the (long) TTL — keeps 市场已结算 notices prompt
+    even with a multi-minute market cache."""
+    for p in positions:
+        nested = p.get("market") if isinstance(p.get("market"), dict) else None
+        if not nested:
+            continue
+        mid = p.get("marketId") or nested.get("id")
+        if not mid:
+            continue
+        entry = market_cache.get(str(mid))
+        if not entry:
+            continue
+        nested_resolved, _ = market_resolution(nested)
+        if not nested_resolved:
+            continue
+        cached_resolved, cached_winning = market_resolution(entry[1])
+        if not (cached_resolved and cached_winning is not None):
+            market_cache.pop(str(mid), None)
 
 
 def _market_cache_put(market_id: str, data: dict) -> None:
@@ -2117,14 +2329,22 @@ async def fetch_market(session: aiohttp.ClientSession, market_id: str) -> dict:
                 headers=_headers(),
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
+                _note_rate_limit_headers(resp.headers)
                 if resp.status == 200:
+                    _record_api("markets", "ok")
                     data = await resp.json()
                     if data.get("success"):
                         payload = data.get("data", {}) or {}
                         _market_cache_put(market_id, payload)
                         return payload
+                elif resp.status == 429:
+                    _record_api("markets", "429")
+                else:
+                    _record_api("markets", "5xx" if resp.status >= 500 else "other")
+    except asyncio.TimeoutError:
+        _record_api("markets", "timeout")
     except Exception:
-        pass
+        _record_api("markets", "other")
 
     # Refetch failed — serve the stale copy (better than dropping titles and
     # slugs from every card) or an empty dict when we never had one.
@@ -2161,6 +2381,7 @@ async def fetch_order_matches(
             headers=_headers(),
             timeout=aiohttp.ClientTimeout(total=12),
         ) as resp:
+            _note_rate_limit_headers(resp.headers)
             if resp.status == 200:
                 _record_api("matches", "ok")
                 data = await resp.json()
@@ -4825,7 +5046,7 @@ async def cmd_apistatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     labels = ("ok", "429", "5xx", "timeout", "other")
 
     lines = [f"API stats (last {window_s // 60} min, rolling)"]
-    for endpoint in ("positions", "matches"):
+    for endpoint in ("positions", "matches", "markets"):
         bucket = api_stats.get(endpoint) or ()
         counts = {lbl: 0 for lbl in labels}
         for ts, lbl in bucket:
@@ -4842,6 +5063,30 @@ async def cmd_apistatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if w.rate_limit_until and w.rate_limit_until > now:
                 throttled.append((w.rate_limit_until - now, addr_, cid, w.rate_limit_level))
     throttled.sort()
+
+    lines.append("")
+    lines.append(
+        f"Cadence: fills every {POLL_INTERVAL}s · positions every "
+        f"{POSITIONS_POLL_INTERVAL_S or POLL_INTERVAL:g}s (+ on new fill) · "
+        f"market cache {MARKET_CACHE_TTL_S:g}s / {MARKET_CACHE_ALERT_TTL_S:g}s with alert"
+    )
+    st = rate_limit_state
+    if st.get("limit") and st.get("remaining") is not None:
+        age = int(now - float(st.get("seen_at") or 0.0))
+        reset_at = st.get("reset_at")
+        reset_txt = (
+            f", resets in {int(reset_at - now)}s"
+            if reset_at and reset_at > now
+            else ""
+        )
+        lines.append(
+            f"API quota: {st['remaining']}/{st['limit']} remaining "
+            f"({age}s ago{reset_txt}); pause below {RL_MIN_REMAINING_PCT:g}%"
+        )
+    else:
+        lines.append("API quota: no rate-limit headers seen yet")
+    watched_addrs = len(_addr_positions)
+    lines.append(f"Positions cache: {watched_addrs} wallets · markets cached: {len(market_cache)}")
 
     lines.append("")
     if throttled:
@@ -7350,9 +7595,27 @@ async def digest_loop(app: Application):
         await asyncio.sleep(DIGEST_SWEEP_INTERVAL_S)
 
 
+# Per-address poll state shared across cycles (keyed by lowercased address):
+#   _addr_positions   -> (fetched_at, positions list) from the last successful
+#                        /v1/positions fetch, reused on cycles where the
+#                        positions refresh isn't due.
+#   _addr_match_keys  -> match keys seen on the previous cycle, so a new fill
+#                        can trigger an immediate positions refresh.
+# Both are pruned every cycle to the set of currently watched addresses.
+_addr_positions: dict[str, tuple[float, list[dict]]] = {}
+_addr_match_keys: dict[str, set[str]] = {}
+
+
 async def poll_loop(app: Application):
     await asyncio.sleep(3)
-    logger.info("Poll loop started")
+    logger.info(
+        "Poll loop started (fills every %ss, positions every %ss + on new fill, "
+        "market cache %ss/%ss alert)",
+        POLL_INTERVAL,
+        POSITIONS_POLL_INTERVAL_S or POLL_INTERVAL,
+        int(MARKET_CACHE_TTL_S),
+        int(MARKET_CACHE_ALERT_TTL_S),
+    )
     sem = asyncio.Semaphore(POLL_CONCURRENCY)
 
     async with aiohttp.ClientSession() as session:
@@ -7859,13 +8122,53 @@ async def poll_loop(app: Application):
                         return
 
                     address = due[0][1].address
-                    # Fan the two endpoints out in parallel — they're
-                    # independent reads keyed on the same wallet. Each helper
-                    # internally swallows exceptions and returns None.
-                    positions_raw, matches_raw = await asyncio.gather(
-                        fetch_positions(session, address),
-                        fetch_order_matches(session, address, first=20),
+                    addr_key = address.lower()
+                    cached_pos = _addr_positions.get(addr_key)
+                    # Positions are refreshed on their own (slower) cadence;
+                    # fills are fetched every cycle. When the refresh is due
+                    # both go out in parallel — they're independent reads
+                    # keyed on the same wallet. Each helper internally
+                    # swallows exceptions and returns None.
+                    positions_due = (
+                        cached_pos is None
+                        or POSITIONS_POLL_INTERVAL_S <= 0
+                        or (now - cached_pos[0]) >= POSITIONS_POLL_INTERVAL_S
                     )
+                    positions_skipped = False
+                    if positions_due:
+                        positions_raw, matches_raw = await asyncio.gather(
+                            fetch_positions(session, address),
+                            fetch_order_matches(session, address, first=20),
+                        )
+                    else:
+                        matches_raw = await fetch_order_matches(
+                            session, address, first=20
+                        )
+                        positions_raw = None
+                        positions_skipped = True
+                        # A fill we haven't seen changes the holdings right
+                        # now — refresh positions immediately so 已平仓 /
+                        # alert bookkeeping doesn't wait for the cadence.
+                        if isinstance(matches_raw, list):
+                            prev_keys = _addr_match_keys.get(addr_key)
+                            if prev_keys is not None and any(
+                                match_key(m) not in prev_keys for m in matches_raw
+                            ):
+                                positions_raw = await fetch_positions(
+                                    session, address
+                                )
+                                positions_skipped = False
+
+                    if isinstance(positions_raw, list):
+                        _addr_positions[addr_key] = (now, positions_raw)
+                    elif positions_skipped and cached_pos is not None:
+                        # Not due this cycle: reuse the last good snapshot so
+                        # downstream diff / alert logic sees a stable list.
+                        positions_raw = list(cached_pos[1])
+                    if isinstance(matches_raw, list):
+                        _addr_match_keys[addr_key] = {
+                            match_key(m) for m in matches_raw
+                        }
 
                     rl_results = [
                         r for r in (positions_raw, matches_raw)
@@ -7888,6 +8191,11 @@ async def poll_loop(app: Application):
                     matches_ok = matches_raw is not None
                     positions = positions_raw or []
                     matches = matches_raw or []
+
+                    # Let a resolution seen in the positions payload expire
+                    # the cached market early (see _invalidate_resolved_markets).
+                    if positions_ok and not positions_skipped:
+                        _invalidate_resolved_markets(positions)
 
                     # Annotate positions/matches with their market payloads
                     # exactly once — the dicts are shared by every watcher.
@@ -7943,12 +8251,35 @@ async def poll_loop(app: Application):
                     for addr, w in list(wallets.items()):
                         groups.setdefault(addr.lower(), []).append((chat_id, w))
 
+                # Per-cycle housekeeping: refresh which markets carry price
+                # alerts (short market-cache TTL) and drop per-address poll
+                # state for wallets nobody watches anymore.
+                _refresh_alert_market_ids()
+                for stale_addr in [a for a in _addr_positions if a not in groups]:
+                    _addr_positions.pop(stale_addr, None)
+                for stale_addr in [a for a in _addr_match_keys if a not in groups]:
+                    _addr_match_keys.pop(stale_addr, None)
+
                 tasks = [_poll_address(group) for group in groups.values()]
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
 
                 elapsed = time.monotonic() - cycle_started
                 sleep_s = max(0.0, POLL_INTERVAL - elapsed)
+                # Pre-emptive throttle: if the API says the per-minute budget
+                # is nearly spent, wait for the window to reset instead of
+                # burning the last requests and tripping 429 backoff on
+                # every wallet at once.
+                pause_s = _rate_limit_pause_s()
+                if pause_s > sleep_s:
+                    logger.info(
+                        "Rate-limit budget low (%s/%s remaining); pausing poll "
+                        "loop %.1fs",
+                        rate_limit_state.get("remaining"),
+                        rate_limit_state.get("limit"),
+                        pause_s,
+                    )
+                    sleep_s = pause_s
             except Exception as e:
                 # Never let a cycle-level failure kill the loop — polling
                 # silently stopping is worse than one skipped cycle.
