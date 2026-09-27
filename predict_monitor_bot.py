@@ -27,6 +27,7 @@ from telegram import (
 )
 from telegram.error import BadRequest
 from telegram.ext import (
+    AIORateLimiter,
     Application,
     CallbackQueryHandler,
     CommandHandler,
@@ -69,10 +70,14 @@ UPGRADE_CONTACT = os.environ.get("UPGRADE_CONTACT", "@xiaoc888").strip() or "@xi
 # WHALE_BOT_URL to point at a different t.me handle if needed.
 WHALE_BOT_URL = os.environ.get("WHALE_BOT_URL", "https://t.me/predict_whale_bot").strip() or "https://t.me/predict_whale_bot"
 POLL_INTERVAL = 2
-# Maximum number of wallets polled concurrently within a single cycle. The old
-# loop processed wallets serially with a 1-second gap between each, so a chat
-# watching N wallets saw a cycle of roughly N + POLL_INTERVAL seconds. Polling
-# in parallel keeps end-to-end latency near POLL_INTERVAL regardless of N.
+# How often the poll scheduler wakes to start polls for addresses that are due
+# (last poll started >= POLL_INTERVAL ago and already finished). Each address
+# runs on its own schedule, so a slow wallet never delays the others.
+POLL_TICK_S = 0.25
+# Maximum number of wallets whose Predict.fun reads are in flight at once.
+# Only the API fetches hold a slot; diffing and Telegram sends happen after
+# it is released. Polling in parallel keeps end-to-end latency near
+# POLL_INTERVAL regardless of how many wallets are watched.
 try:
     POLL_CONCURRENCY = max(1, int(os.environ.get("POLL_CONCURRENCY", "8") or 8))
 except ValueError:
@@ -8093,39 +8098,51 @@ async def poll_loop(app: Application):
             ) and w.address in watched.get(chat_id, {}):
                 await asyncio.to_thread(save_watch, w)
 
-        async def _poll_address(watchers: list[tuple[int, WatchedWallet]]):
-            """Fetch one address once per cycle and fan the shared result out
-            to every due (chat, wallet) watcher of that address — a wallet
-            watched by N chats used to cost N× the API calls."""
-            async with sem:
-                try:
-                    now = time.time()
-                    due: list[tuple[int, WatchedWallet]] = []
-                    for chat_id, w in watchers:
-                        # The cycle iterates a list() snapshot, so a /unwatch
-                        # (or bulk delete) that landed since must not be
-                        # polled — or resurrected by save_watch later.
-                        if w.address not in watched.get(chat_id, {}):
-                            continue
-                        # Per-wallet interval gating (0 = use global).
-                        if (
-                            w.poll_interval_s
-                            and (now - w.last_check) < w.poll_interval_s
-                        ):
-                            continue
-                        # Rate-limit cooldown gate: skip until the backoff
-                        # window (set below on a 429) expires.
-                        if w.rate_limit_until and now < w.rate_limit_until:
-                            continue
-                        due.append((chat_id, w))
-                    if not due:
-                        return
+        async def _process_watcher_safe(chat_id: int, w: WatchedWallet, **kw):
+            try:
+                await _process_watcher(chat_id, w, **kw)
+            except Exception as e:
+                logger.error(f"Poll error {w.address} (chat {chat_id}): {e}")
 
-                    address = due[0][1].address
-                    addr_key = address.lower()
+        async def _poll_address(watchers: list[tuple[int, WatchedWallet]]):
+            """Fetch one address once and fan the shared result out to every
+            due (chat, wallet) watcher of that address — a wallet watched by
+            N chats used to cost N× the API calls.
+
+            Only the Predict.fun reads hold ``sem``: diffing, Telegram sends,
+            alert evaluation and the DB write run after it is released, so a
+            burst of outgoing cards never keeps other wallets from fetching."""
+            try:
+                now = time.time()
+                due: list[tuple[int, WatchedWallet]] = []
+                for chat_id, w in watchers:
+                    # The group is a snapshot, so a /unwatch (or bulk delete)
+                    # that landed since must not be polled — or resurrected by
+                    # save_watch later.
+                    if w.address not in watched.get(chat_id, {}):
+                        continue
+                    # Per-wallet interval gating (0 = use global).
+                    if (
+                        w.poll_interval_s
+                        and (now - w.last_check) < w.poll_interval_s
+                    ):
+                        continue
+                    # Rate-limit cooldown gate: skip until the backoff
+                    # window (set below on a 429) expires.
+                    if w.rate_limit_until and now < w.rate_limit_until:
+                        continue
+                    due.append((chat_id, w))
+                if not due:
+                    return
+
+                address = due[0][1].address
+                addr_key = address.lower()
+
+                async with sem:
+                    now = time.time()
                     cached_pos = _addr_positions.get(addr_key)
                     # Positions are refreshed on their own (slower) cadence;
-                    # fills are fetched every cycle. When the refresh is due
+                    # fills are fetched every poll. When the refresh is due
                     # both go out in parallel — they're independent reads
                     # keyed on the same wallet. Each helper internally
                     # swallows exceptions and returns None.
@@ -8149,143 +8166,193 @@ async def poll_loop(app: Application):
                         # A fill we haven't seen changes the holdings right
                         # now — refresh positions immediately so 已平仓 /
                         # alert bookkeeping doesn't wait for the cadence.
+                        # The new fills' markets are warmed in parallel so
+                        # the card isn't held up by a second serial round
+                        # trip for a market we've never cached.
                         if isinstance(matches_raw, list):
                             prev_keys = _addr_match_keys.get(addr_key)
-                            if prev_keys is not None and any(
-                                match_key(m) not in prev_keys for m in matches_raw
-                            ):
-                                positions_raw = await fetch_positions(
-                                    session, address
+                            fresh = (
+                                [
+                                    m for m in matches_raw
+                                    if match_key(m) not in prev_keys
+                                ]
+                                if prev_keys is not None
+                                else []
+                            )
+                            if fresh:
+                                positions_raw, _ = await asyncio.gather(
+                                    fetch_positions(session, address),
+                                    _fetch_markets(
+                                        session,
+                                        (
+                                            _match_market_view(m).get("id")
+                                            for m in fresh
+                                        ),
+                                    ),
                                 )
                                 positions_skipped = False
 
-                    if isinstance(positions_raw, list):
-                        _addr_positions[addr_key] = (now, positions_raw)
-                    elif positions_skipped and cached_pos is not None:
-                        # Not due this cycle: reuse the last good snapshot so
-                        # downstream diff / alert logic sees a stable list.
-                        positions_raw = list(cached_pos[1])
-                    if isinstance(matches_raw, list):
-                        _addr_match_keys[addr_key] = {
-                            match_key(m) for m in matches_raw
-                        }
-
-                    rl_results = [
-                        r for r in (positions_raw, matches_raw)
-                        if isinstance(r, RateLimited)
-                    ]
-                    rl_hit = bool(rl_results)
-                    rl_retry_after = max(
-                        ((r.retry_after_s or 0) for r in rl_results),
-                        default=0.0,
-                    )
-                    # Coerce RateLimited → None so downstream diff/error
-                    # logic treats this as a failed fetch without trying to
-                    # iterate the sentinel.
-                    if isinstance(positions_raw, RateLimited):
-                        positions_raw = None
-                    if isinstance(matches_raw, RateLimited):
-                        matches_raw = None
-
-                    positions_ok = positions_raw is not None
-                    matches_ok = matches_raw is not None
-                    positions = positions_raw or []
-                    matches = matches_raw or []
-
-                    # Let a resolution seen in the positions payload expire
-                    # the cached market early (see _invalidate_resolved_markets).
-                    if positions_ok and not positions_skipped:
-                        _invalidate_resolved_markets(positions)
-
-                    # Annotate positions/matches with their market payloads
-                    # exactly once — the dicts are shared by every watcher.
-                    market_ids = {
-                        p.get("marketId") for p in positions if p.get("marketId")
+                if isinstance(positions_raw, list):
+                    _addr_positions[addr_key] = (now, positions_raw)
+                elif positions_skipped and cached_pos is not None:
+                    # Not due this poll: reuse the last good snapshot so
+                    # downstream diff / alert logic sees a stable list.
+                    positions_raw = list(cached_pos[1])
+                if isinstance(matches_raw, list):
+                    _addr_match_keys[addr_key] = {
+                        match_key(m) for m in matches_raw
                     }
-                    for m in matches:
-                        mid = _match_market_view(m).get("id")
-                        if mid:
-                            market_ids.add(mid)
-                    markets = await _fetch_markets(session, market_ids)
-                    for p in positions:
-                        p["_market"] = markets.get(p.get("marketId"), {})
-                    for m in matches:
-                        _backfill_match_market(
-                            m, markets.get(_match_market_view(m).get("id"))
-                        )
-                    positions_by_key = {pos_key(p): p for p in positions}
-                    new_match_keys = (
-                        {match_key(m) for m in matches} if matches_ok else None
-                    )
 
-                    for chat_id, w in due:
-                        try:
-                            await _process_watcher(
-                                chat_id,
-                                w,
-                                rl_hit=rl_hit,
-                                rl_retry_after=rl_retry_after,
-                                positions_ok=positions_ok,
-                                matches_ok=matches_ok,
-                                positions=positions,
-                                matches=matches,
-                                positions_by_key=positions_by_key,
-                                markets=markets,
-                                new_match_keys=new_match_keys,
+                rl_results = [
+                    r for r in (positions_raw, matches_raw)
+                    if isinstance(r, RateLimited)
+                ]
+                rl_hit = bool(rl_results)
+                rl_retry_after = max(
+                    ((r.retry_after_s or 0) for r in rl_results),
+                    default=0.0,
+                )
+                # Coerce RateLimited → None so downstream diff/error logic
+                # treats this as a failed fetch without trying to iterate
+                # the sentinel.
+                if isinstance(positions_raw, RateLimited):
+                    positions_raw = None
+                if isinstance(matches_raw, RateLimited):
+                    matches_raw = None
+
+                positions_ok = positions_raw is not None
+                matches_ok = matches_raw is not None
+                positions = positions_raw or []
+                matches = matches_raw or []
+
+                # Let a resolution seen in the positions payload expire the
+                # cached market early (see _invalidate_resolved_markets).
+                if positions_ok and not positions_skipped:
+                    _invalidate_resolved_markets(positions)
+
+                # Annotate positions/matches with their market payloads
+                # exactly once — the dicts are shared by every watcher.
+                # Market fetches are bounded by their own _market_fetch_sem.
+                market_ids = {
+                    p.get("marketId") for p in positions if p.get("marketId")
+                }
+                for m in matches:
+                    mid = _match_market_view(m).get("id")
+                    if mid:
+                        market_ids.add(mid)
+                markets = await _fetch_markets(session, market_ids)
+                for p in positions:
+                    p["_market"] = markets.get(p.get("marketId"), {})
+                for m in matches:
+                    _backfill_match_market(
+                        m, markets.get(_match_market_view(m).get("id"))
+                    )
+                positions_by_key = {pos_key(p): p for p in positions}
+                new_match_keys = (
+                    {match_key(m) for m in matches} if matches_ok else None
+                )
+
+                # Every chat watching this address is notified concurrently
+                # — the 10th chat no longer waits for the first 9 sends.
+                # Messages within one chat stay ordered (_process_watcher
+                # sends its blocks sequentially). _process_watcher only
+                # reads the shared positions / matches lists.
+                await asyncio.gather(
+                    *(
+                        _process_watcher_safe(
+                            chat_id,
+                            w,
+                            rl_hit=rl_hit,
+                            rl_retry_after=rl_retry_after,
+                            positions_ok=positions_ok,
+                            matches_ok=matches_ok,
+                            positions=positions,
+                            matches=matches,
+                            positions_by_key=positions_by_key,
+                            markets=markets,
+                            new_match_keys=new_match_keys,
+                        )
+                        for chat_id, w in due
+                    )
+                )
+            except Exception as e:
+                addr0 = watchers[0][1].address if watchers else "?"
+                logger.error(f"Poll error {addr0}: {e}")
+
+        # Each address is scheduled on its own: a tick every
+        # POLL_TICK_S starts a poll for every address whose previous
+        # poll has finished and last started >= POLL_INTERVAL ago. The
+        # old loop gathered every address and only then slept, so one
+        # slow or timed-out wallet (12–15s timeouts, paginated positions)
+        # stalled the next poll of every other wallet.
+        inflight: dict[str, asyncio.Task] = {}
+        last_started: dict[str, float] = {}
+        paused_until = 0.0
+        try:
+            while True:
+                try:
+                    tick = time.monotonic()
+                    groups: dict[str, list[tuple[int, WatchedWallet]]] = {}
+                    for chat_id, wallets in list(watched.items()):
+                        for addr, w in list(wallets.items()):
+                            groups.setdefault(addr.lower(), []).append(
+                                (chat_id, w)
                             )
-                        except Exception as e:
-                            logger.error(
-                                f"Poll error {w.address} (chat {chat_id}): {e}"
+
+                    # Housekeeping: refresh which markets carry price
+                    # alerts (short market-cache TTL) and drop per-address
+                    # poll state for wallets nobody watches anymore.
+                    _refresh_alert_market_ids()
+                    for stale in [a for a in _addr_positions if a not in groups]:
+                        _addr_positions.pop(stale, None)
+                    for stale in [a for a in _addr_match_keys if a not in groups]:
+                        _addr_match_keys.pop(stale, None)
+                    for stale in [a for a in last_started if a not in groups]:
+                        last_started.pop(stale, None)
+                    for addr, task in list(inflight.items()):
+                        if task.done():
+                            inflight.pop(addr, None)
+                            if not task.cancelled() and task.exception():
+                                logger.error(
+                                    f"Poll task {addr} crashed: {task.exception()}"
+                                )
+
+                    # Pre-emptive throttle: if the API says the per-minute
+                    # budget is nearly spent, stop starting polls until the
+                    # window resets instead of burning the last requests and
+                    # tripping 429 backoff on every wallet at once.
+                    if tick >= paused_until:
+                        pause_s = _rate_limit_pause_s()
+                        if pause_s > 0:
+                            paused_until = tick + pause_s
+                            logger.info(
+                                "Rate-limit budget low (%s/%s remaining); "
+                                "pausing new polls %.1fs",
+                                rate_limit_state.get("remaining"),
+                                rate_limit_state.get("limit"),
+                                pause_s,
+                            )
+
+                    if tick >= paused_until:
+                        for addr, group in groups.items():
+                            if addr in inflight:
+                                continue
+                            if tick - last_started.get(addr, 0.0) < POLL_INTERVAL:
+                                continue
+                            last_started[addr] = tick
+                            inflight[addr] = asyncio.create_task(
+                                _poll_address(group), name=f"poll:{addr}"
                             )
                 except Exception as e:
-                    addr0 = watchers[0][1].address if watchers else "?"
-                    logger.error(f"Poll error {addr0}: {e}")
-
-        while True:
-            try:
-                cycle_started = time.monotonic()
-                # Group watchers by address so a wallet watched by N chats
-                # is fetched once per cycle instead of N times.
-                groups: dict[str, list[tuple[int, WatchedWallet]]] = {}
-                for chat_id, wallets in list(watched.items()):
-                    for addr, w in list(wallets.items()):
-                        groups.setdefault(addr.lower(), []).append((chat_id, w))
-
-                # Per-cycle housekeeping: refresh which markets carry price
-                # alerts (short market-cache TTL) and drop per-address poll
-                # state for wallets nobody watches anymore.
-                _refresh_alert_market_ids()
-                for stale_addr in [a for a in _addr_positions if a not in groups]:
-                    _addr_positions.pop(stale_addr, None)
-                for stale_addr in [a for a in _addr_match_keys if a not in groups]:
-                    _addr_match_keys.pop(stale_addr, None)
-
-                tasks = [_poll_address(group) for group in groups.values()]
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-
-                elapsed = time.monotonic() - cycle_started
-                sleep_s = max(0.0, POLL_INTERVAL - elapsed)
-                # Pre-emptive throttle: if the API says the per-minute budget
-                # is nearly spent, wait for the window to reset instead of
-                # burning the last requests and tripping 429 backoff on
-                # every wallet at once.
-                pause_s = _rate_limit_pause_s()
-                if pause_s > sleep_s:
-                    logger.info(
-                        "Rate-limit budget low (%s/%s remaining); pausing poll "
-                        "loop %.1fs",
-                        rate_limit_state.get("remaining"),
-                        rate_limit_state.get("limit"),
-                        pause_s,
-                    )
-                    sleep_s = pause_s
-            except Exception as e:
-                # Never let a cycle-level failure kill the loop — polling
-                # silently stopping is worse than one skipped cycle.
-                logger.exception(f"poll_loop cycle error: {e}")
-                sleep_s = POLL_INTERVAL
-            await asyncio.sleep(sleep_s)
+                    # Never let a tick-level failure kill the loop — polling
+                    # silently stopping is worse than one skipped tick.
+                    logger.exception(f"poll_loop tick error: {e}")
+                await asyncio.sleep(POLL_TICK_S)
+        finally:
+            for task in inflight.values():
+                task.cancel()
+            if inflight:
+                await asyncio.gather(*inflight.values(), return_exceptions=True)
 
 # ==================== Main ====================
 
@@ -8407,7 +8474,16 @@ def main():
     if not PREDICT_API_KEY:
         raise RuntimeError("Missing PREDICT_API_KEY")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Poll notifications for different chats now go out concurrently; the
+    # limiter keeps bursts under Telegram's flood limits (30 msg/s overall,
+    # 20 msg/min per group) and retries a RetryAfter instead of dropping the
+    # card.
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .rate_limiter(AIORateLimiter(max_retries=2))
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("watch", cmd_watch))
