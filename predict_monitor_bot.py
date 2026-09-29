@@ -537,17 +537,10 @@ I18N = {
         "label_muted_flag": "🔕 muted",
         "label_watching_flag": "👁 watching",
         "watching_multi": "Added {added} new, skipped {skipped} already-watching / invalid.",
-        "watch_limit_hit": (
-            "⛔ You can monitor at most {limit} addresses on the free tier.\n\n"
-            "To monitor more, bind invite code {code}\n"
-            "{link}\n"
-            "Trading volume above 1W? DM {contact} for higher access."
-        ),
+        "watch_limit_hit": "You can monitor at most {limit} addresses. DM {contact} to raise the limit.",
         "watch_limit_partial": (
             "⚠️ Quota reached at {limit} — added {added}, dropped {dropped}.\n"
-            "Bind invite code {code}\n"
-            "{link}\n"
-            "Or DM {contact} for higher access."
+            "You can monitor at most {limit} addresses. DM {contact} to raise the limit."
         ),
         "btn_admin_whitelist": "👑 Whitelist management",
         "btn_whale_bot": "🐋 Predict.fun whale alerts",
@@ -1082,17 +1075,10 @@ I18N = {
         "label_muted_flag": "🔕 已静音",
         "label_watching_flag": "👁 监控中",
         "watching_multi": "新增 {added} 个监控，跳过 {skipped} 个（已存在或格式错误）。",
-        "watch_limit_hit": (
-            "当前最多可监控 {limit} 个地址。\n\n"
-            "如需监控更多地址，请先绑定邀请码 {code}\n"
-            "{link}\n"
-            "超过 1W 交易量私信 {contact} 开通更高权限。"
-        ),
+        "watch_limit_hit": "当前最多可监控 {limit} 个地址，需要提升联系{contact}",
         "watch_limit_partial": (
             "⚠️ 已达上限 {limit}：本次新增 {added} 个，跳过 {dropped} 个。\n"
-            "如需监控更多地址，请先绑定邀请码 {code}\n"
-            "{link}\n"
-            "超过 1W 交易量私信 {contact} 开通更高权限。"
+            "当前最多可监控 {limit} 个地址，需要提升联系{contact}"
         ),
         "btn_admin_whitelist": "👑 白名单管理",
         "btn_whale_bot": "🐋 Predict.fun 大额交易监控",
