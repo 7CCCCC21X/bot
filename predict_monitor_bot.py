@@ -1075,10 +1075,10 @@ I18N = {
         "label_muted_flag": "🔕 已静音",
         "label_watching_flag": "👁 监控中",
         "watching_multi": "新增 {added} 个监控，跳过 {skipped} 个（已存在或格式错误）。",
-        "watch_limit_hit": "当前最多可监控 {limit} 个地址，需要提升联系{contact}",
+        "watch_limit_hit": "当前最多可监控 {limit} 个地址，需要提升联系 {contact}",
         "watch_limit_partial": (
             "⚠️ 已达上限 {limit}：本次新增 {added} 个，跳过 {dropped} 个。\n"
-            "当前最多可监控 {limit} 个地址，需要提升联系{contact}"
+            "当前最多可监控 {limit} 个地址，需要提升联系 {contact}"
         ),
         "btn_admin_whitelist": "👑 白名单管理",
         "btn_whale_bot": "🐋 Predict.fun 大额交易监控",
